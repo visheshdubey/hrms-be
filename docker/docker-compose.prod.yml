@@ -1,0 +1,20 @@
+services:
+  hrms-be-prod:
+    image: hrms-be:prod
+    container_name: hrms-be-prod
+    build:
+      context: ../
+      dockerfile: Dockerfile
+    ports:
+      - "3202:3000"
+    env_file:
+      - ./volume/env/.env
+    volumes:
+      - ./volume/env/.env:/app/.env
+    restart: always
+    networks:
+      - shared_network
+
+networks:
+  shared_network:
+    external: true
