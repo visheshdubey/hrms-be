@@ -35,7 +35,7 @@ done
 echo "==> Bootstrap complete."
 echo "Next steps:"
 echo "  1. Point DNS A records for your domains to this VPS IP"
-echo "  2. Add HOSTINGER_HOSTNAME and SSH key to each CircleCI project"
+echo "  2. Add 147.93.18.45 and SSH key to each CircleCI project"
 echo "  3. Set APP_DOMAIN in each CircleCI project (MF_FE_DOMAIN, etc.)"
 echo "  4. Push to main to trigger deploy"
 echo "  5. After first deploy, run: certbot --nginx -d <your-domain>"
