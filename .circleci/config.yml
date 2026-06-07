@@ -114,7 +114,7 @@ commands:
           name: Update Nginx site config
           command: |
             printf -v circle_project_reponame %q "${CIRCLE_PROJECT_REPONAME}"
-            printf -v app_domain %q "${APP_DOMAIN}"
+            printf -v app_domain %q "hrms-be.devcognito.tech"
             ssh -o StrictHostKeyChecking=no root@${HOSTINGER_HOSTNAME} "bash -s $circle_project_reponame $app_domain" \<< 'EOF'
               circle_project_reponame_var=$1
               domain=$2
