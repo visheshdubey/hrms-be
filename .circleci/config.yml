@@ -29,7 +29,7 @@ commands:
             - run:
                   name: Create remote directory
                   command: |
-                      ssh -A -o StrictHostKeyChecking=no root@147.93.18.45 "mkdir -p /home/source/<< parameters.environment >>/${CIRCLE_PROJECT_REPONAME}/"
+                      ssh -o StrictHostKeyChecking=no root@147.93.18.45 "mkdir -p /home/source/<< parameters.environment >>/${CIRCLE_PROJECT_REPONAME}/"
 
     upload-code:
         description: "Upload code to server using rsync"
@@ -40,11 +40,11 @@ commands:
             - run:
                   name: Install rsync on remote server
                   command: |
-                      ssh -A -o StrictHostKeyChecking=no root@147.93.18.45 "if ! command -v rsync &> /dev/null; then apt-get update && apt-get install -y rsync; fi"
+                      ssh -o StrictHostKeyChecking=no root@147.93.18.45 "if ! command -v rsync &> /dev/null; then apt-get update && apt-get install -y rsync; fi"
             - run:
                   name: Upload code to server
                   command: |
-                      rsync -avz -e "ssh -A -o StrictHostKeyChecking=no" \
+                      rsync -avz -e "ssh -o StrictHostKeyChecking=no" \
                         --exclude='.git' \
                         --exclude='node_modules' \
                         --exclude='dist' \
@@ -62,7 +62,7 @@ commands:
                   name: Build Docker image
                   command: |
                       printf -v circle_project_reponame %q "${CIRCLE_PROJECT_REPONAME}"
-                      ssh -A -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame" \<< 'EOF'
+                      ssh -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame" \<< 'EOF'
                         circle_project_reponame_var=$1
                         cd /home/source/<< parameters.environment >>/$circle_project_reponame_var/
                         docker build -t $circle_project_reponame_var:<< parameters.environment >> -f Dockerfile .
@@ -78,7 +78,7 @@ commands:
                   name: Setup ENV
                   command: |
                       printf -v circle_project_reponame %q "${CIRCLE_PROJECT_REPONAME}"
-                      ssh -A -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame" \<< 'EOF'
+                      ssh -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame" \<< 'EOF'
                         circle_project_reponame_var=$1
                         mkdir -p /home/source/<< parameters.environment >>/$circle_project_reponame_var/docker/volume/env/
                         if [ -f /home/env/<< parameters.environment >>/$circle_project_reponame_var/<< parameters.environment >>.env ]; then
@@ -98,7 +98,7 @@ commands:
                   name: Deploy Docker container
                   command: |
                       printf -v circle_project_reponame %q "${CIRCLE_PROJECT_REPONAME}"
-                      ssh -A -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame" \<< 'EOF'
+                      ssh -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame" \<< 'EOF'
                         circle_project_reponame_var=$1
                         cd /home/source/<< parameters.environment >>/$circle_project_reponame_var/
                         docker compose -f ./docker/docker-compose.<< parameters.environment >>.yml up -d --build
@@ -115,7 +115,7 @@ commands:
                   command: |
                       printf -v circle_project_reponame %q "${CIRCLE_PROJECT_REPONAME}"
                       printf -v app_domain %q "hrms-be.devcognito.tech"
-                      ssh -A -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame $app_domain" \<< 'EOF'
+                      ssh -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame $app_domain" \<< 'EOF'
                         circle_project_reponame_var=$1
                         domain=$2
                         cd /home/source/<< parameters.environment >>/$circle_project_reponame_var/
@@ -135,6 +135,7 @@ jobs:
         executor: deploy-executor
         steps:
             - checkout
+            - add_ssh_keys  # <-- Notice no fingerprint! This pulls all keys.
             - install-rsync
             - create-remote-dir:
                   environment: prod
@@ -145,6 +146,7 @@ jobs:
         executor: deploy-executor
         steps:
             - checkout
+            - add_ssh_keys
             - build-docker:
                   environment: prod
 
@@ -152,6 +154,7 @@ jobs:
         executor: deploy-executor
         steps:
             - checkout
+            - add_ssh_keys
             - setup-environment:
                   environment: prod
 
@@ -159,6 +162,7 @@ jobs:
         executor: deploy-executor
         steps:
             - checkout
+            - add_ssh_keys
             - deploy-docker:
                   environment: prod
 
@@ -166,6 +170,7 @@ jobs:
         executor: deploy-executor
         steps:
             - checkout
+            - add_ssh_keys
             - update-nginx:
                   environment: prod
 
