@@ -135,6 +135,9 @@ jobs:
         executor: deploy-executor
         steps:
             - checkout
+            - add_ssh_keys:
+                fingerprints:
+                  - "SHA256:UZ2tdjl0gzcsEMVtNeeTM+gpWIBBldc55c9R/V5M+Dc"
             - install-rsync
             - create-remote-dir:
                   environment: prod
@@ -144,24 +147,40 @@ jobs:
     build-prod:
         executor: deploy-executor
         steps:
+            - checkout
+            - add_ssh_keys:
+                fingerprints:
+                  - "SHA256:UZ2tdjl0gzcsEMVtNeeTM+gpWIBBldc55c9R/V5M+Dc"
             - build-docker:
                   environment: prod
 
     setup-environment-prod:
         executor: deploy-executor
         steps:
+            - checkout
+            - add_ssh_keys:
+                fingerprints:
+                  - "SHA256:UZ2tdjl0gzcsEMVtNeeTM+gpWIBBldc55c9R/V5M+Dc"
             - setup-environment:
                   environment: prod
 
     deploy-prod:
         executor: deploy-executor
         steps:
+            - checkout
+            - add_ssh_keys:
+                fingerprints:
+                  - "SHA256:UZ2tdjl0gzcsEMVtNeeTM+gpWIBBldc55c9R/V5M+Dc"
             - deploy-docker:
                   environment: prod
 
     update-nginx-prod:
         executor: deploy-executor
         steps:
+            - checkout
+            - add_ssh_keys:
+                fingerprints:
+                  - "SHA256:UZ2tdjl0gzcsEMVtNeeTM+gpWIBBldc55c9R/V5M+Dc"
             - update-nginx:
                   environment: prod
 
