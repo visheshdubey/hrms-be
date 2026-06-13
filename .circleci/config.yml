@@ -5,9 +5,6 @@ executors:
         docker:
             - image: cimg/base:stable
 
-orbs:
-    discord: antonioned/discord@0.1.0
-
 commands:
     install-rsync:
         description: "Install rsync if not already installed"
@@ -135,7 +132,7 @@ jobs:
         executor: deploy-executor
         steps:
             - checkout
-            - add_ssh_keys  # <-- Notice no fingerprint! This pulls all keys.
+            - add_ssh_keys
             - install-rsync
             - create-remote-dir:
                   environment: prod
@@ -208,9 +205,6 @@ workflows:
             - update-nginx-prod:
                   requires:
                       - deploy-prod
-                  post-steps:
-                      - discord/status:
-                            webhook: ${DISCORD_WEBHOOK}
                   filters:
                       branches:
                           only: main
