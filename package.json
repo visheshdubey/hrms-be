@@ -1,5 +1,5 @@
 {
-  "name": "hrms-be",
+  "name": "my-hono-app",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -7,12 +7,27 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@hono/node-server": "^1.14.4",
-    "hono": "^4.7.11"
+    "@hono/node-server": "^1.19.14",
+    "@hono/zod-validator": "^0.7.6",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.9.0",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.12.12",
+    "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^9.0.0",
+    "pg": "^8.20.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20.11.17",
-    "tsx": "^4.7.1",
+    "@types/nodemailer": "^8.0.1",
+    "@types/pg": "^8.20.0",
+    "drizzle-kit": "^0.31.10",
+    "tsx": "^4.21.0",
     "typescript": "^5.8.3"
   }
 }
