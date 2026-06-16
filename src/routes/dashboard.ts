@@ -15,7 +15,7 @@ dashboardRouter.get('/', requireAuth, async (c) => {
     const totalCandidates = allCandidates.length;
 
     // Active jobs
-    const activeJobsQuery = await db.select().from(jobs).where(and(eq(jobs.status, 'Active'), eq(jobs.createdBy, userId)));
+    const activeJobsQuery = await db.select().from(jobs).where(and(eq(jobs.status, 'Ready to accept applications'), eq(jobs.createdBy, userId)));
     const activeJobs = activeJobsQuery.length;
 
     // Recent Uploads / Activities (Top 5)

@@ -11,7 +11,7 @@ const jobsRouter = new Hono<{ Variables: { userId: number } }>({ strict: false }
 const jobSchema = z.object({
   title: z.string().min(1, "Title is required"),
   department: z.string().optional(),
-  status: z.enum(["Active", "Draft", "Closed"]).optional(),
+  status: z.enum(["New", "Draft", "Ready to accept applications", "Submission in progress", "Closed"]).optional(),
   type: z.enum(["Full-time", "Part-time", "Contract"]).optional(),
   location: z.enum(["Remote", "On-site", "Hybrid"]).optional(),
   description: z.string().optional(),
@@ -49,7 +49,7 @@ jobsRouter.post('/', requireAuth, zValidator('json', jobSchema), async (c) => {
     const created = await db.insert(jobs).values({
       title,
       department: department || 'General',
-      status: status || 'Active',
+      status: status || 'New',
       type: type || 'Full-time',
       location: location || 'Remote',
       description: description || '',

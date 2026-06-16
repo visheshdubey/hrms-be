@@ -19,7 +19,7 @@ const candidateSchema = z.object({
   experience: z.union([z.string(), z.array(z.string())]).optional(),
   skills: z.union([z.string(), z.array(z.string())]).optional(),
   match_score: z.number().optional(),
-  status: z.string().optional(),
+  status: z.enum(["Applied", "In Review", "Shortlisted", "Rejected", "Interview Scheduled", "Hold", "Offer", "No Offer"]).optional(),
   // New 18-layer fields
   linkedin: z.string().optional(),
   github: z.string().optional(),
@@ -97,7 +97,7 @@ candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), asy
       experience: Array.isArray(experience) ? experience[0] || 'Fresher' : (experience || ''),
       skills: JSON.stringify(Array.isArray(skills) ? skills : []),
       matchScore: match_score ?? 0,
-      status: status || 'New',
+      status: status || 'Applied',
       // New 18-layer fields
       linkedin: linkedin || '',
       github: github || '',
