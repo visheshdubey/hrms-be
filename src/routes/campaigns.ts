@@ -1,0 +1,203 @@
+import { Hono } from 'hono';
+import { z } from 'zod';
+import { zValidator } from '@hono/zod-validator';
+import { db } from '../db/index.js';
+import {
+  campaigns, users,
+  CAMPAIGN_STATUSES, CAMPAIGN_TYPES,
+} from '../db/schema.js';
+import { eq, desc, inArray, sql } from 'drizzle-orm';
+import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+
+const campaignsRouter = new Hono<AppContext>({ strict: false });
+
+type CampStatus = typeof CAMPAIGN_STATUSES[number];
+type CampType = typeof CAMPAIGN_TYPES[number];
+
+const STATUS_LABELS: Record<CampStatus, string> = {
+  draft: 'Draft', scheduled: 'Scheduled', sent: 'Sent',
+};
+const TYPE_LABELS: Record<CampType, string> = {
+  hotlist: 'Hot List', job_campaign: 'Job Campaign',
+};
+
+const recipientSchema = z.object({
+  email: z.string(),
+  name: z.string().optional(),
+  candidateId: z.number().int().positive().optional(),
+});
+
+async function orgMemberIds(orgId: number | null, userId: number): Promise<number[]> {
+  if (orgId == null) return [userId];
+  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
+  return members.map((m) => m.id);
+}
+
+async function enrichCampaign(row: typeof campaigns.$inferSelect) {
+  let creatorName = '';
+  if (row.createdBy) {
+    const [u] = await db.select({ name: users.name }).from(users).where(eq(users.id, row.createdBy));
+    creatorName = u?.name ?? '';
+  }
+  const recipients = JSON.parse(row.recipientsJson || '[]') as z.infer<typeof recipientSchema>[];
+
+  return {
+    ...row,
+    recipients,
+    creatorName,
+    statusLabel: STATUS_LABELS[row.status as CampStatus] ?? row.status,
+    typeLabel: TYPE_LABELS[row.type as CampType] ?? row.type,
+  };
+}
+
+const campaignBody = z.object({
+  name: z.string().min(1, 'Campaign name is required'),
+  type: z.enum(CAMPAIGN_TYPES).optional(),
+  status: z.enum(CAMPAIGN_STATUSES).optional(),
+  subject: z.string().optional(),
+  body: z.string().optional(),
+  recipients: z.array(recipientSchema).optional(),
+  scheduledAt: z.string().optional(),
+});
+
+/* GET /campaigns */
+campaignsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const typeFilter = c.req.query('type') ?? 'all';
+    const statusFilter = c.req.query('status');
+    const search = c.req.query('search')?.trim().toLowerCase() ?? '';
+    const page = Math.max(1, parseInt(c.req.query('page') ?? '1') || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(c.req.query('pageSize') ?? '15') || 15));
+
+    const memberIds = await orgMemberIds(orgId, userId);
+    if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
+
+    let rows = await db.select().from(campaigns)
+      .where(inArray(campaigns.createdBy, memberIds))
+      .orderBy(desc(campaigns.updatedAt));
+
+    if (typeFilter !== 'all') rows = rows.filter((r) => r.type === typeFilter);
+    if (statusFilter && statusFilter !== 'all') rows = rows.filter((r) => r.status === statusFilter);
+
+    const enriched = await Promise.all(rows.map(enrichCampaign));
+    const filtered = search
+      ? enriched.filter((c) => {
+          const blob = `${c.name} ${c.subject} ${c.creatorName}`.toLowerCase();
+          return blob.includes(search);
+        })
+      : enriched;
+
+    const total = filtered.length;
+    const start = (page - 1) * pageSize;
+    return c.json({ data: filtered.slice(start, start + pageSize), total, page, pageSize });
+  } catch {
+    return c.json({ error: 'Failed to fetch campaigns' }, 500);
+  }
+});
+
+/* GET /campaigns/:id */
+campaignsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+    const [row] = await db.select().from(campaigns).where(eq(campaigns.id, id)).limit(1);
+    if (!row) return c.json({ error: 'Campaign not found' }, 404);
+    return c.json(await enrichCampaign(row));
+  } catch {
+    return c.json({ error: 'Failed to fetch campaign' }, 500);
+  }
+});
+
+/* POST /campaigns */
+campaignsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', campaignBody), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const b = c.req.valid('json');
+    const now = new Date().toISOString();
+    const recipients = b.recipients ?? [];
+
+    const [created] = await db.insert(campaigns).values({
+      name: b.name,
+      type: b.type ?? 'hotlist',
+      status: b.status ?? 'draft',
+      subject: b.subject ?? '',
+      body: b.body ?? '',
+      recipientsJson: JSON.stringify(recipients),
+      recipientCount: recipients.length,
+      scheduledAt: b.scheduledAt ?? '',
+      organizationId: orgId,
+      createdBy: userId,
+      updatedAt: now,
+    }).returning();
+
+    return c.json(await enrichCampaign(created), 201);
+  } catch {
+    return c.json({ error: 'Failed to create campaign' }, 500);
+  }
+});
+
+/* PUT /campaigns/:id */
+campaignsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', campaignBody.partial()), async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+    const b = c.req.valid('json');
+    const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+    if (b.name !== undefined) patch.name = b.name;
+    if (b.type !== undefined) patch.type = b.type;
+    if (b.status !== undefined) {
+      patch.status = b.status;
+      if (b.status === 'sent') patch.sentAt = new Date().toISOString();
+    }
+    if (b.subject !== undefined) patch.subject = b.subject;
+    if (b.body !== undefined) patch.body = b.body;
+    if (b.scheduledAt !== undefined) patch.scheduledAt = b.scheduledAt;
+    if (b.recipients !== undefined) {
+      patch.recipientsJson = JSON.stringify(b.recipients);
+      patch.recipientCount = b.recipients.length;
+    }
+
+    const [updated] = await db.update(campaigns).set(patch as any).where(eq(campaigns.id, id)).returning();
+    if (!updated) return c.json({ error: 'Campaign not found' }, 404);
+    return c.json(await enrichCampaign(updated));
+  } catch {
+    return c.json({ error: 'Failed to update campaign' }, 500);
+  }
+});
+
+/* POST /campaigns/:id/send — must be before nothing, it's /:id/send */
+campaignsRouter.post('/:id/send', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+    const now = new Date().toISOString();
+
+    const [updated] = await db.update(campaigns).set({
+      status: 'sent',
+      sentAt: now,
+      updatedAt: now,
+    }).where(eq(campaigns.id, id)).returning();
+
+    if (!updated) return c.json({ error: 'Campaign not found' }, 404);
+    return c.json(await enrichCampaign(updated));
+  } catch {
+    return c.json({ error: 'Failed to send campaign' }, 500);
+  }
+});
+
+/* DELETE /campaigns/:id */
+campaignsRouter.delete('/:id', requireAuth, requireRole('recruiter_admin'), async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+    await db.delete(campaigns).where(eq(campaigns.id, id));
+    return c.json({ ok: true });
+  } catch {
+    return c.json({ error: 'Failed to delete campaign' }, 500);
+  }
+});
+
+export default campaignsRouter;

@@ -2,11 +2,11 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { candidates, jobs } from '../db/schema.js';
-import { eq, desc } from 'drizzle-orm';
-import { requireAuth } from '../middleware.js';
+import { candidates, jobs, users } from '../db/schema.js';
+import { eq, desc, inArray } from 'drizzle-orm';
+import { requireAuth, type AppContext } from '../middleware.js';
 
-const candidatesRouter = new Hono<{ Variables: { userId: number } }>({ strict: false });
+const candidatesRouter = new Hono<AppContext>({ strict: false });
 
 const candidateSchema = z.object({
   jobId: z.number().optional().nullable(),
@@ -19,7 +19,7 @@ const candidateSchema = z.object({
   experience: z.union([z.string(), z.array(z.string())]).optional(),
   skills: z.union([z.string(), z.array(z.string())]).optional(),
   match_score: z.number().optional(),
-  status: z.enum(["Applied", "In Review", "Shortlisted", "Rejected", "Interview Scheduled", "Hold", "Offer", "No Offer"]).optional(),
+  status: z.string().optional(),
   // New 18-layer fields
   linkedin: z.string().optional(),
   github: z.string().optional(),
@@ -33,15 +33,34 @@ const candidateSchema = z.object({
   fingerprint: z.string().optional(),
 });
 
-// GET /candidates — list all, sorted by match score DESC
+// GET /candidates — list all candidates visible to the authenticated user's organization
 candidatesRouter.get('/', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
-    const all = await db
-      .select()
-      .from(candidates)
-      .where(eq(candidates.createdBy, userId))
-      .orderBy(desc(candidates.matchScore));
+    const orgId = c.get('organizationId') as number | null;
+
+    let all;
+    if (orgId != null) {
+      const orgMembers = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.organizationId, orgId));
+
+      const memberIds = orgMembers.map((u: any) => u.id);
+      if (memberIds.length === 0) return c.json([]);
+
+      all = await db
+        .select()
+        .from(candidates)
+        .where(inArray(candidates.createdBy, memberIds))
+        .orderBy(desc(candidates.matchScore));
+    } else {
+      all = await db
+        .select()
+        .from(candidates)
+        .where(eq(candidates.createdBy, userId))
+        .orderBy(desc(candidates.matchScore));
+    }
 
     const parsed = all.map((c: any, i: number) => ({
       ...c,
@@ -97,7 +116,7 @@ candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), asy
       experience: Array.isArray(experience) ? experience[0] || 'Fresher' : (experience || ''),
       skills: JSON.stringify(Array.isArray(skills) ? skills : []),
       matchScore: match_score ?? 0,
-      status: status || 'Applied',
+      status: status || 'New',
       // New 18-layer fields
       linkedin: linkedin || '',
       github: github || '',
@@ -135,15 +154,31 @@ candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), asy
   }
 });
 
-// GET /candidates/csv — download CSV report for the user's candidates
+// GET /candidates/csv — download CSV report for the organization's candidates
 candidatesRouter.get('/csv', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
-    const all = await db
-      .select()
-      .from(candidates)
-      .where(eq(candidates.createdBy, userId))
-      .orderBy(desc(candidates.matchScore));
+    const orgId = c.get('organizationId') as number | null;
+
+    let all;
+    if (orgId != null) {
+      const orgMembers = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.organizationId, orgId));
+      const memberIds = orgMembers.map((u: any) => u.id);
+      all = memberIds.length === 0
+        ? []
+        : await db.select().from(candidates)
+            .where(inArray(candidates.createdBy, memberIds))
+            .orderBy(desc(candidates.matchScore));
+    } else {
+      all = await db
+        .select()
+        .from(candidates)
+        .where(eq(candidates.createdBy, userId))
+        .orderBy(desc(candidates.matchScore));
+    }
 
     if (all.length === 0) {
       return c.json({ error: 'No candidates found to export.' }, 404);
@@ -195,6 +230,97 @@ candidatesRouter.get('/csv', requireAuth, async (c) => {
   } catch (error) {
     console.error('CSV Export Error:', error);
     return c.json({ error: 'Failed to generate CSV' }, 500);
+  }
+});
+
+// GET /candidates/:id — single candidate (must come after /csv)
+candidatesRouter.get('/:id', requireAuth, async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const row = await db.select().from(candidates).where(eq(candidates.id, id)).limit(1);
+    if (row.length === 0) return c.json({ error: 'Candidate not found' }, 404);
+
+    const cand = row[0];
+    return c.json({
+      ...cand,
+      skills:         safeJsonParse(cand.skills),
+      certifications: safeJsonParse(cand.certifications),
+      languages:      safeJsonParse(cand.languages),
+      workHistory:    safeJsonParse(cand.workHistory),
+    });
+  } catch {
+    return c.json({ error: 'Failed to fetch candidate' }, 500);
+  }
+});
+
+const updateSchema = z.object({
+  name:         z.string().optional(),
+  email:        z.string().optional(),
+  phone:        z.string().optional(),
+  location:     z.string().optional(),
+  education:    z.string().optional(),
+  experience:   z.string().optional(),
+  skills:       z.union([z.string(), z.array(z.string())]).optional(),
+  status:       z.string().optional(),
+  linkedin:     z.string().optional(),
+  github:       z.string().optional(),
+  portfolio:    z.string().optional(),
+  summary:      z.string().optional(),
+  university:   z.string().optional(),
+  grad_year:    z.string().optional(),
+  certifications: z.union([z.string(), z.array(z.string())]).optional(),
+  languages:    z.union([z.string(), z.array(z.string())]).optional(),
+  work_history: z.union([z.string(), z.array(z.any())]).optional(),
+});
+
+// PUT /candidates/:id — update profile fields
+candidatesRouter.put('/:id', requireAuth, zValidator('json', updateSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const existing = await db.select().from(candidates).where(eq(candidates.id, id)).limit(1);
+    if (existing.length === 0) return c.json({ error: 'Candidate not found' }, 404);
+    if (existing[0].createdBy !== userId) return c.json({ error: 'Unauthorized' }, 403);
+
+    const body = c.req.valid('json');
+
+    const patch: Record<string, unknown> = {};
+    if (body.name        != null) patch.name        = body.name;
+    if (body.email       != null) patch.email       = body.email;
+    if (body.phone       != null) patch.phone       = body.phone;
+    if (body.location    != null) patch.location    = body.location;
+    if (body.education   != null) patch.education   = body.education;
+    if (body.experience  != null) patch.experience  = body.experience;
+    if (body.status      != null) patch.status      = body.status;
+    if (body.linkedin    != null) patch.linkedin    = body.linkedin;
+    if (body.github      != null) patch.github      = body.github;
+    if (body.portfolio   != null) patch.portfolio   = body.portfolio;
+    if (body.summary     != null) patch.summary     = body.summary;
+    if (body.university  != null) patch.university  = body.university;
+    if (body.grad_year   != null) patch.gradYear    = body.grad_year;
+    if (body.skills         != null) patch.skills         = JSON.stringify(Array.isArray(body.skills)         ? body.skills         : []);
+    if (body.certifications != null) patch.certifications = JSON.stringify(Array.isArray(body.certifications) ? body.certifications : []);
+    if (body.languages      != null) patch.languages      = JSON.stringify(Array.isArray(body.languages)      ? body.languages      : []);
+    if (body.work_history   != null) patch.workHistory    = JSON.stringify(Array.isArray(body.work_history)   ? body.work_history   : []);
+
+    if (Object.keys(patch).length === 0) return c.json({ error: 'No fields to update' }, 400);
+
+    const updated = await db.update(candidates).set(patch as any).where(eq(candidates.id, id)).returning();
+
+    const u = updated[0];
+    return c.json({
+      ...u,
+      skills:         safeJsonParse(u.skills),
+      certifications: safeJsonParse(u.certifications),
+      languages:      safeJsonParse(u.languages),
+      workHistory:    safeJsonParse(u.workHistory),
+    });
+  } catch {
+    return c.json({ error: 'Failed to update candidate' }, 500);
   }
 });
 

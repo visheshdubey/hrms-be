@@ -25,16 +25,16 @@ async function seed() {
     await db.insert(jobs).values({
       title: 'Senior Frontend Developer',
       department: 'Engineering',
-      status: 'Ready to accept applications',
+      status: 'ready',
       type: 'Full-time',
       location: 'Remote',
       createdBy: userId
     });
-    
+
     await db.insert(jobs).values({
       title: 'Backend Engineer',
       department: 'Engineering',
-      status: 'Ready to accept applications',
+      status: 'ready',
       type: 'Full-time',
       location: 'On-site',
       createdBy: userId

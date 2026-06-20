@@ -1,7 +1,4 @@
 ```
-do this
-```
-```
 npm install
 npm run dev
 ```

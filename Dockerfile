@@ -1,25 +1,18 @@
-FROM node:20-alpine AS builder
-
-WORKDIR /app
-
-COPY package.json package-lock.json ./
-RUN npm ci
-
-COPY tsconfig.json ./
-COPY src ./src
-RUN npm run build
-
 FROM node:20-alpine
 
 WORKDIR /app
 
-ENV NODE_ENV=production
+# Copy package files
+COPY package*.json ./
 
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# Install dependencies
+RUN npm install
 
-COPY --from=builder /app/dist ./dist
+# Copy source code
+COPY . .
 
+# Expose the API port
 EXPOSE 3000
 
-CMD ["npm", "start"]
+# Start the application
+CMD ["sh", "-c", "mkdir -p /app/data && npx drizzle-kit push && npx tsx src/index.ts"]

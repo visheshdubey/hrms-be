@@ -19,6 +19,39 @@ export const transporter = nodemailer.createTransport({
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SMTP_USER || 'noreply@hrms.com';
 
+/** When SMTP is not configured, log emails to console instead of failing. */
+function isSmtpConfigured(): boolean {
+  return Boolean(process.env.SMTP_USER && process.env.SMTP_PASS);
+}
+
+async function deliverEmail(
+  label: string,
+  payload: { to: string; subject: string; html: string },
+): Promise<boolean> {
+  if (!isSmtpConfigured()) {
+    console.log(`[EMAIL MOCK] ${label}`);
+    console.log(`  To: ${payload.to}`);
+    console.log(`  Subject: ${payload.subject}`);
+    const linkMatch = payload.html.match(/href="([^"]+)"/);
+    if (linkMatch) console.log(`  Link: ${linkMatch[1]}`);
+    return true;
+  }
+
+  try {
+    const info = await transporter.sendMail({
+      from: `"HRMS Team" <${FROM_EMAIL}>`,
+      to: payload.to,
+      subject: payload.subject,
+      html: payload.html,
+    });
+    console.log(`${label} sent: ${info.messageId}`);
+    return true;
+  } catch (error) {
+    console.error(`Error ${label.toLowerCase()}:`, error);
+    return false;
+  }
+}
+
 /**
  * Sends a verification email to a newly registered user
  */
@@ -47,24 +80,51 @@ export const sendVerificationEmail = async (toEmail: string, verifyToken: string
     </div>
   `;
 
-  try {
-    const info = await transporter.sendMail({
-      from: `"HRMS Team" <${FROM_EMAIL}>`,
-      to: toEmail,
-      subject: "Verify your HRMS account",
-      html: html,
-    });
-    console.log(`Email sent: ${info.messageId}`);
-    return true;
-  } catch (error) {
-    console.error("Error sending verification email:", error);
-    return false;
-  }
+  return deliverEmail('Verification email', {
+    to: toEmail,
+    subject: 'Verify your HRMS account',
+    html,
+  });
 };
 
 /**
  * Sends an invite email to a team member
  */
+/**
+ * Sends a password-reset email to an existing user
+ */
+export const sendPasswordResetEmail = async (toEmail: string, resetToken: string) => {
+  const resetLink = `${FRONTEND_URL}/create-password?token=${resetToken}`;
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eaeaea; border-radius: 8px;">
+      <h2 style="color: #333;">Reset your password</h2>
+      <p style="color: #555; line-height: 1.5;">
+        We received a request to reset your HRMS account password. Click the button below to choose a new password.
+      </p>
+      <div style="text-align: center; margin: 30px 0;">
+        <a href="${resetLink}" style="background-color: #000; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; display: inline-block;">
+          Reset Password
+        </a>
+      </div>
+      <p style="color: #555; font-size: 14px;">
+        Or copy and paste this link into your browser:<br>
+        <a href="${resetLink}" style="color: #0066cc;">${resetLink}</a>
+      </p>
+      <hr style="border: none; border-top: 1px solid #eaeaea; margin: 30px 0;">
+      <p style="color: #888; font-size: 12px; text-align: center;">
+        If you did not request a password reset, you can safely ignore this email.
+      </p>
+    </div>
+  `;
+
+  return deliverEmail('Password reset email', {
+    to: toEmail,
+    subject: 'Reset your HRMS password',
+    html,
+  });
+};
+
 export const sendInviteEmail = async (toEmail: string, inviterName: string, verifyToken: string) => {
   const verifyLink = `${FRONTEND_URL}/accept-invite?token=${verifyToken}`;
 
@@ -89,17 +149,9 @@ export const sendInviteEmail = async (toEmail: string, inviterName: string, veri
     </div>
   `;
 
-  try {
-    const info = await transporter.sendMail({
-      from: `"HRMS Team" <${FROM_EMAIL}>`,
-      to: toEmail,
-      subject: `Invitation from ${inviterName} to join HRMS`,
-      html: html,
-    });
-    console.log(`Invite email sent: ${info.messageId}`);
-    return true;
-  } catch (error) {
-    console.error("Error sending invite email:", error);
-    return false;
-  }
+  return deliverEmail('Invite email', {
+    to: toEmail,
+    subject: `Invitation from ${inviterName} to join HRMS`,
+    html,
+  });
 };
