@@ -475,7 +475,8 @@ auth.put('/me', zValidator('json', updateSchema), async (c) => {
 
     return c.json({ message: 'Profile updated', user: updatedUser[0] }, 200);
   } catch (error) {
-    return c.json({ error: 'Invalid or expired token' }, 401);
+    console.error('[PUT /me] Error saving profile:', error);
+    return c.json({ error: 'Failed to update profile' }, 500);
   }
 });
 

@@ -1,6 +1,7 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { bodyLimit } from 'hono/body-limit';
 import authRoutes from './routes/auth.js';
 import jobsRoutes from './routes/jobs.js';
 import candidatesRoutes from './routes/candidates.js';
@@ -32,6 +33,16 @@ app.use('*', cors({
   allowHeaders: ['Content-Type', 'Authorization'],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
+
+app.use(
+  '*',
+  bodyLimit({
+    maxSize: 10 * 1024 * 1024, // 10MB limit for Base64 avatars
+    onError: (c) => {
+      return c.json({ error: 'Payload size exceeds 10MB limit' }, 413);
+    },
+  })
+);
 
 
 // Base Route
