@@ -1,0 +1,13 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1781977291015,
+      "tag": "0000_brief_brother_voodoo",
+      "breakpoints": true
+    }
+  ]
+}

@@ -20,6 +20,13 @@ export const users = sqliteTable("users", {
   }),
   portalType: text("portal_type", { enum: ["org", "recruiter"] }),
   organizationId: integer("organization_id").references(() => organizations.id),
+  avatar: text("avatar"),
+  country: text("country").default("australia"),
+  timezone: text("timezone").default("pst"),
+  bio: text("bio"),
+  isActive: integer("is_active").default(1),
+  passwordOtp: text("password_otp"),
+  passwordOtpExpiry: text("password_otp_expiry"),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
