@@ -108,7 +108,10 @@ commands:
                       ssh -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame" \<< 'EOF'
                         circle_project_reponame_var=$1
                         cd /home/source/<< parameters.environment >>/$circle_project_reponame_var/
-                        docker compose -f ./docker/docker-compose.<< parameters.environment >>.yml up -d --build
+                        docker compose -f ./docker/docker-compose.<< parameters.environment >>.yml down --remove-orphans || true
+                        docker rm -f ${circle_project_reponame_var}-<< parameters.environment >> || true
+                        docker rm -f hrms-be-prod || true
+                        docker compose -f ./docker/docker-compose.<< parameters.environment >>.yml up -d --build --remove-orphans
                       EOF
 
     update-nginx:
