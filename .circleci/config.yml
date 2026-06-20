@@ -120,6 +120,8 @@ commands:
                         ln -sf /etc/nginx/sites-available/${circle_project_reponame_var}.conf /etc/nginx/sites-enabled/${circle_project_reponame_var}.conf
                         nginx -t
                         systemctl reload nginx
+                        certbot --nginx -d ${domain} --non-interactive --agree-tos -m admin@devcognito.tech --redirect
+                        systemctl reload nginx
                       EOF
 
 jobs:
