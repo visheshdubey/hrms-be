@@ -15,4 +15,4 @@ COPY . .
 EXPOSE 3000
 
 # Start the application
-CMD ["sh", "-c", "mkdir -p /app/data && npx drizzle-kit push && npx tsx src/index.ts"]
+CMD ["sh", "-c", "mkdir -p /app/data && npx drizzle-kit push --force && npx tsx src/index.ts"]
