@@ -17,6 +17,14 @@ commands:
                         sudo apt-get install -y rsync
                       fi
 
+    clean-disk-space:
+        description: "Free disk space on remote server"
+        steps:
+            - run:
+                  name: Clean remote disk
+                  command: |
+                      ssh -o StrictHostKeyChecking=no root@147.93.18.45 "docker system prune -af --volumes || true; journalctl --vacuum-time=1d || true"
+
     create-remote-dir:
         description: "Create remote directory on server"
         parameters:
@@ -47,6 +55,8 @@ commands:
                         --exclude='dist' \
                         --exclude='.venv' \
                         --exclude='__pycache__' \
+                        --exclude='sqlite.db' \
+                        --exclude='data/sqlite.db' \
                         ./ root@147.93.18.45:/home/source/<< parameters.environment >>/${CIRCLE_PROJECT_REPONAME}/
 
     build-docker:
@@ -135,6 +145,7 @@ jobs:
         steps:
             - checkout
             - add_ssh_keys
+            - clean-disk-space
             - install-rsync
             - create-remote-dir:
                   environment: prod
