@@ -10,6 +10,7 @@ const candidatesRouter = new Hono<AppContext>({ strict: false });
 
 const candidateSchema = z.object({
   jobId: z.number().optional().nullable(),
+  job_id: z.union([z.number(), z.string()]).optional().nullable(),
   filename: z.string().optional(),
   name: z.string().optional(),
   email: z.string().optional(),
@@ -20,6 +21,7 @@ const candidateSchema = z.object({
   skills: z.union([z.string(), z.array(z.string())]).optional(),
   match_score: z.number().optional(),
   status: z.string().optional(),
+  source: z.string().optional(),
   // New 18-layer fields
   linkedin: z.string().optional(),
   github: z.string().optional(),
@@ -81,11 +83,14 @@ candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), asy
   try {
     const body = c.req.valid('json');
     const {
-      jobId, filename, name, email, phone, location,
-      education, experience, skills, match_score, status,
+      jobId, job_id, filename, name, email, phone, location,
+      education, experience, skills, match_score, status, source,
       linkedin, github, portfolio, certifications, languages,
       summary, university, grad_year, work_history, fingerprint,
     } = body;
+
+    // Resolve jobId from either camelCase or snake_case
+    const resolvedJobId = jobId ?? (job_id ? Number(job_id) : null) ?? null;
 
     // Duplicate detection: check fingerprint
     if (fingerprint) {
@@ -106,7 +111,7 @@ candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), asy
     }
 
     const created = await db.insert(candidates).values({
-      jobId: jobId || null,
+      jobId: resolvedJobId || null,
       filename: filename || 'unknown.pdf',
       name: name || '',
       email: email || '',
@@ -117,6 +122,7 @@ candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), asy
       skills: JSON.stringify(Array.isArray(skills) ? skills : []),
       matchScore: match_score ?? 0,
       status: status || 'New',
+      source: source || 'Internal',
       // New 18-layer fields
       linkedin: linkedin || '',
       github: github || '',
@@ -132,12 +138,12 @@ candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), asy
     }).returning();
 
     // Increment applicant count for the job
-    if (jobId) {
-      const job = await db.select().from(jobs).where(eq(jobs.id, jobId));
+    if (resolvedJobId) {
+      const job = await db.select().from(jobs).where(eq(jobs.id, resolvedJobId));
       if (job.length > 0) {
         await db.update(jobs)
           .set({ applicants: job[0].applicants + 1 })
-          .where(eq(jobs.id, jobId));
+          .where(eq(jobs.id, resolvedJobId));
       }
     }
 
