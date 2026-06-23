@@ -51,6 +51,7 @@ export const jobs = sqliteTable("jobs", {
   applicants: integer("applicants").notNull().default(0),
   description: text("description").default(""),
   postedDate: text("posted_date").default(sql`CURRENT_TIMESTAMP`).notNull(),
+  accountId: integer("account_id").references(() => accounts.id),
   createdBy: integer("created_by").references(() => users.id),
 });
 
@@ -198,6 +199,7 @@ export const candidates = sqliteTable("candidates", {
   skills: text("skills").default("[]"), // JSON array stored as text
   matchScore: real("match_score").notNull().default(0),
   status: text("status").notNull().default("New"),
+  source: text("source").default("Internal"),
   // New 18-layer fields
   linkedin: text("linkedin").default(""),
   github: text("github").default(""),

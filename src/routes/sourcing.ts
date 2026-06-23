@@ -411,14 +411,65 @@ async function searchLinkedIn(
     };
   }
 
+  // ── Simulated LinkedIn profiles for demo/presentation ──
+  // Generates realistic candidates based on search keywords
+  const firstNames = ['Aarav','Priya','Rohan','Sneha','Vikram','Ananya','Arjun','Kavita','Rahul','Meera',
+    'Aditya','Neha','Siddharth','Pooja','Karthik','Divya','Amit','Ritu','Varun','Swati',
+    'Nikhil','Shruti','Harsh','Anjali','Deepak','Nisha','Rajesh','Pallavi','Manish','Tanvi'];
+  const lastNames = ['Sharma','Patel','Kumar','Singh','Reddy','Gupta','Mehta','Joshi','Verma','Iyer',
+    'Nair','Chauhan','Malhotra','Kapoor','Rao','Das','Mishra','Thakur','Bhatia','Choudhary'];
+  const companies = ['Infosys','TCS','Wipro','HCL Technologies','Tech Mahindra','Cognizant','Accenture',
+    'Capgemini','IBM India','Amazon','Google','Microsoft','Flipkart','PhonePe','Razorpay','Zomato','Swiggy',
+    'Freshworks','Zoho','Paytm'];
+  const cities = ['Bangalore','Mumbai','Delhi NCR','Hyderabad','Pune','Chennai','Noida','Gurugram','Kolkata','Ahmedabad'];
+  const degrees = ['B.Tech','M.Tech','BCA','MCA','B.E.','MBA','M.Sc.','PhD'];
+  const universities = ['IIT Delhi','IIT Bombay','IIT Madras','BITS Pilani','NIT Trichy','VIT','SRM','IIIT Hyderabad','DTU','NSIT'];
+
+  const searchTerms = keywords.length > 0 ? keywords : ['Software Developer'];
+  const totalSim = 12 + Math.floor(Math.random() * 8); // 12-20 candidates
+  const startIdx = (p.page - 1) * p.pageSize;
+  const endIdx = Math.min(startIdx + p.pageSize, totalSim);
+
+  const simResults: NormalizedCandidate[] = [];
+  for (let i = startIdx; i < endIdx; i++) {
+    const fn = firstNames[i % firstNames.length];
+    const ln = lastNames[(i * 7 + 3) % lastNames.length];
+    const company = companies[(i * 11 + 5) % companies.length];
+    const city = p.location?.trim() || cities[i % cities.length];
+    const expYears = 1 + (i % 15);
+    const degree = degrees[i % degrees.length];
+    const uni = universities[(i * 3) % universities.length];
+
+    const skillPool = [...searchTerms];
+    const extraSkills = ['React','Node.js','Python','Java','TypeScript','AWS','Docker','Kubernetes','MongoDB','PostgreSQL','Redis','GraphQL','REST API','Microservices','CI/CD'];
+    for (let s = 0; s < 3 + (i % 4); s++) {
+      const sk = extraSkills[(i + s * 7) % extraSkills.length];
+      if (!skillPool.includes(sk)) skillPool.push(sk);
+    }
+
+    simResults.push({
+      id: `linkedin-sim-${p.page}-${i}`,
+      source: 'linkedin',
+      name: `${fn} ${ln}`,
+      headline: `${searchTerms[0]} at ${company} | ${degree} from ${uni} | ${expYears}+ yrs`,
+      location: city,
+      skills: skillPool.slice(0, 6),
+      experienceYears: expYears,
+      avatarUrl: null,
+      externalUrl: `https://linkedin.com/in/${fn.toLowerCase()}-${ln.toLowerCase()}-${100000 + i}`,
+      matchScore: Math.max(45, Math.min(98, 90 - i * 2 + Math.floor(Math.random() * 10))),
+      flags: { openToWork: i % 3 === 0, simulated: true },
+    });
+  }
+
   return {
-    total: 0,
-    page: [],
+    total: totalSim,
+    page: simResults,
     meta: {
       simulated: true,
       provider: 'simulated',
       notice:
-        'LinkedIn blocks direct scraping. Configure PROXYCURL_API_KEY or GOOGLE_CSE_API_KEY + GOOGLE_CSE_CX for live X-Ray results.',
+        'Showing simulated LinkedIn profiles. Configure PROXYCURL_API_KEY or GOOGLE_CSE_API_KEY + GOOGLE_CSE_CX for live results.',
     },
   };
 }
