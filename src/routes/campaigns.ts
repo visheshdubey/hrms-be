@@ -8,6 +8,9 @@ import {
 } from '../db/schema.js';
 import { eq, desc, inArray, sql } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import { getOrgMemberIds } from '../lib/orgScope.js';
+import { parsePagination, paginateInMemory } from '../lib/pagination.js';
+import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
 const campaignsRouter = new Hono<AppContext>({ strict: false });
 
@@ -26,12 +29,6 @@ const recipientSchema = z.object({
   name: z.string().optional(),
   candidateId: z.number().int().positive().optional(),
 });
-
-async function orgMemberIds(orgId: number | null, userId: number): Promise<number[]> {
-  if (orgId == null) return [userId];
-  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-  return members.map((m) => m.id);
-}
 
 async function enrichCampaign(row: typeof campaigns.$inferSelect) {
   let creatorName = '';
@@ -68,10 +65,9 @@ campaignsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_
     const typeFilter = c.req.query('type') ?? 'all';
     const statusFilter = c.req.query('status');
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
-    const page = Math.max(1, parseInt(c.req.query('page') ?? '1') || 1);
-    const pageSize = Math.min(100, Math.max(1, parseInt(c.req.query('pageSize') ?? '15') || 15));
+    const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await orgMemberIds(orgId, userId);
+    const memberIds = await getOrgMemberIds(orgId, userId);
     if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
 
     let rows = await db.select().from(campaigns)
@@ -89,9 +85,7 @@ campaignsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_
         })
       : enriched;
 
-    const total = filtered.length;
-    const start = (page - 1) * pageSize;
-    return c.json({ data: filtered.slice(start, start + pageSize), total, page, pageSize });
+    return c.json(paginateInMemory(filtered, page, pageSize));
   } catch {
     return c.json({ error: 'Failed to fetch campaigns' }, 500);
   }

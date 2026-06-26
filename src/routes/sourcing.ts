@@ -15,6 +15,7 @@ import { db } from '../db/index.js';
 import { candidates, users } from '../db/schema.js';
 import { eq, inArray, and, or, sql, type SQL } from 'drizzle-orm';
 import { requireAuth, type AppContext } from '../middleware.js';
+import { getOrgMemberIdsFromContext } from '../lib/orgScope.js';
 
 const sourcingRouter = new Hono<AppContext>({ strict: false });
 
@@ -169,14 +170,6 @@ function ilike(column: unknown, term: string): SQL {
   return sql`lower(${column}) like ${pattern}`;
 }
 
-async function orgMemberIds(c: { get: (key: string) => unknown }): Promise<number[] | null> {
-  const userId = c.get('userId') as number;
-  const orgId = c.get('organizationId') as number | null;
-  if (orgId == null) return [userId];
-  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-  return members.map((u) => u.id);
-}
-
 function mapInternalRow(r: typeof candidates.$inferSelect): NormalizedCandidate {
   const skills = safeArray(r.skills);
   return {
@@ -199,7 +192,7 @@ async function searchInternal(
   p: InternalPayload,
   started: number,
 ) {
-  const memberIds = await orgMemberIds(c);
+  const memberIds = await getOrgMemberIdsFromContext(c);
   if (!memberIds || memberIds.length === 0) {
     return envelope('internal', p, p.page, p.pageSize, 0, Date.now() - started, []);
   }

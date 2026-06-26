@@ -8,6 +8,9 @@ import {
 } from '../db/schema.js';
 import { eq, desc, inArray } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import { getOrgMemberIds } from '../lib/orgScope.js';
+import { parsePagination, paginateInMemory } from '../lib/pagination.js';
+import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
 const submissionsRouter = new Hono<AppContext>({ strict: false });
 
@@ -30,12 +33,6 @@ const TRANSITIONS: Record<SubStatus, SubStatus[]> = {
   client_accepted:            [],
   withdrawn:                  [],
 };
-
-async function orgMemberIds(orgId: number | null, userId: number): Promise<number[]> {
-  if (orgId == null) return [userId];
-  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-  return members.map((m) => m.id);
-}
 
 async function enrichSubmission(row: Record<string, unknown>) {
   const [cand] = await db.select({
@@ -96,10 +93,9 @@ submissionsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruite
     const orgId = c.get('organizationId') as number | null;
     const view = c.req.query('view') ?? 'all';
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
-    const page = Math.max(1, parseInt(c.req.query('page') ?? '1') || 1);
-    const pageSize = Math.min(100, Math.max(1, parseInt(c.req.query('pageSize') ?? '20') || 20));
+    const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await orgMemberIds(orgId, userId);
+    const memberIds = await getOrgMemberIds(orgId, userId);
     if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
 
     let rows = await db.select().from(submissions)
@@ -108,7 +104,7 @@ submissionsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruite
 
     if (view === 'mine') rows = rows.filter((r) => r.submittedBy === userId);
     if (view === 'recent') {
-      const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
+      const cutoff = new Date(Date.now() - 7 * MS_PER_DAY).toISOString();
       rows = rows.filter((r) => r.submittedAt >= cutoff);
     }
 

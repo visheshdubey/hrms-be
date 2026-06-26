@@ -5,6 +5,9 @@ import { db } from '../db/index.js';
 import { accounts, contacts, users, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
 import { eq, desc, inArray, sql } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import { getOrgMemberIds, isOrgMember } from '../lib/orgScope.js';
+import { parsePagination, paginateInMemory } from '../lib/pagination.js';
+import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
 const accountsRouter = new Hono<AppContext>({ strict: false });
 
@@ -17,12 +20,6 @@ const STATUS_LABELS: Record<AccStatus, string> = {
 const TYPE_LABELS: Record<AccType, string> = {
   client: 'Client', client_vendor: 'Client/Vendor', vendor: 'Vendor', prospect: 'Prospect',
 };
-
-async function orgMemberIds(orgId: number | null, userId: number): Promise<number[]> {
-  if (orgId == null) return [userId];
-  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-  return members.map((m) => m.id);
-}
 
 async function enrichAccount(row: typeof accounts.$inferSelect) {
   let ownerName = '';
@@ -71,10 +68,9 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     const view = c.req.query('view') ?? 'all';
     const typeFilter = c.req.query('type');
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
-    const page = Math.max(1, parseInt(c.req.query('page') ?? '1') || 1);
-    const pageSize = Math.min(100, Math.max(1, parseInt(c.req.query('pageSize') ?? '20') || 20));
+    const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await orgMemberIds(orgId, userId);
+    const memberIds = await getOrgMemberIds(orgId, userId);
     if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
 
     let rows = await db.select().from(accounts)
@@ -83,7 +79,7 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
 
     if (view === 'mine') rows = rows.filter((r) => r.createdBy === userId);
     if (view === 'recent') {
-      const cutoff = new Date(Date.now() - 30 * 86400000).toISOString();
+      const cutoff = new Date(Date.now() - RECENT_DAYS * MS_PER_DAY).toISOString();
       rows = rows.filter((r) => r.createdAt >= cutoff);
     }
     if (typeFilter && typeFilter !== 'all') rows = rows.filter((r) => r.type === typeFilter);
@@ -97,9 +93,7 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
         })
       : enriched;
 
-    const total = filtered.length;
-    const start = (page - 1) * pageSize;
-    return c.json({ data: filtered.slice(start, start + pageSize), total, page, pageSize });
+    return c.json(paginateInMemory(filtered, page, pageSize));
   } catch {
     return c.json({ error: 'Failed to fetch accounts' }, 500);
   }
@@ -128,10 +122,18 @@ accountsRouter.post('/merge', requireAuth, requireRole('recruiter_admin'), zVali
 /* GET /accounts/:id */
 accountsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
     const row = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
     if (!row.length) return c.json({ error: 'Account not found' }, 404);
+
+    const memberIds = await getOrgMemberIds(orgId, userId);
+    if (!isOrgMember(row[0].createdBy, memberIds)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
+
     return c.json(await enrichAccount(row[0]));
   } catch {
     return c.json({ error: 'Failed to fetch account' }, 500);
