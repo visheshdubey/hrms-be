@@ -62,3 +62,9 @@ export const requireRole = (...allowedRoles: UserRole[]) =>
     }
     await next();
   };
+
+export const RECRUITER_ROLES: UserRole[] = ['recruiter_admin', 'recruited_staff'];
+export const ORG_ROLES: UserRole[] = ['org_admin', 'org_staff'];
+
+/** Admin shell — Clients, Candidates sourcing, Tags, Integrations */
+export const requireRecruiter = requireRole(...RECRUITER_ROLES);

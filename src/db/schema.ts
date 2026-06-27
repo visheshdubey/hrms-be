@@ -52,6 +52,9 @@ export const jobs = sqliteTable("jobs", {
   description: text("description").default(""),
   postedDate: text("posted_date").default(sql`CURRENT_TIMESTAMP`).notNull(),
   accountId: integer("account_id").references(() => accounts.id),
+  payPackageMin: real("pay_package_min"),
+  payPackageMax: real("pay_package_max"),
+  payCurrency: text("pay_currency").default("INR"),
   createdBy: integer("created_by").references(() => users.id),
 });
 
@@ -165,6 +168,7 @@ export const calendarEvents = sqliteTable("calendar_events", {
   candidateId: integer("candidate_id"),
   candidateName: text("candidate_name").default(""),
   jobProfile: text("job_profile").default(""),
+  jobId: integer("job_id").references(() => jobs.id),
   location: text("location").default(""),
   description: text("description").default(""),
   meetingLink: text("meeting_link").default(""),
@@ -421,3 +425,101 @@ export const rolesPermissions = sqliteTable("roles_permissions", {
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
   updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
+
+/* ── Settings: Tags (filter candidates & applications) ── */
+export const tags = sqliteTable("tags", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  organizationId: integer("organization_id").notNull().references(() => organizations.id),
+  name: text("name").notNull(),
+  color: text("color").default("#6366f1"),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+export const candidateTags = sqliteTable(
+  "candidate_tags",
+  {
+    candidateId: integer("candidate_id").notNull().references(() => candidates.id),
+    tagId: integer("tag_id").notNull().references(() => tags.id),
+  },
+  (t) => ({ pk: unique("candidate_tag_unique").on(t.candidateId, t.tagId) }),
+);
+
+export const applicationTags = sqliteTable(
+  "application_tags",
+  {
+    applicationId: integer("application_id").notNull().references(() => applications.id),
+    tagId: integer("tag_id").notNull().references(() => tags.id),
+  },
+  (t) => ({ pk: unique("application_tag_unique").on(t.applicationId, t.tagId) }),
+);
+
+/* ── Settings: Integrations (API keys per platform) ── */
+export const INTEGRATION_PLATFORMS = [
+  "linkedin",
+  "github",
+  "google_cse",
+  "proxycurl",
+  "custom",
+] as const;
+
+export const integrations = sqliteTable("integrations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  organizationId: integer("organization_id").notNull().references(() => organizations.id),
+  platform: text("platform", { enum: INTEGRATION_PLATFORMS }).notNull(),
+  label: text("label").notNull(),
+  apiKey: text("api_key").default(""),
+  configJson: text("config_json").default("{}"),
+  isActive: integer("is_active").default(1),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+  updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+/* ── Jobs: Custom stages per job ── */
+export const JOB_STAGE_TYPES = ["application", "interview"] as const;
+
+export const jobStages = sqliteTable("job_stages", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  jobId: integer("job_id").notNull().references(() => jobs.id),
+  name: text("name").notNull(),
+  orderIndex: integer("order_index").notNull().default(0),
+  stageType: text("stage_type", { enum: JOB_STAGE_TYPES }).notNull().default("application"),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+/* ── Candidates: Groups for bulk assign ── */
+export const candidateGroups = sqliteTable("candidate_groups", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  organizationId: integer("organization_id").notNull().references(() => organizations.id),
+  name: text("name").notNull(),
+  description: text("description").default(""),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+export const candidateGroupMembers = sqliteTable(
+  "candidate_group_members",
+  {
+    groupId: integer("group_id").notNull().references(() => candidateGroups.id),
+    candidateId: integer("candidate_id").notNull().references(() => candidates.id),
+  },
+  (t) => ({ pk: unique("group_candidate_unique").on(t.groupId, t.candidateId) }),
+);
+
+/* ── Jobs: Shortlist from Find Candidates ── */
+export const SHORTLIST_SOURCES = ["internal", "linkedin", "github", "manual"] as const;
+
+export const jobShortlists = sqliteTable(
+  "job_shortlists",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    jobId: integer("job_id").notNull().references(() => jobs.id),
+    candidateId: integer("candidate_id").notNull().references(() => candidates.id),
+    source: text("source", { enum: SHORTLIST_SOURCES }).notNull().default("internal"),
+    notes: text("notes").default(""),
+    createdBy: integer("created_by").references(() => users.id),
+    createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+  },
+  (t) => ({ uniqueJobCandidate: unique("shortlist_job_candidate").on(t.jobId, t.candidateId) }),
+);

@@ -2,8 +2,8 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { accounts, contacts, users, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
-import { eq, desc, inArray, sql } from 'drizzle-orm';
+import { accounts, contacts, users, jobs, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
+import { eq, desc, inArray, sql, and } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
 import { getOrgMemberIds, isOrgMember } from '../lib/orgScope.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
@@ -116,6 +116,50 @@ accountsRouter.post('/merge', requireAuth, requireRole('recruiter_admin'), zVali
     return c.json(await enrichAccount(target));
   } catch {
     return c.json({ error: 'Failed to merge accounts' }, 500);
+  }
+});
+
+/* GET /accounts/:id/stats — must be before /:id */
+accountsRouter.get('/:id/stats', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const [account] = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+    if (!account) return c.json({ error: 'Account not found' }, 404);
+
+    const memberIds = await getOrgMemberIds(orgId, userId);
+    if (!isOrgMember(account.createdBy, memberIds)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
+
+    const accountJobs = await db.select().from(jobs).where(eq(jobs.accountId, id));
+    const totalJobs = accountJobs.length;
+    const activeJobs = accountJobs.filter(
+      (j) => j.status === 'submission_in_progress' || j.status === 'ready',
+    ).length;
+
+    const [contactRow] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(contacts)
+      .where(eq(contacts.accountId, id));
+
+    const [activeContactRow] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(contacts)
+      .where(and(eq(contacts.accountId, id), eq(contacts.status, 'active')));
+
+    return c.json({
+      accountId: id,
+      totalJobs,
+      activeJobs,
+      totalContacts: Number(contactRow?.count ?? 0),
+      activeContacts: Number(activeContactRow?.count ?? 0),
+    });
+  } catch {
+    return c.json({ error: 'Failed to fetch account stats' }, 500);
   }
 });
 

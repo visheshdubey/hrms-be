@@ -15,6 +15,13 @@
       "when": 1782197510412,
       "tag": "0001_familiar_otto_octavius",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1782300000000,
+      "tag": "0002_product_architecture",
+      "breakpoints": true
     }
   ]
 }

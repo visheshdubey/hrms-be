@@ -109,12 +109,19 @@ interviewsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
     const { page, pageSize } = parsePagination(c.req.query());
 
+    const jobIdParam = c.req.query('jobId');
+    const jobId = jobIdParam ? parseInt(jobIdParam) : null;
+
     const memberIds = await getOrgMemberIds(orgId, userId);
     if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
 
     let rows = await db.select().from(interviews)
       .where(inArray(interviews.createdBy, memberIds))
       .orderBy(desc(interviews.startTime));
+
+    if (jobId != null && !isNaN(jobId)) {
+      rows = rows.filter((r) => r.jobId === jobId);
+    }
 
     const now = new Date().toISOString();
     if (period === 'upcoming') rows = rows.filter((r) => r.startTime >= now && r.status === 'scheduled');
