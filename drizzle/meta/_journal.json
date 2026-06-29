@@ -1,26 +1,12 @@
 {
   "version": "7",
-  "dialect": "sqlite",
+  "dialect": "postgresql",
   "entries": [
     {
       "idx": 0,
-      "version": "6",
-      "when": 1781977291015,
-      "tag": "0000_brief_brother_voodoo",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "6",
-      "when": 1782197510412,
-      "tag": "0001_familiar_otto_octavius",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1782300000000,
-      "tag": "0002_product_architecture",
+      "version": "7",
+      "when": 1782738441546,
+      "tag": "0000_init_postgres",
       "breakpoints": true
     }
   ]
