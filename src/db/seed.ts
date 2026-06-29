@@ -8,6 +8,10 @@ import {
   candidates,
   applications,
   applicationStageHistory,
+  accounts,
+  contacts,
+  candidateGroups,
+  candidateGroupMembers,
   APP_STATUSES,
 } from './schema.js';
 
@@ -48,7 +52,47 @@ async function seed() {
 
     const userId = admin.id;
 
-    /* ── 3. Jobs (4 statuses) ── */
+    /* ── 3. Client accounts (5) ── */
+    const demoAccounts = [
+      { name: 'Acme Corporation', email: 'contact@acme.com', city: 'San Francisco', country: 'USA' },
+      { name: 'Horizon Ventures', email: 'hr@horizonventures.io', city: 'New York', country: 'USA' },
+      { name: 'BlueSky Analytics', email: 'talent@bluesky.io', city: 'Chicago', country: 'USA' },
+      { name: 'NovaBuild Infra', email: 'careers@novabuild.com', city: 'Austin', country: 'USA' },
+      { name: 'PineSoft Technologies', email: 'jobs@pinesoft.com', city: 'Seattle', country: 'USA' },
+    ];
+
+    const accountRows = [];
+    for (const a of demoAccounts) {
+      const [row] = await db.insert(accounts).values({
+        name: a.name,
+        status: 'active',
+        type: 'client',
+        email: a.email,
+        city: a.city,
+        country: a.country,
+        website: `https://${a.name.toLowerCase().replace(/\s+/g, '')}.com`,
+        organizationId: org.id,
+        createdBy: userId,
+        updatedAt: new Date().toISOString(),
+      }).returning();
+      accountRows.push(row);
+
+      await db.insert(contacts).values({
+        accountId: row.id,
+        firstName: 'Primary',
+        lastName: 'Contact',
+        email: a.email,
+        phone: '+1-555-0100',
+        jobTitle: 'Hiring Manager',
+        department: 'HR',
+        status: 'active',
+        organizationId: org.id,
+        createdBy: userId,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    /* ── 4. Jobs (4 statuses) linked to accounts ── */
     const [jobFrontend] = await db.insert(jobs).values({
       title: 'Senior Frontend Developer',
       department: 'Engineering',
@@ -57,6 +101,7 @@ async function seed() {
       location: 'Remote',
       applicants: 3,
       description: 'React, TypeScript, and modern UI architecture.',
+      accountId: accountRows[0].id,
       createdBy: userId,
     }).returning();
 
@@ -68,6 +113,7 @@ async function seed() {
       location: 'Hybrid',
       applicants: 2,
       description: 'Node.js, Hono, and PostgreSQL experience required.',
+      accountId: accountRows[1].id,
       createdBy: userId,
     }).returning();
 
@@ -79,6 +125,7 @@ async function seed() {
       location: 'On-site',
       applicants: 0,
       description: 'Own the hiring product roadmap end-to-end.',
+      accountId: accountRows[2].id,
       createdBy: userId,
     }).returning();
 
@@ -90,10 +137,11 @@ async function seed() {
       location: 'Remote',
       applicants: 1,
       description: 'Figma, design systems, and user research.',
+      accountId: accountRows[3].id,
       createdBy: userId,
     });
 
-    /* ── 4. Candidates (6) ── */
+    /* ── 5. Candidates (6) ── */
     const candidateData = [
       { name: 'Alice Johnson',  email: 'alice@demo.com',  matchScore: 92, skills: ['React', 'TypeScript', 'Tailwind'] },
       { name: 'Bob Smith',      email: 'bob@demo.com',      matchScore: 78, skills: ['Node.js', 'PostgreSQL', 'Docker'] },
@@ -122,7 +170,7 @@ async function seed() {
       insertedCandidates.push(row);
     }
 
-    /* ── 5. Applications (6) across pipeline stages ── */
+    /* ── 6. Applications (6) across pipeline stages ── */
     type AppSeed = {
       jobId: number;
       candidateIdx: number;
@@ -207,15 +255,31 @@ async function seed() {
       }
     }
 
+    const [group] = await db.insert(candidateGroups).values({
+      organizationId: org.id,
+      name: 'Senior React engineers',
+      description: 'Shortlist for frontend roles',
+      createdBy: userId,
+    }).returning();
+
+    for (const cand of insertedCandidates.slice(0, 3)) {
+      await db.insert(candidateGroupMembers).values({
+        groupId: group.id,
+        candidateId: cand.id,
+      }).onConflictDoNothing();
+    }
+
     // Silence unused variable warning for draft job
     void jobPM;
 
     console.log('✅ Demo seed complete!');
     console.log('   Organization : Demo Recruitment Co.');
     console.log(`   Login        : ${DEMO_EMAIL} / ${DEMO_PASSWORD}`);
-    console.log('   Jobs         : 4 (submission_in_progress, ready, draft, closed)');
+    console.log('   Accounts     : 5 demo clients with contacts');
+    console.log('   Jobs         : 4 (linked to accounts)');
     console.log('   Candidates   : 6');
     console.log('   Applications : 6 (full pipeline stages)');
+    console.log('   Groups       : 1 candidate group');
   } catch (err) {
     console.error('❌ Seed failed:', err);
     process.exit(1);

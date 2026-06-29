@@ -8,6 +8,9 @@ import {
 } from '../db/schema.js';
 import { eq, desc, inArray, sql } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import { getOrgMemberIds } from '../lib/orgScope.js';
+import { parsePagination, paginateInMemory } from '../lib/pagination.js';
+import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
 const tasksRouter = new Hono<AppContext>({ strict: false });
 
@@ -29,12 +32,6 @@ const CATEGORY_LABELS: Record<TaskCategory, string> = {
   client_call: 'Client Call',
   screening: 'Screening',
 };
-
-async function orgMemberIds(orgId: number | null, userId: number): Promise<number[]> {
-  if (orgId == null) return [userId];
-  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-  return members.map((m) => m.id);
-}
 
 async function nextTaskCode(orgId: number | null): Promise<string> {
   const [row] = await db
@@ -105,10 +102,9 @@ tasksRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_staf
     const view = c.req.query('view') ?? 'all';
     const statusFilter = c.req.query('status');
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
-    const page = Math.max(1, parseInt(c.req.query('page') ?? '1') || 1);
-    const pageSize = Math.min(100, Math.max(1, parseInt(c.req.query('pageSize') ?? '15') || 15));
+    const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await orgMemberIds(orgId, userId);
+    const memberIds = await getOrgMemberIds(orgId, userId);
     if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
 
     let rows = await db.select().from(tasks)
@@ -134,9 +130,7 @@ tasksRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_staf
         })
       : enriched;
 
-    const total = filtered.length;
-    const start = (page - 1) * pageSize;
-    return c.json({ data: filtered.slice(start, start + pageSize), total, page, pageSize });
+    return c.json(paginateInMemory(filtered, page, pageSize));
   } catch {
     return c.json({ error: 'Failed to fetch tasks' }, 500);
   }

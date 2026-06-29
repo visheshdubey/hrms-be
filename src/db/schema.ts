@@ -1,16 +1,16 @@
-import { sqliteTable, integer, text, real, unique } from "drizzle-orm/sqlite-core";
+import { pgTable, serial, integer, text, real, unique } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
-export const organizations = sqliteTable("organizations", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const organizations = pgTable("organizations", {
+  id: serial("id").primaryKey(),
   name: text("name").notNull(),
   logo: text("logo").default(""),
   defaults: text("defaults").default("{}"),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
-export const users = sqliteTable("users", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
   name: text("name").notNull(),
   email: text("email").notNull().unique(),
   password: text("password"),
@@ -30,8 +30,8 @@ export const users = sqliteTable("users", {
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
-export const savedReports = sqliteTable("saved_reports", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const savedReports = pgTable("saved_reports", {
+  id: serial("id").primaryKey(),
   userId: integer("user_id").notNull().references(() => users.id),
   name: text("name").notNull(),
   type: text("type").notNull().default("pipeline"),
@@ -39,8 +39,8 @@ export const savedReports = sqliteTable("saved_reports", {
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
-export const jobs = sqliteTable("jobs", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const jobs = pgTable("jobs", {
+  id: serial("id").primaryKey(),
   title: text("title").notNull(),
   department: text("department").notNull().default("General"),
   status: text("status", {
@@ -52,6 +52,9 @@ export const jobs = sqliteTable("jobs", {
   description: text("description").default(""),
   postedDate: text("posted_date").default(sql`CURRENT_TIMESTAMP`).notNull(),
   accountId: integer("account_id").references(() => accounts.id),
+  payPackageMin: real("pay_package_min"),
+  payPackageMax: real("pay_package_max"),
+  payCurrency: text("pay_currency").default("INR"),
   createdBy: integer("created_by").references(() => users.id),
 });
 
@@ -66,10 +69,10 @@ export const APP_STATUSES = [
   "no_offer",
 ] as const;
 
-export const applications = sqliteTable(
+export const applications = pgTable(
   "applications",
   {
-    id: integer("id").primaryKey({ autoIncrement: true }),
+    id: serial("id").primaryKey(),
     jobId: integer("job_id").notNull().references(() => jobs.id),
     candidateId: integer("candidate_id").notNull().references(() => candidates.id),
     status: text("status", { enum: APP_STATUSES }).notNull().default("applied"),
@@ -84,8 +87,8 @@ export const applications = sqliteTable(
   })
 );
 
-export const applicationStageHistory = sqliteTable("application_stage_history", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const applicationStageHistory = pgTable("application_stage_history", {
+  id: serial("id").primaryKey(),
   applicationId: integer("application_id").notNull().references(() => applications.id),
   fromStatus: text("from_status"),
   toStatus: text("to_status", { enum: APP_STATUSES }).notNull(),
@@ -104,8 +107,8 @@ export const SUBMISSION_STATUSES = [
   "withdrawn",
 ] as const;
 
-export const submissions = sqliteTable("submissions", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const submissions = pgTable("submissions", {
+  id: serial("id").primaryKey(),
   applicationId: integer("application_id").references(() => applications.id),
   jobId: integer("job_id").notNull().references(() => jobs.id),
   candidateId: integer("candidate_id").notNull().references(() => candidates.id),
@@ -131,8 +134,8 @@ export const INTERVIEW_STATUSES = [
   "no_show",
 ] as const;
 
-export const interviews = sqliteTable("interviews", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const interviews = pgTable("interviews", {
+  id: serial("id").primaryKey(),
   applicationId: integer("application_id").references(() => applications.id),
   submissionId: integer("submission_id").references(() => submissions.id),
   jobId: integer("job_id").notNull().references(() => jobs.id),
@@ -155,8 +158,8 @@ export const interviews = sqliteTable("interviews", {
   updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
-export const calendarEvents = sqliteTable("calendar_events", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const calendarEvents = pgTable("calendar_events", {
+  id: serial("id").primaryKey(),
   title: text("title").notNull(),
   startTime: text("start_time").notNull(),
   endTime: text("end_time").notNull(),
@@ -165,6 +168,7 @@ export const calendarEvents = sqliteTable("calendar_events", {
   candidateId: integer("candidate_id"),
   candidateName: text("candidate_name").default(""),
   jobProfile: text("job_profile").default(""),
+  jobId: integer("job_id").references(() => jobs.id),
   location: text("location").default(""),
   description: text("description").default(""),
   meetingLink: text("meeting_link").default(""),
@@ -174,8 +178,8 @@ export const calendarEvents = sqliteTable("calendar_events", {
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
-export const notifications = sqliteTable("notifications", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const notifications = pgTable("notifications", {
+  id: serial("id").primaryKey(),
   userId: integer("user_id").notNull().references(() => users.id),
   title: text("title").notNull(),
   body: text("body").default(""),
@@ -186,8 +190,8 @@ export const notifications = sqliteTable("notifications", {
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
-export const candidates = sqliteTable("candidates", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const candidates = pgTable("candidates", {
+  id: serial("id").primaryKey(),
   jobId: integer("job_id").references(() => jobs.id),
   filename: text("filename").notNull(),
   name: text("name").notNull().default(""),
@@ -219,8 +223,8 @@ export const candidates = sqliteTable("candidates", {
 export const ACCOUNT_STATUSES = ["active", "inactive", "on_hold"] as const;
 export const ACCOUNT_TYPES = ["client", "client_vendor", "vendor", "prospect"] as const;
 
-export const accounts = sqliteTable("accounts", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const accounts = pgTable("accounts", {
+  id: serial("id").primaryKey(),
   name: text("name").notNull(),
   status: text("status", { enum: ACCOUNT_STATUSES }).notNull().default("active"),
   type: text("type", { enum: ACCOUNT_TYPES }).notNull().default("client"),
@@ -241,8 +245,8 @@ export const accounts = sqliteTable("accounts", {
 /* ── CRM: Contacts (people at accounts) ── */
 export const CONTACT_STATUSES = ["active", "inactive"] as const;
 
-export const contacts = sqliteTable("contacts", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const contacts = pgTable("contacts", {
+  id: serial("id").primaryKey(),
   accountId: integer("account_id").notNull().references(() => accounts.id),
   firstName: text("first_name").notNull(),
   lastName: text("last_name").notNull().default(""),
@@ -262,8 +266,8 @@ export const contacts = sqliteTable("contacts", {
 export const EMPLOYEE_STATUSES = ["active", "offboarded", "on_bench"] as const;
 export const EMPLOYMENT_TYPES = ["full_time", "contractor", "part_time", "intern"] as const;
 
-export const employees = sqliteTable("employees", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const employees = pgTable("employees", {
+  id: serial("id").primaryKey(),
   employeeCode: text("employee_code").notNull(),
   userId: integer("user_id").references(() => users.id),
   candidateId: integer("candidate_id").references(() => candidates.id),
@@ -297,8 +301,8 @@ export const ONBOARDING_STATUSES = [
   "profile_update",
 ] as const;
 
-export const onboardingWorkflows = sqliteTable("onboarding_workflows", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const onboardingWorkflows = pgTable("onboarding_workflows", {
+  id: serial("id").primaryKey(),
   workflowCode: text("workflow_code").notNull(),
   employeeId: integer("employee_id").references(() => employees.id),
   candidateId: integer("candidate_id").references(() => candidates.id),
@@ -324,8 +328,8 @@ export const TASK_CATEGORIES = [
   "screening",
 ] as const;
 
-export const tasks = sqliteTable("tasks", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const tasks = pgTable("tasks", {
+  id: serial("id").primaryKey(),
   taskCode: text("task_code").notNull(),
   title: text("title").notNull(),
   category: text("category", { enum: TASK_CATEGORIES }).notNull().default("general"),
@@ -347,8 +351,8 @@ export const tasks = sqliteTable("tasks", {
 export const CAMPAIGN_STATUSES = ["draft", "scheduled", "sent"] as const;
 export const CAMPAIGN_TYPES = ["hotlist", "job_campaign"] as const;
 
-export const campaigns = sqliteTable("campaigns", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const campaigns = pgTable("campaigns", {
+  id: serial("id").primaryKey(),
   name: text("name").notNull(),
   type: text("type", { enum: CAMPAIGN_TYPES }).notNull().default("hotlist"),
   status: text("status", { enum: CAMPAIGN_STATUSES }).notNull().default("draft"),
@@ -365,8 +369,8 @@ export const campaigns = sqliteTable("campaigns", {
 });
 
 /* ── Settings: Organization profile & configurations ── */
-export const orgSettings = sqliteTable("org_settings", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const orgSettings = pgTable("org_settings", {
+  id: serial("id").primaryKey(),
   organizationId: integer("organization_id").notNull().unique().references(() => organizations.id),
   website: text("website").default(""),
   description: text("description").default(""),
@@ -406,8 +410,8 @@ export const ACCESS_CONTROL_TYPES = [
   "security_policy",
 ] as const;
 
-export const rolesPermissions = sqliteTable("roles_permissions", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const rolesPermissions = pgTable("roles_permissions", {
+  id: serial("id").primaryKey(),
   organizationId: integer("organization_id").notNull().references(() => organizations.id),
   type: text("type", { enum: ACCESS_CONTROL_TYPES }).notNull(),
   name: text("name").notNull(),
@@ -421,3 +425,101 @@ export const rolesPermissions = sqliteTable("roles_permissions", {
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
   updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
+
+/* ── Settings: Tags (filter candidates & applications) ── */
+export const tags = pgTable("tags", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").notNull().references(() => organizations.id),
+  name: text("name").notNull(),
+  color: text("color").default("#6366f1"),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+export const candidateTags = pgTable(
+  "candidate_tags",
+  {
+    candidateId: integer("candidate_id").notNull().references(() => candidates.id),
+    tagId: integer("tag_id").notNull().references(() => tags.id),
+  },
+  (t) => ({ pk: unique("candidate_tag_unique").on(t.candidateId, t.tagId) }),
+);
+
+export const applicationTags = pgTable(
+  "application_tags",
+  {
+    applicationId: integer("application_id").notNull().references(() => applications.id),
+    tagId: integer("tag_id").notNull().references(() => tags.id),
+  },
+  (t) => ({ pk: unique("application_tag_unique").on(t.applicationId, t.tagId) }),
+);
+
+/* ── Settings: Integrations (API keys per platform) ── */
+export const INTEGRATION_PLATFORMS = [
+  "linkedin",
+  "github",
+  "google_cse",
+  "proxycurl",
+  "custom",
+] as const;
+
+export const integrations = pgTable("integrations", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").notNull().references(() => organizations.id),
+  platform: text("platform", { enum: INTEGRATION_PLATFORMS }).notNull(),
+  label: text("label").notNull(),
+  apiKey: text("api_key").default(""),
+  configJson: text("config_json").default("{}"),
+  isActive: integer("is_active").default(1),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+  updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+/* ── Jobs: Custom stages per job ── */
+export const JOB_STAGE_TYPES = ["application", "interview"] as const;
+
+export const jobStages = pgTable("job_stages", {
+  id: serial("id").primaryKey(),
+  jobId: integer("job_id").notNull().references(() => jobs.id),
+  name: text("name").notNull(),
+  orderIndex: integer("order_index").notNull().default(0),
+  stageType: text("stage_type", { enum: JOB_STAGE_TYPES }).notNull().default("application"),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+/* ── Candidates: Groups for bulk assign ── */
+export const candidateGroups = pgTable("candidate_groups", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").notNull().references(() => organizations.id),
+  name: text("name").notNull(),
+  description: text("description").default(""),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+export const candidateGroupMembers = pgTable(
+  "candidate_group_members",
+  {
+    groupId: integer("group_id").notNull().references(() => candidateGroups.id),
+    candidateId: integer("candidate_id").notNull().references(() => candidates.id),
+  },
+  (t) => ({ pk: unique("group_candidate_unique").on(t.groupId, t.candidateId) }),
+);
+
+/* ── Jobs: Shortlist from Find Candidates ── */
+export const SHORTLIST_SOURCES = ["internal", "linkedin", "github", "manual"] as const;
+
+export const jobShortlists = pgTable(
+  "job_shortlists",
+  {
+    id: serial("id").primaryKey(),
+    jobId: integer("job_id").notNull().references(() => jobs.id),
+    candidateId: integer("candidate_id").notNull().references(() => candidates.id),
+    source: text("source", { enum: SHORTLIST_SOURCES }).notNull().default("internal"),
+    notes: text("notes").default(""),
+    createdBy: integer("created_by").references(() => users.id),
+    createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+  },
+  (t) => ({ uniqueJobCandidate: unique("shortlist_job_candidate").on(t.jobId, t.candidateId) }),
+);

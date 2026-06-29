@@ -8,8 +8,13 @@ import {
 } from '../db/schema.js';
 import { eq, desc } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import tagsRoutes from './tags.js';
+import integrationsRoutes from './integrations.js';
 
 const settingsRouter = new Hono<AppContext>({ strict: false });
+
+settingsRouter.route('/tags', tagsRoutes);
+settingsRouter.route('/integrations', integrationsRoutes);
 
 type AccessType = typeof ACCESS_CONTROL_TYPES[number];
 

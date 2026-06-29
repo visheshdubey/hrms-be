@@ -5,6 +5,9 @@ import { db } from '../db/index.js';
 import { contacts, accounts, users, CONTACT_STATUSES } from '../db/schema.js';
 import { eq, desc, inArray } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import { getOrgMemberIds } from '../lib/orgScope.js';
+import { parsePagination, paginateInMemory } from '../lib/pagination.js';
+import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
 const contactsRouter = new Hono<AppContext>({ strict: false });
 
@@ -13,12 +16,6 @@ type ConStatus = typeof CONTACT_STATUSES[number];
 const STATUS_LABELS: Record<ConStatus, string> = {
   active: 'Active', inactive: 'Inactive',
 };
-
-async function orgMemberIds(orgId: number | null, userId: number): Promise<number[]> {
-  if (orgId == null) return [userId];
-  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-  return members.map((m) => m.id);
-}
 
 async function enrichContact(row: typeof contacts.$inferSelect) {
   const [acc] = await db.select({
@@ -60,10 +57,9 @@ contactsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     const view = c.req.query('view') ?? 'all';
     const accountId = c.req.query('accountId');
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
-    const page = Math.max(1, parseInt(c.req.query('page') ?? '1') || 1);
-    const pageSize = Math.min(100, Math.max(1, parseInt(c.req.query('pageSize') ?? '20') || 20));
+    const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await orgMemberIds(orgId, userId);
+    const memberIds = await getOrgMemberIds(orgId, userId);
     if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
 
     let rows = await db.select().from(contacts)
@@ -72,7 +68,7 @@ contactsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
 
     if (view === 'mine') rows = rows.filter((r) => r.createdBy === userId);
     if (view === 'recent') {
-      const cutoff = new Date(Date.now() - 30 * 86400000).toISOString();
+      const cutoff = new Date(Date.now() - RECENT_DAYS * MS_PER_DAY).toISOString();
       rows = rows.filter((r) => r.createdAt >= cutoff);
     }
     if (accountId) {
@@ -89,9 +85,7 @@ contactsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
         })
       : enriched;
 
-    const total = filtered.length;
-    const start = (page - 1) * pageSize;
-    return c.json({ data: filtered.slice(start, start + pageSize), total, page, pageSize });
+    return c.json(paginateInMemory(filtered, page, pageSize));
   } catch {
     return c.json({ error: 'Failed to fetch contacts' }, 500);
   }

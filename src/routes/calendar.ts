@@ -17,6 +17,7 @@ const eventSchema = z.object({
   candidateId:   z.number().optional().nullable(),
   candidateName: z.string().optional(),
   jobProfile:    z.string().optional(),
+  jobId:         z.number().optional().nullable(),
   location:      z.string().optional(),
   description:   z.string().optional(),
   meetingLink:   z.string().optional(),
@@ -32,10 +33,18 @@ function parseInterviewerIds(json: string | null | undefined): number[] {
   }
 }
 
-async function interviewsAsCalendarEvents(orgId: number | null, from?: string, to?: string) {
+async function interviewsAsCalendarEvents(
+  orgId: number | null,
+  from?: string,
+  to?: string,
+  jobId?: number,
+) {
   let interviewRows = await db.select().from(interviews);
   if (orgId != null) {
     interviewRows = interviewRows.filter((row) => row.organizationId === orgId);
+  }
+  if (jobId != null) {
+    interviewRows = interviewRows.filter((row) => row.jobId === jobId);
   }
 
   const filtered = interviewRows.filter((row) => {
@@ -99,6 +108,8 @@ calendarRouter.get('/', requireAuth, async (c) => {
     const orgId   = c.get('organizationId') as number | null;
     const from    = c.req.query('from');
     const to      = c.req.query('to');
+    const jobIdParam = c.req.query('jobId');
+    const jobId = jobIdParam ? parseInt(jobIdParam) : undefined;
 
     let memberIds: number[] = [userId];
     if (orgId != null) {
@@ -111,12 +122,18 @@ calendarRouter.get('/', requireAuth, async (c) => {
       .where(inArray(calendarEvents.createdBy, memberIds));
 
     const calendarOnly = rows.filter((e) => {
+      if (jobId != null && !isNaN(jobId) && e.jobId !== jobId) return false;
       if (from && e.startTime < from) return false;
       if (to && e.startTime > to) return false;
       return true;
     }).map((e) => ({ ...e, source: 'calendar' }));
 
-    const interviewEvents = await interviewsAsCalendarEvents(orgId, from, to);
+    const interviewEvents = await interviewsAsCalendarEvents(
+      orgId,
+      from,
+      to,
+      jobId != null && !isNaN(jobId) ? jobId : undefined,
+    );
 
     return c.json([...calendarOnly, ...interviewEvents]);
   } catch (err) {
@@ -141,6 +158,7 @@ calendarRouter.post('/', requireAuth, zValidator('json', eventSchema), async (c)
       candidateId:   b.candidateId   ?? null,
       candidateName: b.candidateName ?? '',
       jobProfile:    b.jobProfile    ?? '',
+      jobId:         b.jobId         ?? null,
       location:      b.location      ?? '',
       description:   b.description   ?? '',
       meetingLink:   b.meetingLink   ?? '',
@@ -181,6 +199,7 @@ calendarRouter.put('/:id', requireAuth, zValidator('json', eventSchema.partial()
     if (b.candidateId   !== undefined) patch.candidateId   = b.candidateId;
     if (b.candidateName != null) patch.candidateName = b.candidateName;
     if (b.jobProfile    != null) patch.jobProfile    = b.jobProfile;
+    if (b.jobId         !== undefined) patch.jobId         = b.jobId;
     if (b.location      != null) patch.location      = b.location;
     if (b.description   != null) patch.description   = b.description;
     if (b.meetingLink   != null) patch.meetingLink   = b.meetingLink;

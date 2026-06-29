@@ -1,16 +1,25 @@
 {
-  "name": "my-hono-app",
+  "name": "hrms-be",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/src/index.js",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:push": "drizzle-kit push",
+    "db:reset": "tsx src/db/reset-db.ts",
+    "db:sync": "tsx src/db/migrate-portal-type.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:seed": "tsx src/db/seed.ts",
+    "db:seed:stress": "tsx src/db/seed-stress.ts",
+    "db:setup": "npm run db:push && npm run db:seed",
+    "db:migrate:sqlite": "tsx src/db/migrate-sqlite-to-postgres.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.14",
     "@hono/zod-validator": "^0.7.6",
     "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^12.9.0",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "hono": "^4.12.12",
@@ -20,12 +29,14 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@faker-js/faker": "^10.5.0",
     "@types/bcryptjs": "^2.4.6",
     "@types/better-sqlite3": "^7.6.13",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20.11.17",
     "@types/nodemailer": "^8.0.1",
     "@types/pg": "^8.20.0",
+    "better-sqlite3": "^12.11.1",
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.21.0",
     "typescript": "^5.8.3"

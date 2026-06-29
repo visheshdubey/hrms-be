@@ -12,11 +12,29 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { candidates, users } from '../db/schema.js';
+import { candidates, users, applications, applicationStageHistory, jobShortlists, SHORTLIST_SOURCES } from '../db/schema.js';
 import { eq, inArray, and, or, sql, type SQL } from 'drizzle-orm';
-import { requireAuth, type AppContext } from '../middleware.js';
+import { requireAuth, requireRecruiter, type AppContext } from '../middleware.js';
+import { getOrgMemberIdsFromContext } from '../lib/orgScope.js';
 
 const sourcingRouter = new Hono<AppContext>({ strict: false });
+
+sourcingRouter.use('*', requireAuth, requireRecruiter);
+
+const shortlistSchema = z.object({
+  jobId: z.number().int().positive(),
+  candidateId: z.union([z.number().int().positive(), z.string()]),
+  source: z.enum(SHORTLIST_SOURCES).optional(),
+  notes: z.string().optional(),
+});
+
+function resolveCandidateId(raw: number | string): number | null {
+  if (typeof raw === 'number') return raw;
+  const internal = /^internal-(\d+)$/.exec(raw);
+  if (internal) return parseInt(internal[1], 10);
+  const numeric = parseInt(raw, 10);
+  return isNaN(numeric) ? null : numeric;
+}
 
 const PROXYCURL_API_KEY = process.env.PROXYCURL_API_KEY ?? '';
 const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY ?? '';
@@ -169,14 +187,6 @@ function ilike(column: unknown, term: string): SQL {
   return sql`lower(${column}) like ${pattern}`;
 }
 
-async function orgMemberIds(c: { get: (key: string) => unknown }): Promise<number[] | null> {
-  const userId = c.get('userId') as number;
-  const orgId = c.get('organizationId') as number | null;
-  if (orgId == null) return [userId];
-  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-  return members.map((u) => u.id);
-}
-
 function mapInternalRow(r: typeof candidates.$inferSelect): NormalizedCandidate {
   const skills = safeArray(r.skills);
   return {
@@ -199,7 +209,7 @@ async function searchInternal(
   p: InternalPayload,
   started: number,
 ) {
-  const memberIds = await orgMemberIds(c);
+  const memberIds = await getOrgMemberIdsFromContext(c);
   if (!memberIds || memberIds.length === 0) {
     return envelope('internal', p, p.page, p.pageSize, 0, Date.now() - started, []);
   }
@@ -474,8 +484,74 @@ async function searchLinkedIn(
   };
 }
 
+/* ── POST /sourcing/shortlist ── */
+sourcingRouter.post('/shortlist', zValidator('json', shortlistSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const b = c.req.valid('json');
+    const candidateId = resolveCandidateId(b.candidateId);
+    if (!candidateId) return c.json({ error: 'Invalid candidateId' }, 400);
+
+    const [cand] = await db.select().from(candidates).where(eq(candidates.id, candidateId)).limit(1);
+    if (!cand) return c.json({ error: 'Candidate not found' }, 404);
+
+    const now = new Date().toISOString();
+    const source = b.source ?? 'internal';
+
+    const [shortlist] = await db.insert(jobShortlists).values({
+      jobId: b.jobId,
+      candidateId,
+      source,
+      notes: b.notes ?? '',
+      createdBy: userId,
+    }).onConflictDoNothing().returning();
+
+    const [existingApp] = await db.select().from(applications)
+      .where(and(eq(applications.jobId, b.jobId), eq(applications.candidateId, candidateId)))
+      .limit(1);
+
+    let application = existingApp;
+    if (!existingApp) {
+      const [created] = await db.insert(applications).values({
+        jobId: b.jobId,
+        candidateId,
+        status: 'shortlisted',
+        notes: b.notes ?? '',
+        createdBy: userId,
+        updatedAt: now,
+      }).returning();
+      application = created;
+      await db.insert(applicationStageHistory).values({
+        applicationId: created.id,
+        fromStatus: null,
+        toStatus: 'shortlisted',
+        note: `Shortlisted from ${source}`,
+        changedBy: userId,
+      });
+    } else if (existingApp.status !== 'shortlisted') {
+      const [updated] = await db.update(applications)
+        .set({ status: 'shortlisted', updatedAt: now })
+        .where(eq(applications.id, existingApp.id))
+        .returning();
+      application = updated;
+      await db.insert(applicationStageHistory).values({
+        applicationId: existingApp.id,
+        fromStatus: existingApp.status,
+        toStatus: 'shortlisted',
+        note: `Shortlisted from ${source}`,
+        changedBy: userId,
+      });
+    }
+
+    return c.json({ shortlist: shortlist ?? { jobId: b.jobId, candidateId, source }, application }, 201);
+  } catch (err) {
+    console.error('[sourcing] shortlist failed:', err);
+    return c.json({ error: 'Failed to shortlist candidate' }, 500);
+  }
+});
+
 /* ── GET /sourcing/internal?q=... ── */
-sourcingRouter.get('/internal', requireAuth, async (c) => {
+sourcingRouter.get('/internal', async (c) => {
   const started = Date.now();
   try {
     const q = c.req.query('q')?.trim() ?? '';
@@ -492,7 +568,7 @@ sourcingRouter.get('/internal', requireAuth, async (c) => {
   }
 });
 
-sourcingRouter.post('/internal', requireAuth, zValidator('json', internalSchema), async (c) => {
+sourcingRouter.post('/internal', zValidator('json', internalSchema), async (c) => {
   const started = Date.now();
   try {
     const p = c.req.valid('json') as InternalPayload;
@@ -504,7 +580,7 @@ sourcingRouter.post('/internal', requireAuth, zValidator('json', internalSchema)
 });
 
 /* ── GET /sourcing/github?q=... ── */
-sourcingRouter.get('/github', requireAuth, async (c) => {
+sourcingRouter.get('/github', async (c) => {
   const started = Date.now();
   try {
     const query = c.req.query('q')?.trim() ?? '';
@@ -523,7 +599,7 @@ sourcingRouter.get('/github', requireAuth, async (c) => {
   }
 });
 
-sourcingRouter.post('/github', requireAuth, zValidator('json', githubSchema), async (c) => {
+sourcingRouter.post('/github', zValidator('json', githubSchema), async (c) => {
   const started = Date.now();
   try {
     const p = c.req.valid('json') as GithubPayload;
@@ -537,7 +613,7 @@ sourcingRouter.post('/github', requireAuth, zValidator('json', githubSchema), as
 });
 
 /* ── GET /sourcing/linkedin?q=... ── */
-sourcingRouter.get('/linkedin', requireAuth, async (c) => {
+sourcingRouter.get('/linkedin', async (c) => {
   const started = Date.now();
   try {
     const q = c.req.query('q')?.trim() ?? '';
@@ -556,7 +632,7 @@ sourcingRouter.get('/linkedin', requireAuth, async (c) => {
   }
 });
 
-sourcingRouter.post('/linkedin', requireAuth, zValidator('json', linkedinSchema), async (c) => {
+sourcingRouter.post('/linkedin', zValidator('json', linkedinSchema), async (c) => {
   const started = Date.now();
   try {
     const p = c.req.valid('json') as LinkedInPayload;
