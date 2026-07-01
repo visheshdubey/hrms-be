@@ -5,7 +5,7 @@ import { db } from '../db/index.js';
 import { contacts, accounts, users, CONTACT_STATUSES } from '../db/schema.js';
 import { eq, desc, inArray } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
-import { getOrgMemberIds } from '../lib/orgScope.js';
+import { getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
@@ -59,11 +59,8 @@ contactsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
     const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
-
     let rows = await db.select().from(contacts)
-      .where(inArray(contacts.createdBy, memberIds))
+      .where(orgOrCreatorScope(orgId, userId, contacts, contacts))
       .orderBy(desc(contacts.updatedAt));
 
     if (view === 'mine') rows = rows.filter((r) => r.createdBy === userId);

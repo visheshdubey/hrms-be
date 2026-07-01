@@ -2,9 +2,9 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { eq, desc, inArray, and } from 'drizzle-orm';
+import { eq, desc, inArray, and, or, isNull } from 'drizzle-orm';
 import { requireAuth, type AppContext } from '../middleware.js';
-import { jobs, users, jobStages, JOB_STAGE_TYPES } from '../db/schema.js';
+import { jobs, users, jobStages, JOB_STAGE_TYPES, accounts } from '../db/schema.js';
 
 const jobsRouter = new Hono<AppContext>({ strict: false });
 
@@ -51,19 +51,30 @@ jobsRouter.get('/', requireAuth, async (c) => {
 
     let all;
     if (orgId != null) {
-      const orgMembers = await db
-        .select({ id: users.id })
-        .from(users)
-        .where(eq(users.organizationId, orgId));
+      const orgAccounts = await db
+        .select({ id: accounts.id })
+        .from(accounts)
+        .where(eq(accounts.organizationId, orgId));
+      const accountIds = orgAccounts.map((account) => account.id);
 
-      const memberIds = orgMembers.map((u: { id: number }) => u.id);
-      if (memberIds.length === 0) return c.json([]);
-
-      all = await db
-        .select()
-        .from(jobs)
-        .where(inArray(jobs.createdBy, memberIds))
-        .orderBy(desc(jobs.id));
+      if (accountIds.length === 0) {
+        all = await db
+          .select()
+          .from(jobs)
+          .where(and(isNull(jobs.accountId), eq(jobs.createdBy, userId)))
+          .orderBy(desc(jobs.id));
+      } else {
+        all = await db
+          .select()
+          .from(jobs)
+          .where(
+            or(
+              inArray(jobs.accountId, accountIds),
+              and(isNull(jobs.accountId), eq(jobs.createdBy, userId)),
+            ),
+          )
+          .orderBy(desc(jobs.id));
+      }
     } else {
       all = await db
         .select()

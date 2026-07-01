@@ -3,9 +3,9 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { accounts, contacts, users, jobs, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
-import { eq, desc, inArray, sql, and } from 'drizzle-orm';
+import { eq, desc, sql, and } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
-import { getOrgMemberIds, isOrgMember } from '../lib/orgScope.js';
+import { belongsToOrganization, orgOrCreatorScope } from '../lib/orgScope.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
@@ -70,11 +70,8 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
     const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
-
     let rows = await db.select().from(accounts)
-      .where(inArray(accounts.createdBy, memberIds))
+      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
       .orderBy(desc(accounts.updatedAt));
 
     if (view === 'mine') rows = rows.filter((r) => r.createdBy === userId);
@@ -130,8 +127,7 @@ accountsRouter.get('/:id/stats', requireAuth, requireRole('recruiter_admin', 're
     const [account] = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
     if (!account) return c.json({ error: 'Account not found' }, 404);
 
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    if (!isOrgMember(account.createdBy, memberIds)) {
+    if (!belongsToOrganization(account.organizationId, orgId, account.createdBy, userId)) {
       return c.json({ error: 'Account not found' }, 404);
     }
 
@@ -173,8 +169,7 @@ accountsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
     const row = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
     if (!row.length) return c.json({ error: 'Account not found' }, 404);
 
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    if (!isOrgMember(row[0].createdBy, memberIds)) {
+    if (!belongsToOrganization(row[0].organizationId, orgId, row[0].createdBy, userId)) {
       return c.json({ error: 'Account not found' }, 404);
     }
 
