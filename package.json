@@ -12,6 +12,8 @@
     "db:sync": "tsx src/db/migrate-portal-type.ts",
     "db:generate": "drizzle-kit generate",
     "db:seed": "tsx src/db/seed.ts",
+    "db:seed:users": "tsx src/db/seed-test-users.ts",
+    "db:seed:stages": "tsx src/db/seed-stage-templates.ts",
     "db:seed:stress": "tsx src/db/seed-stress.ts",
     "db:setup": "npm run db:push && npm run db:seed",
     "db:migrate:sqlite": "tsx src/db/migrate-sqlite-to-postgres.ts"
