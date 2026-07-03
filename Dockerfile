@@ -13,4 +13,5 @@ COPY . .
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx drizzle-kit push --force && npx tsx src/index.ts"]
+# Migrations run in CI/setup; start API only (drizzle push can hang on large shared DBs)
+CMD ["npx", "tsx", "src/index.ts"]
