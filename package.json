@@ -35,12 +35,10 @@
   "devDependencies": {
     "@faker-js/faker": "^10.5.0",
     "@types/bcryptjs": "^2.4.6",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20.11.17",
     "@types/nodemailer": "^8.0.1",
     "@types/pg": "^8.20.0",
-    "better-sqlite3": "^12.11.1",
     "typescript": "^5.8.3"
   }
 }
