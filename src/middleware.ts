@@ -2,8 +2,7 @@ import jwt from 'jsonwebtoken';
 import { db } from './db/index.js';
 import { users } from './db/schema.js';
 import { eq } from 'drizzle-orm';
-
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
+import { JWT_SECRET } from './config.js';
 
 export type UserRole = 'recruiter_admin' | 'recruited_staff' | 'org_admin' | 'org_staff';
 
@@ -63,3 +62,9 @@ export const requireRole = (...allowedRoles: UserRole[]) =>
     }
     await next();
   };
+
+export const RECRUITER_ROLES: UserRole[] = ['recruiter_admin', 'recruited_staff'];
+export const ORG_ROLES: UserRole[] = ['org_admin', 'org_staff'];
+
+/** Admin shell — Clients, Candidates sourcing, Tags, Integrations */
+export const requireRecruiter = requireRole(...RECRUITER_ROLES);

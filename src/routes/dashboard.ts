@@ -1,10 +1,21 @@
 import { Hono } from 'hono';
 import { db } from '../db/index.js';
-import { jobs, candidates, users } from '../db/schema.js';
+import { jobs, candidates, users, applications, interviews, APP_STATUSES } from '../db/schema.js';
 import { eq, desc, and, sql, gte, inArray } from 'drizzle-orm';
 import { requireAuth, type AppContext } from '../middleware.js';
 
 const dashboardRouter = new Hono<AppContext>({ strict: false });
+
+const STAGE_LABELS: Record<typeof APP_STATUSES[number], string> = {
+  applied: 'Applied',
+  in_review: 'In Review',
+  shortlisted: 'Shortlisted',
+  rejected: 'Rejected',
+  interview_scheduled: 'Interview Scheduled',
+  hold: 'Hold',
+  offer: 'Offer',
+  no_offer: 'No Offer',
+};
 
 /**
  * Returns an ISO date string for the start of the requested period.
@@ -50,71 +61,75 @@ dashboardRouter.get('/', requireAuth, async (c) => {
     const period = c.req.query('period');
     const since  = periodToSince(period);
 
-    // Resolve org members for scoping
     let memberIds: number[] = [userId];
     if (orgId != null) {
       const orgMembers = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-      memberIds = orgMembers.map((u: any) => u.id);
+      memberIds = orgMembers.map((u: { id: number }) => u.id);
     }
 
-    const candWhere = memberIds.length === 1
-      ? (since ? and(eq(candidates.createdBy, userId), gte(candidates.createdAt, since)) : eq(candidates.createdBy, userId))
-      : (since ? and(inArray(candidates.createdBy, memberIds), gte(candidates.createdAt, since)) : inArray(candidates.createdBy, memberIds));
+    const appWhere = memberIds.length === 1
+      ? (since ? and(eq(applications.createdBy, userId), gte(applications.createdAt, since)) : eq(applications.createdBy, userId))
+      : (since ? and(inArray(applications.createdBy, memberIds), gte(applications.createdAt, since)) : inArray(applications.createdBy, memberIds));
 
-    // Total candidates (within period)
-    const allCandidates = await db.select().from(candidates).where(candWhere);
-    const totalCandidates = allCandidates.length;
+    const allApplications = await db.select().from(applications).where(appWhere);
+    const totalCandidates = allApplications.length;
 
-    // Active jobs (no period filter — snapshot of current state)
     const jobsWhere = memberIds.length === 1
       ? and(eq(jobs.status, 'submission_in_progress'), eq(jobs.createdBy, userId))
       : and(eq(jobs.status, 'submission_in_progress'), inArray(jobs.createdBy, memberIds));
     const activeJobsQuery = await db.select().from(jobs).where(jobsWhere);
     const activeJobs = activeJobsQuery.length;
 
-    // Recent activity (top 10, within period)
     const recentActivity = await db
       .select({
-        id: candidates.id, name: candidates.name, filename: candidates.filename,
-        matchScore: candidates.matchScore, createdAt: candidates.createdAt,
-        jobId: candidates.jobId, status: candidates.status,
+        id: applications.id,
+        applicationId: applications.id,
+        candidateId: applications.candidateId,
+        jobId: applications.jobId,
+        status: applications.status,
+        createdAt: applications.createdAt,
+        name: candidates.name,
+        filename: candidates.filename,
+        matchScore: candidates.matchScore,
       })
-      .from(candidates)
-      .where(candWhere)
-      .orderBy(desc(candidates.createdAt))
+      .from(applications)
+      .innerJoin(candidates, eq(applications.candidateId, candidates.id))
+      .where(appWhere)
+      .orderBy(desc(applications.createdAt))
       .limit(10);
 
-    // Pipeline by Stage (within period)
     const pipelineDataRaw = await db
       .select({
-        stage: candidates.status,
-        count: sql<number>`count(${candidates.id})`,
+        stage: applications.status,
+        count: sql<number>`count(${applications.id})`,
       })
-      .from(candidates)
-      .where(candWhere)
-      .groupBy(candidates.status);
+      .from(applications)
+      .where(appWhere)
+      .groupBy(applications.status);
 
-    const stagesMap: Record<string, number> = {
-      'New': 0, 'Applied': 0, 'In Review': 0, 'Shortlisted': 0,
-      'Rejected': 0, 'Interview Scheduled': 0, 'Hold': 0, 'Offer': 0, 'No Offer': 0,
-    };
-    pipelineDataRaw.forEach((row) => { if (row.stage) stagesMap[row.stage] = row.count; });
+    const stagesMap: Record<string, number> = {};
+    for (const status of APP_STATUSES) {
+      stagesMap[STAGE_LABELS[status]] = 0;
+    }
+    pipelineDataRaw.forEach((row) => {
+      const label = STAGE_LABELS[row.stage as typeof APP_STATUSES[number]] ?? row.stage;
+      if (label) stagesMap[label] = row.count;
+    });
 
     const pipelineByStage = Object.entries(stagesMap)
       .map(([name, count]) => ({ name, count }))
-      .filter(x => x.count > 0 || ['New', 'Applied', 'Shortlisted', 'Interview Scheduled'].includes(x.name));
+      .filter((x) => x.count > 0 || ['Applied', 'Shortlisted', 'Interview Scheduled'].includes(x.name));
 
-    // Applications over time — bucketed by period
     const { fmt, count: bucketCount, labelFn } = chartConfig(period);
 
     const rawBuckets = await db
       .select({
-        bucket: sql<string>`strftime(${fmt}, ${candidates.createdAt})`,
-        count:  sql<number>`count(${candidates.id})`,
+        bucket: sql<string>`strftime(${fmt}, ${applications.createdAt})`,
+        count:  sql<number>`count(${applications.id})`,
       })
-      .from(candidates)
-      .where(candWhere)
-      .groupBy(sql`strftime(${fmt}, ${candidates.createdAt})`);
+      .from(applications)
+      .where(appWhere)
+      .groupBy(sql`strftime(${fmt}, ${applications.createdAt})`);
 
     const bucketMap: Record<string, number> = {};
     rawBuckets.forEach((r) => { if (r.bucket) bucketMap[r.bucket] = r.count; });
@@ -131,7 +146,6 @@ dashboardRouter.get('/', requireAuth, async (c) => {
         d.setDate(d.getDate() - i);
       }
 
-      // SQLite bucket key for this data point
       let key: string;
       if (fmt === '%H') {
         key = d.getHours().toString().padStart(2, '0');
@@ -148,10 +162,15 @@ dashboardRouter.get('/', requireAuth, async (c) => {
       });
     }
 
+    const interviewWhere = memberIds.length === 1
+      ? and(eq(interviews.status, 'scheduled'), eq(interviews.createdBy, userId))
+      : and(eq(interviews.status, 'scheduled'), inArray(interviews.createdBy, memberIds));
+    const scheduledInterviews = await db.select().from(interviews).where(interviewWhere);
+
     return c.json({
       totalCandidates,
       activeJobs,
-      interviewsScheduled: stagesMap['Interview Scheduled'] ?? 0,
+      interviewsScheduled: scheduledInterviews.length,
       recentActivity,
       pipelineByStage,
       applicationsOverTime,

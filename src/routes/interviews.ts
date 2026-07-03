@@ -8,6 +8,9 @@ import {
 } from '../db/schema.js';
 import { eq, desc, inArray } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import { getOrgMemberIds } from '../lib/orgScope.js';
+import { parsePagination, paginateInMemory } from '../lib/pagination.js';
+import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
 const interviewsRouter = new Hono<AppContext>({ strict: false });
 
@@ -31,12 +34,6 @@ const TRANSITIONS: Record<IntStatus, IntStatus[]> = {
   cancelled: [],
   no_show:   [],
 };
-
-async function orgMemberIds(orgId: number | null, userId: number): Promise<number[]> {
-  if (orgId == null) return [userId];
-  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-  return members.map((m) => m.id);
-}
 
 function parseIds(json: string): number[] {
   try { const p = JSON.parse(json); return Array.isArray(p) ? p.map(Number).filter(Boolean) : []; }
@@ -68,7 +65,7 @@ async function enrichInterview(row: Record<string, unknown>) {
   const status = row.status as IntStatus;
   const start = new Date(row.startTime as string);
   const now = Date.now();
-  const dueInDays = Math.ceil((start.getTime() - now) / 86400000);
+  const dueInDays = Math.ceil((start.getTime() - now) / MS_PER_DAY);
 
   return {
     ...row,
@@ -110,15 +107,21 @@ interviewsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited
     const view = c.req.query('view') ?? 'all';
     const period = c.req.query('period') ?? 'all';
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
-    const page = Math.max(1, parseInt(c.req.query('page') ?? '1') || 1);
-    const pageSize = Math.min(100, Math.max(1, parseInt(c.req.query('pageSize') ?? '20') || 20));
+    const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await orgMemberIds(orgId, userId);
+    const jobIdParam = c.req.query('jobId');
+    const jobId = jobIdParam ? parseInt(jobIdParam) : null;
+
+    const memberIds = await getOrgMemberIds(orgId, userId);
     if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
 
     let rows = await db.select().from(interviews)
       .where(inArray(interviews.createdBy, memberIds))
       .orderBy(desc(interviews.startTime));
+
+    if (jobId != null && !isNaN(jobId)) {
+      rows = rows.filter((r) => r.jobId === jobId);
+    }
 
     const now = new Date().toISOString();
     if (period === 'upcoming') rows = rows.filter((r) => r.startTime >= now && r.status === 'scheduled');

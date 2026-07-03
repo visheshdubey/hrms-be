@@ -13,15 +13,10 @@ import {
 } from '../db/schema.js';
 import { eq, inArray, sql, desc } from 'drizzle-orm';
 import { requireAuth, type AppContext } from '../middleware.js';
+import { getOrgMemberIds } from '../lib/orgScope.js';
 import { STATUS_LABELS } from './applications.js';
 
 const reportsRouter = new Hono<AppContext>({ strict: false });
-
-async function getOrgMemberIds(userId: number, orgId: number | null): Promise<number[]> {
-  if (orgId == null) return [userId];
-  const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-  return members.map((u: { id: number }) => u.id);
-}
 
 async function getOrgJobIds(memberIds: number[]): Promise<number[]> {
   if (memberIds.length === 0) return [];
@@ -38,7 +33,7 @@ reportsRouter.get('/summary', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
-    const memberIds = await getOrgMemberIds(userId, orgId);
+    const memberIds = await getOrgMemberIds(orgId, userId);
     const jobIds = await getOrgJobIds(memberIds);
 
     if (jobIds.length === 0) {
@@ -116,7 +111,7 @@ reportsRouter.get('/pipeline', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
-    const memberIds = await getOrgMemberIds(userId, orgId);
+    const memberIds = await getOrgMemberIds(orgId, userId);
     const jobIds = await getOrgJobIds(memberIds);
 
     if (jobIds.length === 0) return c.json({ jobs: [], stages: [] });
@@ -165,7 +160,7 @@ reportsRouter.get('/export', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
-    const memberIds = await getOrgMemberIds(userId, orgId);
+    const memberIds = await getOrgMemberIds(orgId, userId);
     const jobIds = await getOrgJobIds(memberIds);
 
     if (jobIds.length === 0) {

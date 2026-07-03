@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
@@ -20,6 +21,7 @@ import onboardingRoutes from './routes/onboarding.js';
 import tasksRoutes from './routes/tasks.js';
 import campaignsRoutes from './routes/campaigns.js';
 import settingsRoutes from './routes/settings.js';
+import candidateGroupsRoutes from './routes/candidateGroups.js';
 
 const app = new Hono({ strict: false });
 
@@ -87,6 +89,8 @@ app.route('/campaigns', campaignsRoutes);
 app.route('/api/hono/campaigns', campaignsRoutes);
 app.route('/settings', settingsRoutes);
 app.route('/api/hono/settings', settingsRoutes);
+app.route('/candidate-groups', candidateGroupsRoutes);
+app.route('/api/hono/candidate-groups', candidateGroupsRoutes);
 
 const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 console.log(`✅ Server is running on port ${port}`);

@@ -3,16 +3,15 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Copy package files
-COPY package*.json ./
+COPY package*.json .npmrc ./
 
-# Install dependencies
-RUN npm install
+# Production deps only — no native sqlite (Postgres only in prod)
+RUN npm ci --omit=dev
 
 # Copy source code
 COPY . .
 
-# Expose the API port
 EXPOSE 3000
 
-# Start the application
-CMD ["sh", "-c", "mkdir -p /app/data && npx drizzle-kit push --force && npx tsx src/index.ts"]
+# Migrations run in CI/setup; start API only (drizzle push can hang on large shared DBs)
+CMD ["npx", "tsx", "src/index.ts"]

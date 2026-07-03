@@ -29,12 +29,12 @@ async function deliverEmail(
   payload: { to: string; subject: string; html: string },
 ): Promise<boolean> {
   if (!isSmtpConfigured()) {
-    console.log(`[EMAIL MOCK] ${label}`);
+    console.log(`[EMAIL MOCK] ${label} — SMTP not configured`);
     console.log(`  To: ${payload.to}`);
     console.log(`  Subject: ${payload.subject}`);
     const linkMatch = payload.html.match(/href="([^"]+)"/);
     if (linkMatch) console.log(`  Link: ${linkMatch[1]}`);
-    return true;
+    return false;
   }
 
   try {
