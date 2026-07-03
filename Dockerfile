@@ -5,8 +5,8 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install
+# Skip devDependencies (better-sqlite3 needs native build tools on Alpine)
+RUN npm install --omit=dev
 
 # Copy source code
 COPY . .
@@ -15,4 +15,4 @@ COPY . .
 EXPOSE 3000
 
 # Start the application
-CMD ["sh", "-c", "mkdir -p /app/data && npx drizzle-kit push --force && npx tsx src/index.ts"]
+CMD ["sh", "-c", "npx drizzle-kit push --force && npx tsx src/index.ts"]
