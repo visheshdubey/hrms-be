@@ -479,6 +479,16 @@ export const integrations = pgTable("integrations", {
 /* ── Jobs: Custom stages per job ── */
 export const JOB_STAGE_TYPES = ["application", "interview"] as const;
 
+/** Client-level hiring round templates — copied to jobs on create */
+export const accountStageTemplates = pgTable("account_stage_templates", {
+  id: serial("id").primaryKey(),
+  accountId: integer("account_id").notNull().references(() => accounts.id),
+  name: text("name").notNull(),
+  orderIndex: integer("order_index").notNull().default(0),
+  stageType: text("stage_type", { enum: JOB_STAGE_TYPES }).notNull().default("application"),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
 export const jobStages = pgTable("job_stages", {
   id: serial("id").primaryKey(),
   jobId: integer("job_id").notNull().references(() => jobs.id),

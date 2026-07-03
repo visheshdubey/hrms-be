@@ -2,10 +2,15 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { accounts, contacts, users, jobs, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
-import { eq, desc, inArray, sql, and } from 'drizzle-orm';
-import { requireAuth, requireRole, type AppContext } from '../middleware.js';
-import { getOrgMemberIds, isOrgMember } from '../lib/orgScope.js';
+import { accounts, contacts, users, jobs, accountStageTemplates, JOB_STAGE_TYPES, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
+import { eq, desc, sql, and } from 'drizzle-orm';
+import { requireAuth, requireRole, type AppContext, type UserRole } from '../middleware.js';
+import { belongsToOrganization, orgOrCreatorScope } from '../lib/orgScope.js';
+import {
+  applyTemplatesToAccountJobsWithoutStages,
+  canWriteStageTemplates,
+  getAccountIfAccessible,
+} from '../lib/stages.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
@@ -60,6 +65,166 @@ const mergeSchema = z.object({
   sourceIds: z.array(z.number().int().positive()).min(1),
 });
 
+const stageTemplateSchema = z.object({
+  name: z.string().min(1),
+  orderIndex: z.number().int().nonnegative().optional(),
+  stageType: z.enum(JOB_STAGE_TYPES).optional(),
+});
+
+function stageWriteForbidden(c: { json: (body: unknown, status?: number) => Response }) {
+  return c.json({ error: 'Only admins can modify stage templates' }, 403);
+}
+
+/* GET /accounts/options — lightweight list for stage settings */
+accountsRouter.get('/options', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+
+    const rows = await db
+      .select({ id: accounts.id, name: accounts.name })
+      .from(accounts)
+      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
+      .orderBy(desc(accounts.updatedAt));
+
+    return c.json({ data: rows });
+  } catch {
+    return c.json({ error: 'Failed to fetch account options' }, 500);
+  }
+});
+
+/* GET /accounts/:id/stage-templates */
+accountsRouter.get('/:id/stage-templates', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const accountId = parseInt(c.req.param('id'));
+    if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
+
+    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
+
+    const stages = await db
+      .select()
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId))
+      .orderBy(accountStageTemplates.orderIndex);
+
+    return c.json({ data: stages });
+  } catch {
+    return c.json({ error: 'Failed to fetch stage templates' }, 500);
+  }
+});
+
+/* POST /accounts/:id/stage-templates */
+accountsRouter.post('/:id/stage-templates', requireAuth, zValidator('json', stageTemplateSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const accountId = parseInt(c.req.param('id'));
+    if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
+    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
+
+    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
+
+    const body = c.req.valid('json');
+    const [created] = await db.insert(accountStageTemplates).values({
+      accountId,
+      name: body.name,
+      orderIndex: body.orderIndex ?? 0,
+      stageType: body.stageType ?? 'application',
+    }).returning();
+
+    return c.json(created, 201);
+  } catch {
+    return c.json({ error: 'Failed to create stage template' }, 500);
+  }
+});
+
+/* PUT /accounts/:id/stage-templates/:stageId */
+accountsRouter.put('/:id/stage-templates/:stageId', requireAuth, zValidator('json', stageTemplateSchema.partial()), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const accountId = parseInt(c.req.param('id'));
+    const stageId = parseInt(c.req.param('stageId'));
+    if (isNaN(accountId) || isNaN(stageId)) return c.json({ error: 'Invalid id' }, 400);
+    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
+
+    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
+
+    const body = c.req.valid('json');
+    const patch: Record<string, unknown> = {};
+    if (body.name !== undefined) patch.name = body.name;
+    if (body.orderIndex !== undefined) patch.orderIndex = body.orderIndex;
+    if (body.stageType !== undefined) patch.stageType = body.stageType;
+
+    const [updated] = await db
+      .update(accountStageTemplates)
+      .set(patch as typeof accountStageTemplates.$inferInsert)
+      .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId)))
+      .returning();
+
+    if (!updated) return c.json({ error: 'Stage template not found' }, 404);
+    return c.json(updated);
+  } catch {
+    return c.json({ error: 'Failed to update stage template' }, 500);
+  }
+});
+
+/* DELETE /accounts/:id/stage-templates/:stageId */
+accountsRouter.delete('/:id/stage-templates/:stageId', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const accountId = parseInt(c.req.param('id'));
+    const stageId = parseInt(c.req.param('stageId'));
+    if (isNaN(accountId) || isNaN(stageId)) return c.json({ error: 'Invalid id' }, 400);
+    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
+
+    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
+
+    const [deleted] = await db
+      .delete(accountStageTemplates)
+      .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId)))
+      .returning();
+
+    if (!deleted) return c.json({ error: 'Stage template not found' }, 404);
+    return c.json({ ok: true });
+  } catch {
+    return c.json({ error: 'Failed to delete stage template' }, 500);
+  }
+});
+
+/* POST /accounts/:id/stage-templates/apply-to-jobs */
+accountsRouter.post('/:id/stage-templates/apply-to-jobs', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const accountId = parseInt(c.req.param('id'));
+    if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
+    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
+
+    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
+
+    const result = await applyTemplatesToAccountJobsWithoutStages(accountId);
+    return c.json({
+      message: 'Templates applied to jobs without stages',
+      ...result,
+    });
+  } catch {
+    return c.json({ error: 'Failed to apply templates to jobs' }, 500);
+  }
+});
+
 /* GET /accounts */
 accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
   try {
@@ -70,11 +235,8 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
     const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
-
     let rows = await db.select().from(accounts)
-      .where(inArray(accounts.createdBy, memberIds))
+      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
       .orderBy(desc(accounts.updatedAt));
 
     if (view === 'mine') rows = rows.filter((r) => r.createdBy === userId);
@@ -130,8 +292,7 @@ accountsRouter.get('/:id/stats', requireAuth, requireRole('recruiter_admin', 're
     const [account] = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
     if (!account) return c.json({ error: 'Account not found' }, 404);
 
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    if (!isOrgMember(account.createdBy, memberIds)) {
+    if (!belongsToOrganization(account.organizationId, orgId, account.createdBy, userId)) {
       return c.json({ error: 'Account not found' }, 404);
     }
 
@@ -173,8 +334,7 @@ accountsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
     const row = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
     if (!row.length) return c.json({ error: 'Account not found' }, 404);
 
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    if (!isOrgMember(row[0].createdBy, memberIds)) {
+    if (!belongsToOrganization(row[0].organizationId, orgId, row[0].createdBy, userId)) {
       return c.json({ error: 'Account not found' }, 404);
     }
 

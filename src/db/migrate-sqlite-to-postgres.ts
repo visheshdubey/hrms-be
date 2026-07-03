@@ -1,3 +1,4 @@
+// One-off migration tool. Install locally first: npm install -D better-sqlite3 @types/better-sqlite3
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';

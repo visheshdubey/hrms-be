@@ -14,7 +14,11 @@ services:
     restart: always
     networks:
       - shared_network
+      - ats_network
 
 networks:
   shared_network:
     external: true
+  ats_network:
+    external: true
+    name: ats-backend-live_ats-network
