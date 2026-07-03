@@ -23,7 +23,7 @@ commands:
             - run:
                   name: Clean remote disk
                   command: |
-                      ssh -o StrictHostKeyChecking=no root@147.93.18.45 "docker system prune -af --volumes || true; journalctl --vacuum-time=1d || true"
+                      ssh -o StrictHostKeyChecking=no root@147.93.18.45 "docker image prune -af || true; docker container prune -f || true; journalctl --vacuum-time=1d || true"
 
     create-remote-dir:
         description: "Create remote directory on server"
@@ -193,34 +193,46 @@ workflows:
             - checkout-code:
                   filters:
                       branches:
-                          only: main
+                          only:
+                              - main
+                              - candidates-stable
             - upload-to-prod:
                   requires:
                       - checkout-code
                   filters:
                       branches:
-                          only: main
+                          only:
+                              - main
+                              - candidates-stable
             - build-prod:
                   requires:
                       - upload-to-prod
                   filters:
                       branches:
-                          only: main
+                          only:
+                              - main
+                              - candidates-stable
             - setup-environment-prod:
                   requires:
                       - build-prod
                   filters:
                       branches:
-                          only: main
+                          only:
+                              - main
+                              - candidates-stable
             - deploy-prod:
                   requires:
                       - setup-environment-prod
                   filters:
                       branches:
-                          only: main
+                          only:
+                              - main
+                              - candidates-stable
             - update-nginx-prod:
                   requires:
                       - deploy-prod
                   filters:
                       branches:
-                          only: main
+                          only:
+                              - main
+                              - candidates-stable
