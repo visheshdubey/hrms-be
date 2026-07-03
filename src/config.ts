@@ -1,4 +1,13 @@
-export const JWT_SECRET = process.env.JWT_SECRET ?? 'fallback-secret';
+function resolveJwtSecret(): string {
+  const secret = process.env.JWT_SECRET?.trim();
+  if (secret) return secret;
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("JWT_SECRET environment variable is required in production");
+  }
+  return "dev-only-jwt-secret-change-me";
+}
+
+export const JWT_SECRET = resolveJwtSecret();
 
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;

@@ -26,9 +26,15 @@ import candidateGroupsRoutes from './routes/candidateGroups.js';
 const app = new Hono({ strict: false });
 
 // Middleware
+const defaultOrigins = [
+  'http://localhost:5173',
+  'https://hrms.devcognito.tech',
+  'https://hrms-be.devcognito.tech',
+];
+
 const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-  : ['http://147.93.18.45', 'http://localhost:5173', 'https://devcognito.tech', 'https://hrms.devcognito.tech'];
+  ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
+  : defaultOrigins;
 
 app.use('*', cors({
   origin: allowedOrigins,

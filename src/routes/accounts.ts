@@ -58,6 +58,8 @@ const accountBody = z.object({
   city: z.string().optional(),
   state: z.string().optional(),
   country: z.string().optional(),
+  shortLogoUrl: z.string().optional(),
+  longLogoUrl: z.string().optional(),
 });
 
 const mergeSchema = z.object({
@@ -382,7 +384,7 @@ accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
     const b = c.req.valid('json');
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
-    for (const k of ['name','status','type','website','description','phone','email','address','city','state','country'] as const) {
+    for (const k of ['name','status','type','website','description','phone','email','address','city','state','country','shortLogoUrl','longLogoUrl'] as const) {
       if (b[k] !== undefined) patch[k] = b[k];
     }
 

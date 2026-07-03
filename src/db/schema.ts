@@ -236,6 +236,8 @@ export const accounts = pgTable("accounts", {
   city: text("city").default(""),
   state: text("state").default(""),
   country: text("country").default(""),
+  shortLogoUrl: text("short_logo_url").default(""),
+  longLogoUrl: text("long_logo_url").default(""),
   organizationId: integer("organization_id").references(() => organizations.id),
   createdBy: integer("created_by").references(() => users.id),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
