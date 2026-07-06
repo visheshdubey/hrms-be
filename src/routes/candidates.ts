@@ -5,6 +5,7 @@ import { db } from '../db/index.js';
 import { candidates, jobs, users } from '../db/schema.js';
 import { eq, desc, inArray } from 'drizzle-orm';
 import { requireAuth, type AppContext } from '../middleware.js';
+import { canAccessByCreator } from '../lib/orgScope.js';
 
 const candidatesRouter = new Hono<AppContext>({ strict: false });
 
@@ -242,11 +243,17 @@ candidatesRouter.get('/csv', requireAuth, async (c) => {
 // GET /candidates/:id — single candidate (must come after /csv)
 candidatesRouter.get('/:id', requireAuth, async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
     const row = await db.select().from(candidates).where(eq(candidates.id, id)).limit(1);
     if (row.length === 0) return c.json({ error: 'Candidate not found' }, 404);
+
+    if (!await canAccessByCreator(orgId, userId, row[0].createdBy)) {
+      return c.json({ error: 'Candidate not found' }, 404);
+    }
 
     const cand = row[0];
     return c.json({
@@ -290,7 +297,10 @@ candidatesRouter.put('/:id', requireAuth, zValidator('json', updateSchema), asyn
 
     const existing = await db.select().from(candidates).where(eq(candidates.id, id)).limit(1);
     if (existing.length === 0) return c.json({ error: 'Candidate not found' }, 404);
-    if (existing[0].createdBy !== userId) return c.json({ error: 'Unauthorized' }, 403);
+    const orgId = c.get('organizationId') as number | null;
+    if (!await canAccessByCreator(orgId, userId, existing[0].createdBy)) {
+      return c.json({ error: 'Unauthorized' }, 403);
+    }
 
     const body = c.req.valid('json');
 
@@ -334,10 +344,14 @@ candidatesRouter.put('/:id', requireAuth, zValidator('json', updateSchema), asyn
 candidatesRouter.delete('/:id', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
 
     const existing = await db.select().from(candidates).where(eq(candidates.id, id));
-    if (existing.length === 0 || existing[0].createdBy !== userId) {
+    if (existing.length === 0) {
+      return c.json({ error: 'Candidate not found or unauthorized' }, 403);
+    }
+    if (!await canAccessByCreator(orgId, userId, existing[0].createdBy)) {
       return c.json({ error: 'Candidate not found or unauthorized' }, 403);
     }
     

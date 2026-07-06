@@ -4,8 +4,9 @@ import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { eq, desc, inArray, and, or, isNull } from 'drizzle-orm';
 import { requireAuth, type AppContext, type UserRole } from '../middleware.js';
-import { jobs, users, jobStages, JOB_STAGE_TYPES, accounts } from '../db/schema.js';
-import { copyAccountStageTemplatesToJob, canWriteStageTemplates, getAccountIfAccessible } from '../lib/stages.js';
+import { jobs, jobStages, JOB_STAGE_TYPES, accounts } from '../db/schema.js';
+import { copyAccountStageTemplatesToJob, canWriteStageTemplates } from '../lib/stages.js';
+import { canAccessJob, getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
 
 const jobsRouter = new Hono<AppContext>({ strict: false });
 
@@ -47,26 +48,8 @@ async function canAccessJobForStages(params: { jobId: number; userId: number; or
   const { jobId, userId, orgId } = params;
   const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
   if (!job) return null;
-
-  if (orgId != null) {
-    if (job.accountId != null) {
-      const orgAccounts = await db
-        .select({ id: accounts.id })
-        .from(accounts)
-        .where(eq(accounts.organizationId, orgId));
-      const accountIds = orgAccounts.map((account) => account.id);
-      return accountIds.includes(job.accountId) ? job : null;
-    }
-
-    const orgMembers = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.organizationId, orgId));
-    const memberIds = orgMembers.map((member) => member.id);
-    return memberIds.includes(job.createdBy ?? -1) ? job : null;
-  }
-
-  return job.createdBy === userId ? job : null;
+  if (!await canAccessJob(job, userId, orgId)) return null;
+  return job;
 }
 
 // GET /jobs — list all jobs visible to the authenticated user's organization
@@ -81,14 +64,15 @@ jobsRouter.get('/', requireAuth, async (c) => {
       const orgAccounts = await db
         .select({ id: accounts.id })
         .from(accounts)
-        .where(eq(accounts.organizationId, orgId));
+        .where(orgOrCreatorScope(orgId, userId, accounts, accounts));
       const accountIds = orgAccounts.map((account) => account.id);
+      const memberIds = await getOrgMemberIds(orgId, userId);
 
       if (accountIds.length === 0) {
         all = await db
           .select()
           .from(jobs)
-          .where(and(isNull(jobs.accountId), eq(jobs.createdBy, userId)))
+          .where(and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)))
           .orderBy(desc(jobs.id));
       } else {
         all = await db
@@ -97,7 +81,7 @@ jobsRouter.get('/', requireAuth, async (c) => {
           .where(
             or(
               inArray(jobs.accountId, accountIds),
-              and(isNull(jobs.accountId), eq(jobs.createdBy, userId)),
+              and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)),
             ),
           )
           .orderBy(desc(jobs.id));
@@ -132,11 +116,17 @@ jobsRouter.get('/', requireAuth, async (c) => {
 // GET /jobs/:id — single job detail
 jobsRouter.get('/:id', requireAuth, async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
     const row = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
     if (row.length === 0) return c.json({ error: 'Job not found' }, 404);
+
+    if (!await canAccessJob(row[0], userId, orgId)) {
+      return c.json({ error: 'Job not found' }, 404);
+    }
 
     const j = row[0];
     return c.json({
@@ -196,17 +186,7 @@ jobsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSchema), a
     const row = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
     if (row.length === 0) return c.json({ error: 'Job not found' }, 404);
 
-    // Org-scope check: the job must belong to the caller's org (or be their own)
-    if (orgId != null) {
-      const orgMembers = await db
-        .select({ id: users.id })
-        .from(users)
-        .where(eq(users.organizationId, orgId));
-      const memberIds = orgMembers.map((u: any) => u.id);
-      if (!memberIds.includes(row[0].createdBy!)) {
-        return c.json({ error: 'Job not found or unauthorized' }, 403);
-      }
-    } else if (row[0].createdBy !== userId) {
+    if (!await canAccessJob(row[0], userId, orgId)) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
     }
 
@@ -238,11 +218,15 @@ jobsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSchema), a
 jobsRouter.put('/:id', requireAuth, zValidator('json', jobSchema), async (c) => {
   try {
     const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     const body = c.req.valid('json');
 
     const existing = await db.select().from(jobs).where(eq(jobs.id, id));
-    if (existing.length === 0 || existing[0].createdBy !== userId) {
+    if (existing.length === 0) {
+      return c.json({ error: 'Job not found or unauthorized' }, 403);
+    }
+    if (!await canAccessJob(existing[0], userId, orgId)) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
     }
 
@@ -267,10 +251,14 @@ jobsRouter.put('/:id', requireAuth, zValidator('json', jobSchema), async (c) => 
 jobsRouter.delete('/:id', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
 
     const existing = await db.select().from(jobs).where(eq(jobs.id, id));
-    if (existing.length === 0 || existing[0].createdBy !== userId) {
+    if (existing.length === 0) {
+      return c.json({ error: 'Job not found or unauthorized' }, 403);
+    }
+    if (!await canAccessJob(existing[0], userId, orgId)) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
     }
 

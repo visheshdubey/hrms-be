@@ -380,8 +380,17 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
 /* PUT /accounts/:id */
 accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', accountBody.partial()), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const [existing] = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+    if (!existing) return c.json({ error: 'Account not found' }, 404);
+    if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
+
     const b = c.req.valid('json');
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const k of ['name','status','type','website','description','phone','email','address','city','state','country','shortLogoUrl','longLogoUrl'] as const) {
@@ -399,8 +408,16 @@ accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
 /* DELETE /accounts/:id */
 accountsRouter.delete('/:id', requireAuth, requireRole('recruiter_admin'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const [existing] = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+    if (!existing) return c.json({ error: 'Account not found' }, 404);
+    if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
 
     const linked = await db.select({ id: contacts.id }).from(contacts).where(eq(contacts.accountId, id)).limit(1);
     if (linked.length) return c.json({ error: 'Cannot delete account with linked contacts' }, 409);

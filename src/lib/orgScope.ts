@@ -1,5 +1,5 @@
 import { db } from '../db/index.js';
-import { users } from '../db/schema.js';
+import { accounts, users } from '../db/schema.js';
 import { eq, and, or, isNull, type SQL } from 'drizzle-orm';
 
 export async function getOrgMemberIds(
@@ -59,4 +59,35 @@ export function belongsToOrganization(
     return createdBy === userId;
   }
   return createdBy === userId;
+}
+
+/** Whether the caller may access a record scoped by its creator (org members share access). */
+export async function canAccessByCreator(
+  orgId: number | null,
+  userId: number,
+  createdBy: number | null | undefined,
+): Promise<boolean> {
+  if (orgId != null) {
+    const memberIds = await getOrgMemberIds(orgId, userId);
+    return isOrgMember(createdBy, memberIds);
+  }
+  return createdBy === userId;
+}
+
+/** Whether the caller may access a job via its linked account or creator. */
+export async function canAccessJob(
+  job: { accountId: number | null; createdBy: number | null },
+  userId: number,
+  orgId: number | null,
+): Promise<boolean> {
+  if (job.accountId != null) {
+    const [account] = await db
+      .select()
+      .from(accounts)
+      .where(eq(accounts.id, job.accountId))
+      .limit(1);
+    if (!account) return false;
+    return belongsToOrganization(account.organizationId, orgId, account.createdBy, userId);
+  }
+  return canAccessByCreator(orgId, userId, job.createdBy);
 }
