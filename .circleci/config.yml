@@ -106,12 +106,22 @@ commands:
                   command: |
                       printf -v circle_project_reponame %q "${CIRCLE_PROJECT_REPONAME}"
                       ssh -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame" \<< 'EOF'
+                        set -e
                         circle_project_reponame_var=$1
+                        compose_project="${circle_project_reponame_var}-<< parameters.environment >>"
+                        compose_file="./docker/docker-compose.<< parameters.environment >>.yml"
+                        container_name="${circle_project_reponame_var}-<< parameters.environment >>"
+
                         cd /home/source/<< parameters.environment >>/$circle_project_reponame_var/
-                        docker compose -p ${circle_project_reponame_var}-<< parameters.environment >> -f ./docker/docker-compose.<< parameters.environment >>.yml down --remove-orphans || true
-                        docker rm -f ${circle_project_reponame_var}-<< parameters.environment >> || true
-                        docker rm -f hrms-be-prod || true
-                        docker compose -p ${circle_project_reponame_var}-<< parameters.environment >> -f ./docker/docker-compose.<< parameters.environment >>.yml up -d --build --remove-orphans
+
+                        docker compose -p "$compose_project" -f "$compose_file" down --remove-orphans || true
+                        docker stop "$container_name" 2>/dev/null || true
+                        docker rm -f "$container_name" 2>/dev/null || true
+                        # Wait for Docker to release the fixed container_name before recreate
+                        sleep 3
+                        docker rm -f "$container_name" 2>/dev/null || true
+
+                        docker compose -p "$compose_project" -f "$compose_file" up -d --build --force-recreate --remove-orphans
                       EOF
 
     update-nginx:
