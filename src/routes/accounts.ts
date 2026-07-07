@@ -11,6 +11,7 @@ import {
   canWriteStageTemplates,
   getAccountIfAccessible,
 } from '../lib/stages.js';
+import { cascadeDeleteAccount, getAccountDeletePreview } from '../lib/accountDelete.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
@@ -37,8 +38,16 @@ async function enrichAccount(row: typeof accounts.$inferSelect) {
     .from(contacts)
     .where(eq(contacts.accountId, row.id));
 
+  let parsedTags: string[] = [];
+  try {
+    const raw = JSON.parse(row.tags ?? '[]');
+    if (Array.isArray(raw)) parsedTags = raw.map((v) => String(v)).filter(Boolean);
+  } catch {}
+
   return {
     ...row,
+    tags: parsedTags,
+    alertsEnabled: Boolean(row.alertsEnabled),
     ownerName,
     contactCount: Number(countRow?.count ?? 0),
     statusLabel: STATUS_LABELS[row.status as AccStatus] ?? row.status,
@@ -50,6 +59,9 @@ const accountBody = z.object({
   name: z.string().min(1, 'Account name is required'),
   status: z.enum(ACCOUNT_STATUSES).optional(),
   type: z.enum(ACCOUNT_TYPES).optional(),
+  contractValue: z.number().int().nonnegative().optional(),
+  tags: z.array(z.string()).optional(),
+  alertsEnabled: z.boolean().optional(),
   website: z.string().optional(),
   description: z.string().optional(),
   phone: z.string().optional(),
@@ -58,6 +70,8 @@ const accountBody = z.object({
   city: z.string().optional(),
   state: z.string().optional(),
   country: z.string().optional(),
+  shortLogoUrl: z.string().optional(),
+  longLogoUrl: z.string().optional(),
 });
 
 const mergeSchema = z.object({
@@ -232,6 +246,7 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     const orgId = c.get('organizationId') as number | null;
     const view = c.req.query('view') ?? 'all';
     const typeFilter = c.req.query('type');
+    const statusFilter = c.req.query('status');
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
     const { page, pageSize } = parsePagination(c.req.query());
 
@@ -245,6 +260,7 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
       rows = rows.filter((r) => r.createdAt >= cutoff);
     }
     if (typeFilter && typeFilter !== 'all') rows = rows.filter((r) => r.type === typeFilter);
+    if (statusFilter && statusFilter !== 'all') rows = rows.filter((r) => r.status === statusFilter);
 
     const enriched = await Promise.all(rows.map(enrichAccount));
 
@@ -278,6 +294,26 @@ accountsRouter.post('/merge', requireAuth, requireRole('recruiter_admin'), zVali
     return c.json(await enrichAccount(target));
   } catch {
     return c.json({ error: 'Failed to merge accounts' }, 500);
+  }
+});
+
+/* GET /accounts/:id/delete-preview — must be before /:id */
+accountsRouter.get('/:id/delete-preview', requireAuth, requireRole('recruiter_admin'), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const [account] = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+    if (!account) return c.json({ error: 'Account not found' }, 404);
+    if (!belongsToOrganization(account.organizationId, orgId, account.createdBy, userId)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
+
+    return c.json(await getAccountDeletePreview(id));
+  } catch {
+    return c.json({ error: 'Failed to fetch delete preview' }, 500);
   }
 });
 
@@ -356,6 +392,9 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
       name: b.name,
       status: b.status ?? 'active',
       type: b.type ?? 'client',
+      contractValue: b.contractValue ?? 0,
+      tags: JSON.stringify(b.tags ?? []),
+      alertsEnabled: b.alertsEnabled ? 1 : 0,
       website: b.website ?? '',
       description: b.description ?? '',
       phone: b.phone ?? '',
@@ -378,13 +417,24 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
 /* PUT /accounts/:id */
 accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', accountBody.partial()), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const [existing] = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+    if (!existing) return c.json({ error: 'Account not found' }, 404);
+    if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
+
     const b = c.req.valid('json');
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
-    for (const k of ['name','status','type','website','description','phone','email','address','city','state','country'] as const) {
+    for (const k of ['name','status','type','contractValue','website','description','phone','email','address','city','state','country','shortLogoUrl','longLogoUrl'] as const) {
       if (b[k] !== undefined) patch[k] = b[k];
     }
+    if (b.tags !== undefined) patch.tags = JSON.stringify(b.tags);
+    if (b.alertsEnabled !== undefined) patch.alertsEnabled = b.alertsEnabled ? 1 : 0;
 
     const [updated] = await db.update(accounts).set(patch as any).where(eq(accounts.id, id)).returning();
     if (!updated) return c.json({ error: 'Account not found' }, 404);
@@ -397,13 +447,18 @@ accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
 /* DELETE /accounts/:id */
 accountsRouter.delete('/:id', requireAuth, requireRole('recruiter_admin'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
-    const linked = await db.select({ id: contacts.id }).from(contacts).where(eq(contacts.accountId, id)).limit(1);
-    if (linked.length) return c.json({ error: 'Cannot delete account with linked contacts' }, 409);
+    const [existing] = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+    if (!existing) return c.json({ error: 'Account not found' }, 404);
+    if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
 
-    await db.delete(accounts).where(eq(accounts.id, id));
+    await cascadeDeleteAccount(id);
     return c.json({ ok: true });
   } catch {
     return c.json({ error: 'Failed to delete account' }, 500);
