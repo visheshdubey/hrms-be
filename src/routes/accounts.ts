@@ -497,7 +497,7 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
       }).returning();
       created = row;
     } catch (error) {
-      if (!isMissingAccountMetadataColumnError(error)) throw error;
+      if (!isAccountsSchemaDriftError(error)) throw error;
       const [row] = await db.insert(accounts).values({
         name: b.name,
         status: b.status ?? 'active',
@@ -550,7 +550,7 @@ accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
       const [row] = await db.update(accounts).set(patch as any).where(eq(accounts.id, id)).returning();
       updated = row;
     } catch (error) {
-      if (!isMissingAccountMetadataColumnError(error)) throw error;
+      if (!isAccountsSchemaDriftError(error)) throw error;
       delete patch.contractValue;
       delete patch.tags;
       delete patch.alertsEnabled;
