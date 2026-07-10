@@ -3,8 +3,14 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { candidates, jobs, users } from '../db/schema.js';
-import { eq, desc, inArray } from 'drizzle-orm';
+import { eq, desc, inArray, and, or, ilike, notInArray } from 'drizzle-orm';
 import { requireAuth, type AppContext } from '../middleware.js';
+import { canAccessByCreator } from '../lib/orgScope.js';
+import {
+  runCandidateBulkImport,
+  sanitizeBulkCandidateRows,
+} from '../lib/candidateBulkImport.js';
+import { queueCandidateBulkImport, shouldQueueBulkImport } from '../queue/bulk-import.js';
 
 const candidatesRouter = new Hono<AppContext>({ strict: false });
 
@@ -33,6 +39,26 @@ const candidateSchema = z.object({
   grad_year: z.string().optional(),
   work_history: z.union([z.string(), z.array(z.any())]).optional(),
   fingerprint: z.string().optional(),
+});
+
+const bulkCandidateSchema = z.object({
+  rows: z.array(z.object({
+    name: z.string().min(1),
+    email: z.string().optional(),
+    phone: z.string().optional(),
+    location: z.string().optional(),
+    education: z.string().optional(),
+    experience: z.string().optional(),
+    skills: z.array(z.string()).optional(),
+    source: z.string().optional(),
+    status: z.string().optional(),
+    linkedin: z.string().optional(),
+    github: z.string().optional(),
+    portfolio: z.string().optional(),
+    summary: z.string().optional(),
+    university: z.string().optional(),
+    grad_year: z.string().optional(),
+  })).min(1),
 });
 
 // GET /candidates — list all candidates visible to the authenticated user's organization
@@ -160,6 +186,102 @@ candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), asy
   }
 });
 
+// POST /candidates/bulk — bulk create from parsed CSV rows (queued when Redis available)
+candidatesRouter.post('/bulk', requireAuth, zValidator('json', bulkCandidateSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const { rows } = c.req.valid('json');
+
+    const sanitized = sanitizeBulkCandidateRows(rows);
+    if (sanitized.length === 0) {
+      return c.json({ error: 'No valid rows to import' }, 400);
+    }
+
+    if (!shouldQueueBulkImport(sanitized.length)) {
+      const result = await runCandidateBulkImport({
+        rows: sanitized,
+        userId,
+        organizationId: orgId,
+      });
+      return c.json(result, 201);
+    }
+
+    const queued = await queueCandidateBulkImport({
+      rows: sanitized,
+      userId,
+      organizationId: orgId,
+    });
+
+    if (queued.inline && queued.result) {
+      return c.json(queued.result, 201);
+    }
+
+    return c.json({
+      status: 'queued',
+      batchId: queued.batchId,
+      taskId: queued.taskId,
+      total: sanitized.length,
+      queued: queued.queued,
+    }, 202);
+  } catch (error) {
+    console.error('Bulk import error:', error);
+    return c.json({ error: 'Failed to bulk import candidates' }, 500);
+  }
+});
+
+// GET /candidates/options — lightweight search for pickers (bulk assign, etc.)
+candidatesRouter.get('/options', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const q = c.req.query('q')?.trim() ?? '';
+    const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '50', 10) || 50, 1), 100);
+    const excludeRaw = (c.req.query('exclude') ?? '')
+      .split(',')
+      .map((value) => parseInt(value.trim(), 10))
+      .filter((value) => !Number.isNaN(value));
+
+    let memberIds: number[];
+    if (orgId != null) {
+      const orgMembers = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.organizationId, orgId));
+      memberIds = orgMembers.map((u) => u.id);
+      if (memberIds.length === 0) return c.json({ data: [] });
+    } else {
+      memberIds = [userId];
+    }
+
+    const conditions = [inArray(candidates.createdBy, memberIds)];
+    if (excludeRaw.length > 0) {
+      conditions.push(notInArray(candidates.id, excludeRaw));
+    }
+    if (q) {
+      const pattern = `%${q}%`;
+      conditions.push(or(ilike(candidates.name, pattern), ilike(candidates.email, pattern))!);
+    }
+
+    const rows = await db
+      .select({ id: candidates.id, name: candidates.name, email: candidates.email })
+      .from(candidates)
+      .where(and(...conditions))
+      .orderBy(desc(candidates.matchScore))
+      .limit(limit);
+
+    return c.json({
+      data: rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        email: row.email,
+      })),
+    });
+  } catch {
+    return c.json({ error: 'Failed to fetch candidate options' }, 500);
+  }
+});
+
 // GET /candidates/csv — download CSV report for the organization's candidates
 candidatesRouter.get('/csv', requireAuth, async (c) => {
   try {
@@ -242,11 +364,17 @@ candidatesRouter.get('/csv', requireAuth, async (c) => {
 // GET /candidates/:id — single candidate (must come after /csv)
 candidatesRouter.get('/:id', requireAuth, async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
     const row = await db.select().from(candidates).where(eq(candidates.id, id)).limit(1);
     if (row.length === 0) return c.json({ error: 'Candidate not found' }, 404);
+
+    if (!await canAccessByCreator(orgId, userId, row[0].createdBy)) {
+      return c.json({ error: 'Candidate not found' }, 404);
+    }
 
     const cand = row[0];
     return c.json({
@@ -290,7 +418,10 @@ candidatesRouter.put('/:id', requireAuth, zValidator('json', updateSchema), asyn
 
     const existing = await db.select().from(candidates).where(eq(candidates.id, id)).limit(1);
     if (existing.length === 0) return c.json({ error: 'Candidate not found' }, 404);
-    if (existing[0].createdBy !== userId) return c.json({ error: 'Unauthorized' }, 403);
+    const orgId = c.get('organizationId') as number | null;
+    if (!await canAccessByCreator(orgId, userId, existing[0].createdBy)) {
+      return c.json({ error: 'Unauthorized' }, 403);
+    }
 
     const body = c.req.valid('json');
 
@@ -334,10 +465,14 @@ candidatesRouter.put('/:id', requireAuth, zValidator('json', updateSchema), asyn
 candidatesRouter.delete('/:id', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
 
     const existing = await db.select().from(candidates).where(eq(candidates.id, id));
-    if (existing.length === 0 || existing[0].createdBy !== userId) {
+    if (existing.length === 0) {
+      return c.json({ error: 'Candidate not found or unauthorized' }, 403);
+    }
+    if (!await canAccessByCreator(orgId, userId, existing[0].createdBy)) {
       return c.json({ error: 'Candidate not found or unauthorized' }, 403);
     }
     

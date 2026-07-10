@@ -22,13 +22,24 @@ import tasksRoutes from './routes/tasks.js';
 import campaignsRoutes from './routes/campaigns.js';
 import settingsRoutes from './routes/settings.js';
 import candidateGroupsRoutes from './routes/candidateGroups.js';
+import uploadsRoutes from './routes/uploads.js';
+import queueRoutes from './routes/queue.js';
+import { startQueueWorker } from './queue/worker.js';
+import { QUEUE_CONFIG } from './queue/config.js';
+import { ensureProdSchema } from './db/ensureProdSchema.js';
 
 const app = new Hono({ strict: false });
 
 // Middleware
+const defaultOrigins = [
+  'http://localhost:5173',
+  'https://hrms.devcognito.tech',
+  'https://hrms-be.devcognito.tech',
+];
+
 const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-  : ['http://147.93.18.45', 'http://localhost:5173', 'https://devcognito.tech', 'https://hrms.devcognito.tech'];
+  ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
+  : defaultOrigins;
 
 app.use('*', cors({
   origin: allowedOrigins,
@@ -91,8 +102,27 @@ app.route('/settings', settingsRoutes);
 app.route('/api/hono/settings', settingsRoutes);
 app.route('/candidate-groups', candidateGroupsRoutes);
 app.route('/api/hono/candidate-groups', candidateGroupsRoutes);
+app.route('/uploads', uploadsRoutes);
+app.route('/api/hono/uploads', uploadsRoutes);
+app.route('/queue', queueRoutes);
+app.route('/api/hono/queue', queueRoutes);
 
 const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-console.log(`✅ Server is running on port ${port}`);
 
-serve({ fetch: app.fetch, port });
+async function boot() {
+  try {
+    await ensureProdSchema();
+  } catch (error) {
+    console.error('[boot] ensureProdSchema failed (continuing):', error);
+  }
+
+  console.log(`✅ Server is running on port ${port}`);
+
+  if (QUEUE_CONFIG.enableWorker) {
+    void startQueueWorker();
+  }
+
+  serve({ fetch: app.fetch, port });
+}
+
+void boot();

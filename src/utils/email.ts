@@ -1,15 +1,12 @@
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
-import path from 'path';
 
-// Load environment variables
 dotenv.config();
 
-// Create reusable transporter object using the default SMTP transport
 export const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: process.env.SMTP_SECURE === 'true', // true for 465, false for other ports
+  secure: process.env.SMTP_SECURE === 'true',
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
@@ -19,45 +16,44 @@ export const transporter = nodemailer.createTransport({
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SMTP_USER || 'noreply@hrms.com';
 
-/** When SMTP is not configured, log emails to console instead of failing. */
-function isSmtpConfigured(): boolean {
+export function isSmtpConfigured(): boolean {
   return Boolean(process.env.SMTP_USER && process.env.SMTP_PASS);
 }
 
-async function deliverEmail(
-  label: string,
-  payload: { to: string; subject: string; html: string },
-): Promise<boolean> {
+export async function deliverRawEmail(input: {
+  to: string;
+  subject: string;
+  html: string;
+  label?: string;
+}): Promise<boolean> {
+  const label = input.label ?? 'Email';
+
   if (!isSmtpConfigured()) {
     console.log(`[EMAIL MOCK] ${label} — SMTP not configured`);
-    console.log(`  To: ${payload.to}`);
-    console.log(`  Subject: ${payload.subject}`);
-    const linkMatch = payload.html.match(/href="([^"]+)"/);
+    console.log(`  To: ${input.to}`);
+    console.log(`  Subject: ${input.subject}`);
+    const linkMatch = input.html.match(/href="([^"]+)"/);
     if (linkMatch) console.log(`  Link: ${linkMatch[1]}`);
-    return false;
+    return true;
   }
 
   try {
     const info = await transporter.sendMail({
       from: `"HRMS Team" <${FROM_EMAIL}>`,
-      to: payload.to,
-      subject: payload.subject,
-      html: payload.html,
+      to: input.to,
+      subject: input.subject,
+      html: input.html,
     });
     console.log(`${label} sent: ${info.messageId}`);
     return true;
   } catch (error) {
-    console.error(`Error ${label.toLowerCase()}:`, error);
+    console.error(`Error sending ${label.toLowerCase()}:`, error);
     return false;
   }
 }
 
-/**
- * Sends a verification email to a newly registered user
- */
-export const sendVerificationEmail = async (toEmail: string, verifyToken: string) => {
+export function buildVerificationEmailHtml(verifyToken: string) {
   const verifyLink = `${FRONTEND_URL}/accept-invite?token=${verifyToken}`;
-
   const html = `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eaeaea; border-radius: 8px;">
       <h2 style="color: #333;">Welcome to HRMS!</h2>
@@ -79,23 +75,11 @@ export const sendVerificationEmail = async (toEmail: string, verifyToken: string
       </p>
     </div>
   `;
+  return { subject: 'Verify your HRMS account', html };
+}
 
-  return deliverEmail('Verification email', {
-    to: toEmail,
-    subject: 'Verify your HRMS account',
-    html,
-  });
-};
-
-/**
- * Sends an invite email to a team member
- */
-/**
- * Sends a password-reset email to an existing user
- */
-export const sendPasswordResetEmail = async (toEmail: string, resetToken: string) => {
+export function buildPasswordResetEmailHtml(resetToken: string) {
   const resetLink = `${FRONTEND_URL}/create-password?token=${resetToken}`;
-
   const html = `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eaeaea; border-radius: 8px;">
       <h2 style="color: #333;">Reset your password</h2>
@@ -117,17 +101,11 @@ export const sendPasswordResetEmail = async (toEmail: string, resetToken: string
       </p>
     </div>
   `;
+  return { subject: 'Reset your HRMS password', html };
+}
 
-  return deliverEmail('Password reset email', {
-    to: toEmail,
-    subject: 'Reset your HRMS password',
-    html,
-  });
-};
-
-export const sendInviteEmail = async (toEmail: string, inviterName: string, verifyToken: string) => {
+export function buildInviteEmailHtml(inviterName: string, verifyToken: string) {
   const verifyLink = `${FRONTEND_URL}/accept-invite?token=${verifyToken}`;
-
   const html = `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eaeaea; border-radius: 8px;">
       <h2 style="color: #333;">You've been invited!</h2>
@@ -148,10 +126,57 @@ export const sendInviteEmail = async (toEmail: string, inviterName: string, veri
       </p>
     </div>
   `;
+  return { subject: `Invitation from ${inviterName} to join HRMS`, html };
+}
 
-  return deliverEmail('Invite email', {
-    to: toEmail,
-    subject: `Invitation from ${inviterName} to join HRMS`,
-    html,
-  });
+export function buildPasswordOtpEmailHtml(otp: string) {
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eaeaea; border-radius: 8px;">
+      <h2 style="color: #333;">Password change verification</h2>
+      <p style="color: #555; line-height: 1.5;">
+        Use this one-time code to confirm your password change. It expires in 10 minutes.
+      </p>
+      <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px; text-align: center; color: #111;">
+        ${otp}
+      </p>
+      <p style="color: #888; font-size: 12px; text-align: center;">
+        If you did not request this, ignore this email.
+      </p>
+    </div>
+  `;
+  return { subject: 'Your HRMS password change code', html };
+}
+
+export function buildCampaignEmailHtml(bodyHtml: string) {
+  return `
+    <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; padding: 24px; border: 1px solid #eaeaea; border-radius: 8px;">
+      <div style="color: #333; line-height: 1.6;">${bodyHtml}</div>
+      <hr style="border: none; border-top: 1px solid #eaeaea; margin: 24px 0;">
+      <p style="color: #888; font-size: 12px; text-align: center;">Sent via HRMS</p>
+    </div>
+  `;
+}
+
+/** @deprecated Use queue helpers in queue/email-service.ts */
+export const sendVerificationEmail = async (toEmail: string, verifyToken: string) => {
+  const { subject, html } = buildVerificationEmailHtml(verifyToken);
+  return deliverRawEmail({ to: toEmail, subject, html, label: 'Verification email' });
+};
+
+/** @deprecated Use queue helpers in queue/email-service.ts */
+export const sendPasswordResetEmail = async (toEmail: string, resetToken: string) => {
+  const { subject, html } = buildPasswordResetEmailHtml(resetToken);
+  return deliverRawEmail({ to: toEmail, subject, html, label: 'Password reset email' });
+};
+
+/** @deprecated Use queue helpers in queue/email-service.ts */
+export const sendInviteEmail = async (toEmail: string, inviterName: string, verifyToken: string) => {
+  const { subject, html } = buildInviteEmailHtml(inviterName, verifyToken);
+  return deliverRawEmail({ to: toEmail, subject, html, label: 'Invite email' });
+};
+
+/** @deprecated Use queue helpers in queue/email-service.ts */
+export const sendPasswordOtpEmail = async (toEmail: string, otp: string) => {
+  const { subject, html } = buildPasswordOtpEmailHtml(otp);
+  return deliverRawEmail({ to: toEmail, subject, html, label: 'Password change OTP' });
 };

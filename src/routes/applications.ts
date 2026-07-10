@@ -7,11 +7,20 @@ import {
   applicationStageHistory,
   candidates,
   jobs,
+  jobStages,
   users,
   APP_STATUSES,
 } from '../db/schema.js';
 import { eq, desc, and } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import { canAccessJob } from '../lib/orgScope.js';
+import { selectJobById } from '../lib/jobQueries.js';
+import { isSchemaDriftError } from '../lib/schemaDrift.js';
+import {
+  incrementJobApplicantCount,
+  resolveNewApplicationDefaults,
+  backfillNullApplicationStages,
+} from '../lib/applicationDefaults.js';
 
 const applicationsRouter = new Hono<AppContext>({ strict: false });
 
@@ -45,6 +54,15 @@ const createSchema = z.object({
   jobId:       z.number().int().positive(),
   candidateId: z.number().int().positive(),
   notes:       z.string().optional(),
+  assignedTo:  z.number().int().positive().optional().nullable(),
+  jobStageId:  z.number().int().positive().optional().nullable(),
+});
+
+const bulkCreateSchema = z.object({
+  jobId:         z.number().int().positive(),
+  candidateIds:  z.array(z.number().int().positive()).min(1),
+  notes:         z.string().optional(),
+  assignedTo:    z.number().int().positive().optional().nullable(),
 });
 
 const statusSchema = z.object({
@@ -54,7 +72,21 @@ const statusSchema = z.object({
 
 const notesSchema = z.object({ notes: z.string() });
 
+const assignmentSchema = z.object({
+  assignedTo: z.number().int().positive(),
+  jobStageId: z.number().int().positive().optional().nullable(),
+});
+
 /* ─── Helpers ─── */
+function safeJsonParse(str: string | null | undefined): string[] {
+  try {
+    const parsed = JSON.parse(str || "[]") as unknown;
+    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : [];
+  } catch {
+    return [];
+  }
+}
+
 async function enrichApplication(app: Record<string, unknown>) {
   const [cand] = await db
     .select({
@@ -65,18 +97,235 @@ async function enrichApplication(app: Record<string, unknown>) {
     .from(candidates)
     .where(eq(candidates.id, app.candidateId as number));
 
-  const [job] = await db
-    .select({ id: jobs.id, title: jobs.title, department: jobs.department })
-    .from(jobs)
-    .where(eq(jobs.id, app.jobId as number));
+  let job: { id: number; title: string; department: string; assignedTo: number | null } | null = null;
+  try {
+    const [row] = await db
+      .select({ id: jobs.id, title: jobs.title, department: jobs.department, assignedTo: jobs.assignedTo })
+      .from(jobs)
+      .where(eq(jobs.id, app.jobId as number));
+    job = row ?? null;
+  } catch {
+    const [row] = await db
+      .select({ id: jobs.id, title: jobs.title, department: jobs.department })
+      .from(jobs)
+      .where(eq(jobs.id, app.jobId as number));
+    job = row ? { ...row, assignedTo: null } : null;
+  }
+
+  let jobStage: { id: number; name: string; color: string; orderIndex: number } | null = null;
+  if (app.jobStageId != null) {
+    try {
+      const [stage] = await db
+        .select({
+          id: jobStages.id,
+          name: jobStages.name,
+          color: jobStages.color,
+          orderIndex: jobStages.orderIndex,
+        })
+        .from(jobStages)
+        .where(eq(jobStages.id, app.jobStageId as number))
+        .limit(1);
+      jobStage = stage ?? null;
+    } catch {
+      const [stage] = await db
+        .select({
+          id: jobStages.id,
+          name: jobStages.name,
+          orderIndex: jobStages.orderIndex,
+        })
+        .from(jobStages)
+        .where(eq(jobStages.id, app.jobStageId as number))
+        .limit(1);
+      jobStage = stage ? { ...stage, color: '#6366f1' } : null;
+    }
+  }
+
+  let assignedToName: string | null = null;
+  if (app.assignedTo != null) {
+    const [assignee] = await db
+      .select({ name: users.name })
+      .from(users)
+      .where(eq(users.id, app.assignedTo as number))
+      .limit(1);
+    assignedToName = assignee?.name ?? null;
+  }
 
   return {
     ...app,
-    candidate:          cand   ?? null,
-    job:                job    ?? null,
+    candidate: cand
+      ? {
+          ...cand,
+          skills: safeJsonParse(cand.skills),
+        }
+      : null,
+    job:                  job    ?? null,
+    jobStage,
+    assignedToName,
     allowedTransitions: TRANSITIONS[app.status as AppStatus] ?? [],
     statusLabel:        STATUS_LABELS[app.status as AppStatus] ?? app.status,
   };
+}
+
+async function getJobIfAccessible(jobId: number, userId: number, orgId: number | null) {
+  const [job] = await selectJobById(jobId);
+  if (!job || !await canAccessJob(job, userId, orgId)) return null;
+  return job;
+}
+
+async function selectApplicationsForJob(jobId: number) {
+  try {
+    return await db
+      .select()
+      .from(applications)
+      .where(eq(applications.jobId, jobId))
+      .orderBy(desc(applications.createdAt));
+  } catch (error) {
+    if (!isSchemaDriftError(error) && !String(error).toLowerCase().includes('failed query')) {
+      // still try legacy shape
+    }
+    const rows = await db
+      .select({
+        id: applications.id,
+        jobId: applications.jobId,
+        candidateId: applications.candidateId,
+        status: applications.status,
+        notes: applications.notes,
+        createdBy: applications.createdBy,
+        createdAt: applications.createdAt,
+        updatedAt: applications.updatedAt,
+      })
+      .from(applications)
+      .where(eq(applications.jobId, jobId))
+      .orderBy(desc(applications.createdAt));
+    return rows.map((row) => ({
+      ...row,
+      assignedTo: null as number | null,
+      jobStageId: null as number | null,
+    }));
+  }
+}
+
+async function getApplicationIfAccessible(
+  applicationId: number,
+  userId: number,
+  orgId: number | null,
+) {
+  let row: Array<typeof applications.$inferSelect | Record<string, unknown>> = [];
+  try {
+    row = await db.select().from(applications).where(eq(applications.id, applicationId)).limit(1);
+  } catch {
+    const legacy = await db
+      .select({
+        id: applications.id,
+        jobId: applications.jobId,
+        candidateId: applications.candidateId,
+        status: applications.status,
+        notes: applications.notes,
+        createdBy: applications.createdBy,
+        createdAt: applications.createdAt,
+        updatedAt: applications.updatedAt,
+      })
+      .from(applications)
+      .where(eq(applications.id, applicationId))
+      .limit(1);
+    row = legacy.map((r) => ({ ...r, assignedTo: null, jobStageId: null }));
+  }
+  if (row.length === 0) return null;
+  const job = await getJobIfAccessible(row[0].jobId as number, userId, orgId);
+  if (!job) return null;
+  return row[0] as typeof applications.$inferSelect;
+}
+
+async function resolveRequiredAssignee(
+  jobId: number,
+  assignedTo?: number | null,
+): Promise<number> {
+  if (assignedTo != null && assignedTo > 0) return assignedTo;
+
+  try {
+    const [job] = await db
+      .select({ assignedTo: jobs.assignedTo })
+      .from(jobs)
+      .where(eq(jobs.id, jobId))
+      .limit(1);
+    if (job?.assignedTo != null && job.assignedTo > 0) return job.assignedTo;
+  } catch {
+    // assigned_to may be missing until ensureProdSchema runs
+  }
+
+  throw new Error('ASSIGNMENT_REQUIRED');
+}
+
+async function createApplicationRecord(params: {
+  jobId: number;
+  candidateId: number;
+  userId: number;
+  notes?: string;
+  assignedTo?: number | null;
+  jobStageId?: number | null;
+}) {
+  const resolvedAssignee = await resolveRequiredAssignee(params.jobId, params.assignedTo);
+  const defaults = await resolveNewApplicationDefaults(params.jobId);
+
+  const created = await db.insert(applications).values({
+    jobId: params.jobId,
+    candidateId: params.candidateId,
+    status: 'applied',
+    notes: params.notes ?? '',
+    assignedTo: resolvedAssignee,
+    jobStageId: params.jobStageId ?? defaults.jobStageId,
+    createdBy: params.userId,
+  }).returning();
+
+  await db.insert(applicationStageHistory).values({
+    applicationId: created[0].id,
+    fromStatus:    null,
+    toStatus:      'applied',
+    note:          'Application created',
+    changedBy:     params.userId,
+  });
+
+  await incrementJobApplicantCount(params.jobId, 1);
+
+  return created[0];
+}
+
+function filterEnrichedApplications(
+  rows: Awaited<ReturnType<typeof enrichApplication>>[],
+  filters: { stageId?: string; email?: string; q?: string },
+) {
+  let result = rows;
+
+  if (filters.stageId) {
+    const sid = parseInt(filters.stageId, 10);
+    if (!isNaN(sid)) {
+      result = result.filter((row) => (row as { jobStageId?: number | null }).jobStageId === sid);
+    }
+  }
+
+  if (filters.email?.trim()) {
+    const needle = filters.email.trim().toLowerCase();
+    result = result.filter((row) => row.candidate?.email?.toLowerCase().includes(needle));
+  }
+
+  if (filters.q?.trim()) {
+    const needle = filters.q.trim().toLowerCase();
+    result = result.filter((row) => {
+      const candidate = row.candidate;
+      const record = row as {
+        id?: number;
+        candidateId?: number;
+      };
+      return (
+        String(record.id).includes(needle)
+        || String(record.candidateId).includes(needle)
+        || candidate?.name?.toLowerCase().includes(needle)
+        || candidate?.email?.toLowerCase().includes(needle)
+      );
+    });
+  }
+
+  return result;
 }
 
 /* ═══════════════════════════════════════════════
@@ -85,38 +334,110 @@ async function enrichApplication(app: Record<string, unknown>) {
 ═══════════════════════════════════════════════ */
 applicationsRouter.get('/', requireAuth, async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const jobId = c.req.query('jobId');
     if (!jobId) return c.json({ error: 'jobId query param is required' }, 400);
     const jid = parseInt(jobId);
     if (isNaN(jid)) return c.json({ error: 'Invalid jobId' }, 400);
 
-    const all = await db
-      .select()
-      .from(applications)
-      .where(eq(applications.jobId, jid))
-      .orderBy(desc(applications.createdAt));
+    const job = await getJobIfAccessible(jid, userId, orgId);
+    if (!job) return c.json({ error: 'Job not found' }, 404);
 
-    const enriched = await Promise.all(all.map(r => enrichApplication(r as Record<string, unknown>)));
-    return c.json(enriched);
+    await backfillNullApplicationStages(jid);
+
+    const all = await selectApplicationsForJob(jid);
+
+    const enriched = await Promise.all(all.map((r) => enrichApplication(r as Record<string, unknown>)));
+    const filtered = filterEnrichedApplications(enriched, {
+      stageId: c.req.query('stageId'),
+      email: c.req.query('email'),
+      q: c.req.query('q'),
+    });
+
+    return c.json(filtered);
   } catch {
     return c.json({ error: 'Failed to fetch applications' }, 500);
   }
 });
 
 /* ═══════════════════════════════════════════════
+   POST /applications/bulk
+═══════════════════════════════════════════════ */
+applicationsRouter.post(
+  '/bulk',
+  requireAuth,
+  requireRole('recruiter_admin', 'recruited_staff'),
+  zValidator('json', bulkCreateSchema),
+  async (c) => {
+    try {
+      const userId = c.get('userId') as number;
+      const orgId = c.get('organizationId') as number | null;
+      const { jobId, candidateIds, notes, assignedTo } = c.req.valid('json');
+
+      const job = await getJobIfAccessible(jobId, userId, orgId);
+      if (!job) return c.json({ error: 'Job not found' }, 404);
+
+      let resolvedAssignee: number;
+      try {
+        resolvedAssignee = await resolveRequiredAssignee(jobId, assignedTo);
+      } catch {
+        return c.json({ error: 'Assign a job owner or staff member before bulk assigning' }, 400);
+      }
+
+      const created: Awaited<ReturnType<typeof enrichApplication>>[] = [];
+      const skipped: { candidateId: number; reason: string }[] = [];
+
+      for (const candidateId of candidateIds) {
+        const dup = await db
+          .select({ id: applications.id })
+          .from(applications)
+          .where(and(eq(applications.jobId, jobId), eq(applications.candidateId, candidateId)))
+          .limit(1);
+
+        if (dup.length > 0) {
+          skipped.push({ candidateId, reason: 'already_assigned' });
+          continue;
+        }
+
+        const row = await createApplicationRecord({
+          jobId,
+          candidateId,
+          userId,
+          notes,
+          assignedTo: resolvedAssignee,
+        });
+        created.push(await enrichApplication(row as Record<string, unknown>));
+      }
+
+      return c.json({
+        created,
+        skipped,
+        createdCount: created.length,
+        skippedCount: skipped.length,
+      }, 201);
+    } catch {
+      return c.json({ error: 'Failed to bulk create applications' }, 500);
+    }
+  },
+);
+
+/* ═══════════════════════════════════════════════
    GET /applications/:id
 ═══════════════════════════════════════════════ */
 applicationsRouter.get('/:id', requireAuth, async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
-    const row = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
-    if (row.length === 0) return c.json({ error: 'Application not found' }, 404);
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
 
-    return c.json(await enrichApplication(row[0] as Record<string, unknown>));
+    return c.json(await enrichApplication(row as Record<string, unknown>));
   } catch {
-    return c.json({ error: 'Failed to fetch application' }, 500);
+    return c.json({ error: 'Failed to fetch application' }, 404);
   }
 });
 
@@ -131,9 +452,13 @@ applicationsRouter.post(
   async (c) => {
     try {
       const userId = c.get('userId') as number;
-      const { jobId, candidateId, notes } = c.req.valid('json');
+      const orgId = c.get('organizationId') as number | null;
+      const body = c.req.valid('json');
+      const { jobId, candidateId, notes, assignedTo, jobStageId } = body;
 
-      // Duplicate guard
+      const job = await getJobIfAccessible(jobId, userId, orgId);
+      if (!job) return c.json({ error: 'Job not found' }, 404);
+
       const dup = await db
         .select({ id: applications.id })
         .from(applications)
@@ -143,28 +468,66 @@ applicationsRouter.post(
         return c.json({ error: 'Candidate is already assigned to this job' }, 409);
       }
 
-      const created = await db.insert(applications).values({
+      const created = await createApplicationRecord({
         jobId,
         candidateId,
-        status: 'applied',
-        notes: notes ?? '',
-        createdBy: userId,
-      }).returning();
-
-      // Seed initial history row
-      await db.insert(applicationStageHistory).values({
-        applicationId: created[0].id,
-        fromStatus:    null,
-        toStatus:      'applied',
-        note:          'Application created',
-        changedBy:     userId,
+        userId,
+        notes,
+        assignedTo,
+        jobStageId,
       });
 
-      return c.json(await enrichApplication(created[0] as Record<string, unknown>), 201);
-    } catch {
+      return c.json(await enrichApplication(created as Record<string, unknown>), 201);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'ASSIGNMENT_REQUIRED') {
+        return c.json({ error: 'Assign a job owner before creating applications' }, 400);
+      }
       return c.json({ error: 'Failed to create application' }, 500);
     }
-  }
+  },
+);
+
+/* ═══════════════════════════════════════════════
+   PATCH /applications/:id/assignment
+═══════════════════════════════════════════════ */
+applicationsRouter.patch(
+  '/:id/assignment',
+  requireAuth,
+  zValidator('json', assignmentSchema),
+  async (c) => {
+    try {
+      const userId = c.get('userId') as number;
+      const orgId = c.get('organizationId') as number | null;
+      const id = parseInt(c.req.param('id'));
+      if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+      const row = await getApplicationIfAccessible(id, userId, orgId);
+      if (!row) return c.json({ error: 'Application not found' }, 404);
+
+      const body = c.req.valid('json');
+      const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+
+      if (body.assignedTo !== undefined) patch.assignedTo = body.assignedTo;
+      if (body.jobStageId !== undefined) {
+        if (body.jobStageId != null) {
+          const [stage] = await db
+            .select({ id: jobStages.id })
+            .from(jobStages)
+            .where(and(eq(jobStages.id, body.jobStageId), eq(jobStages.jobId, row.jobId)))
+            .limit(1);
+          if (!stage) return c.json({ error: 'Stage not found for this job' }, 400);
+        }
+        patch.jobStageId = body.jobStageId;
+      }
+
+      await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
+
+      const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
+      return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
+    } catch {
+      return c.json({ error: 'Failed to update assignment' }, 500);
+    }
+  },
 );
 
 /* ═══════════════════════════════════════════════
@@ -174,15 +537,16 @@ applicationsRouter.post(
 applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSchema), async (c) => {
   try {
     const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id     = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
     const { status: nextStatus, note } = c.req.valid('json');
 
-    const row = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
-    if (row.length === 0) return c.json({ error: 'Application not found' }, 404);
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
 
-    const currentStatus = row[0].status as AppStatus;
+    const currentStatus = row.status as AppStatus;
     const allowed       = TRANSITIONS[currentStatus] ?? [];
 
     if (!allowed.includes(nextStatus)) {
@@ -217,8 +581,14 @@ applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSc
 ═══════════════════════════════════════════════ */
 applicationsRouter.patch('/:id/notes', requireAuth, zValidator('json', notesSchema), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
+
     const { notes } = c.req.valid('json');
     await db.update(applications).set({ notes, updatedAt: new Date().toISOString() }).where(eq(applications.id, id));
     return c.json({ message: 'Notes updated' });
@@ -232,8 +602,13 @@ applicationsRouter.patch('/:id/notes', requireAuth, zValidator('json', notesSche
 ═══════════════════════════════════════════════ */
 applicationsRouter.get('/:id/history', requireAuth, async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
 
     const rows = await db
       .select({
@@ -265,14 +640,17 @@ applicationsRouter.get('/:id/history', requireAuth, async (c) => {
 ═══════════════════════════════════════════════ */
 applicationsRouter.delete('/:id', requireAuth, requireRole('recruiter_admin'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
-    const row = await db.select({ id: applications.id }).from(applications).where(eq(applications.id, id)).limit(1);
-    if (row.length === 0) return c.json({ error: 'Application not found' }, 404);
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
 
     await db.delete(applicationStageHistory).where(eq(applicationStageHistory.applicationId, id));
     await db.delete(applications).where(eq(applications.id, id));
+    await incrementJobApplicantCount(row.jobId, -1);
     return c.json({ message: 'Application deleted' });
   } catch {
     return c.json({ error: 'Failed to delete application' }, 500);

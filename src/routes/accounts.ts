@@ -3,16 +3,19 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { accounts, contacts, users, jobs, accountStageTemplates, JOB_STAGE_TYPES, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
-import { eq, desc, sql, and } from 'drizzle-orm';
+import { eq, desc, sql, and, inArray, type SQL } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext, type UserRole } from '../middleware.js';
-import { belongsToOrganization, orgOrCreatorScope } from '../lib/orgScope.js';
+import { belongsToOrganization, orgOrCreatorScope, getOrgMemberIds } from '../lib/orgScope.js';
 import {
   applyTemplatesToAccountJobsWithoutStages,
   canWriteStageTemplates,
   getAccountIfAccessible,
 } from '../lib/stages.js';
+import { cascadeDeleteAccount, getAccountDeletePreview } from '../lib/accountDelete.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
+import { isSchemaDriftError } from '../lib/schemaDrift.js';
+import { defaultStageColor } from '../lib/stageColors.js';
 
 const accountsRouter = new Hono<AppContext>({ strict: false });
 
@@ -29,89 +32,143 @@ const TYPE_LABELS: Record<AccType, string> = {
 async function enrichAccount(row: typeof accounts.$inferSelect) {
   let ownerName = '';
   if (row.createdBy) {
-    const [u] = await db.select({ name: users.name }).from(users).where(eq(users.id, row.createdBy));
-    ownerName = u?.name ?? '';
+    try {
+      const [u] = await db.select({ name: users.name }).from(users).where(eq(users.id, row.createdBy));
+      ownerName = u?.name ?? '';
+    } catch {
+      ownerName = '';
+    }
   }
-  const [countRow] = await db
-    .select({ count: sql<number>`count(*)` })
-    .from(contacts)
-    .where(eq(contacts.accountId, row.id));
+
+  let contactCount = 0;
+  try {
+    const [countRow] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(contacts)
+      .where(eq(contacts.accountId, row.id));
+    contactCount = Number(countRow?.count ?? 0);
+  } catch {
+    contactCount = 0;
+  }
+
+  let parsedTags: string[] = [];
+  try {
+    const raw = JSON.parse(row.tags ?? '[]');
+    if (Array.isArray(raw)) parsedTags = raw.map((v) => String(v)).filter(Boolean);
+  } catch {}
 
   return {
     ...row,
+    tags: parsedTags,
+    alertsEnabled: Boolean(row.alertsEnabled),
     ownerName,
-    contactCount: Number(countRow?.count ?? 0),
+    contactCount,
     statusLabel: STATUS_LABELS[row.status as AccStatus] ?? row.status,
     typeLabel: TYPE_LABELS[row.type as AccType] ?? row.type,
   };
 }
 
-function isMissingAccountColumnError(error: unknown): boolean {
-  const message = String(error ?? '').toLowerCase();
-  return message.includes('does not exist') && message.includes('accounts');
+const LEGACY_ACCOUNT_SELECT = {
+  id: accounts.id,
+  name: accounts.name,
+  status: accounts.status,
+  type: accounts.type,
+  website: accounts.website,
+  description: accounts.description,
+  phone: accounts.phone,
+  email: accounts.email,
+  address: accounts.address,
+  city: accounts.city,
+  state: accounts.state,
+  country: accounts.country,
+  createdBy: accounts.createdBy,
+  createdAt: accounts.createdAt,
+  updatedAt: accounts.updatedAt,
+} as const;
+
+function withLegacyAccountDefaults<T extends Record<string, unknown>>(row: T) {
+  return {
+    ...row,
+    contractValue: 0,
+    tags: '[]',
+    alertsEnabled: 0,
+    shortLogoUrl: '',
+    longLogoUrl: '',
+    organizationId: null as number | null,
+  };
+}
+
+async function legacyAccountsScope(
+  orgId: number | null,
+  userId: number,
+): Promise<SQL | undefined> {
+  if (orgId != null) {
+    const memberIds = await getOrgMemberIds(orgId, userId);
+    if (memberIds.length === 0) return eq(accounts.createdBy, userId);
+    return inArray(accounts.createdBy, memberIds);
+  }
+  return eq(accounts.createdBy, userId);
+}
+
+async function listAccountsLegacy(orgId: number | null, userId: number) {
+  const scope = await legacyAccountsScope(orgId, userId);
+  const rows = await db
+    .select(LEGACY_ACCOUNT_SELECT)
+    .from(accounts)
+    .where(scope)
+    .orderBy(desc(accounts.updatedAt));
+  return rows.map(withLegacyAccountDefaults);
+}
+
+async function getAccountByIdLegacy(id: number) {
+  const rows = await db
+    .select(LEGACY_ACCOUNT_SELECT)
+    .from(accounts)
+    .where(eq(accounts.id, id))
+    .limit(1);
+  return rows.map(withLegacyAccountDefaults);
 }
 
 async function listAccountsSafe(orgId: number | null, userId: number) {
+  const scope = orgOrCreatorScope(orgId, userId, accounts, accounts);
   try {
     return await db
-      .select()
-      .from(accounts)
-      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
-      .orderBy(desc(accounts.updatedAt));
-  } catch (error) {
-    if (!isMissingAccountColumnError(error)) throw error;
-    return db
       .select({
-        id: accounts.id,
-        name: accounts.name,
-        status: accounts.status,
-        type: accounts.type,
-        website: accounts.website,
-        description: accounts.description,
-        phone: accounts.phone,
-        email: accounts.email,
-        address: accounts.address,
-        city: accounts.city,
-        state: accounts.state,
-        country: accounts.country,
+        ...LEGACY_ACCOUNT_SELECT,
+        contractValue: accounts.contractValue,
+        tags: accounts.tags,
+        alertsEnabled: accounts.alertsEnabled,
+        shortLogoUrl: accounts.shortLogoUrl,
+        longLogoUrl: accounts.longLogoUrl,
         organizationId: accounts.organizationId,
-        createdBy: accounts.createdBy,
-        createdAt: accounts.createdAt,
-        updatedAt: accounts.updatedAt,
       })
       .from(accounts)
-      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
+      .where(scope)
       .orderBy(desc(accounts.updatedAt));
+  } catch {
+    return listAccountsLegacy(orgId, userId);
   }
 }
 
 async function getAccountByIdSafe(id: number) {
   try {
-    return db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
-  } catch (error) {
-    if (!isMissingAccountColumnError(error)) throw error;
-    return db
+    const rows = await db
       .select({
-        id: accounts.id,
-        name: accounts.name,
-        status: accounts.status,
-        type: accounts.type,
-        website: accounts.website,
-        description: accounts.description,
-        phone: accounts.phone,
-        email: accounts.email,
-        address: accounts.address,
-        city: accounts.city,
-        state: accounts.state,
-        country: accounts.country,
+        ...LEGACY_ACCOUNT_SELECT,
+        contractValue: accounts.contractValue,
+        tags: accounts.tags,
+        alertsEnabled: accounts.alertsEnabled,
+        shortLogoUrl: accounts.shortLogoUrl,
+        longLogoUrl: accounts.longLogoUrl,
         organizationId: accounts.organizationId,
-        createdBy: accounts.createdBy,
-        createdAt: accounts.createdAt,
-        updatedAt: accounts.updatedAt,
       })
       .from(accounts)
       .where(eq(accounts.id, id))
       .limit(1);
+    return rows;
+  } catch (error) {
+    if (!isSchemaDriftError(error)) throw error;
+    return getAccountByIdLegacy(id);
   }
 }
 
@@ -119,6 +176,9 @@ const accountBody = z.object({
   name: z.string().min(1, 'Account name is required'),
   status: z.enum(ACCOUNT_STATUSES).optional(),
   type: z.enum(ACCOUNT_TYPES).optional(),
+  contractValue: z.number().int().nonnegative().optional(),
+  tags: z.array(z.string()).optional(),
+  alertsEnabled: z.boolean().optional(),
   website: z.string().optional(),
   description: z.string().optional(),
   phone: z.string().optional(),
@@ -127,6 +187,8 @@ const accountBody = z.object({
   city: z.string().optional(),
   state: z.string().optional(),
   country: z.string().optional(),
+  shortLogoUrl: z.string().optional(),
+  longLogoUrl: z.string().optional(),
 });
 
 const mergeSchema = z.object({
@@ -138,6 +200,11 @@ const stageTemplateSchema = z.object({
   name: z.string().min(1),
   orderIndex: z.number().int().nonnegative().optional(),
   stageType: z.enum(JOB_STAGE_TYPES).optional(),
+  color: z.string().min(4).max(32).optional(),
+});
+
+const reorderStageTemplatesSchema = z.object({
+  stageIds: z.array(z.number().int().positive()).min(1),
 });
 
 function stageWriteForbidden(c: { json: (body: unknown, status?: number) => Response }) {
@@ -199,11 +266,13 @@ accountsRouter.post('/:id/stage-templates', requireAuth, zValidator('json', stag
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
     const body = c.req.valid('json');
+    const orderIndex = body.orderIndex ?? 0;
     const [created] = await db.insert(accountStageTemplates).values({
       accountId,
       name: body.name,
-      orderIndex: body.orderIndex ?? 0,
+      orderIndex,
       stageType: body.stageType ?? 'application',
+      color: body.color ?? defaultStageColor(orderIndex),
     }).returning();
 
     return c.json(created, 201);
@@ -231,6 +300,7 @@ accountsRouter.put('/:id/stage-templates/:stageId', requireAuth, zValidator('jso
     if (body.name !== undefined) patch.name = body.name;
     if (body.orderIndex !== undefined) patch.orderIndex = body.orderIndex;
     if (body.stageType !== undefined) patch.stageType = body.stageType;
+    if (body.color !== undefined) patch.color = body.color;
 
     const [updated] = await db
       .update(accountStageTemplates)
@@ -271,6 +341,58 @@ accountsRouter.delete('/:id/stage-templates/:stageId', requireAuth, async (c) =>
   }
 });
 
+/* PUT /accounts/:id/stage-templates/reorder — batch reorder after drag-and-drop */
+accountsRouter.put('/:id/stage-templates/reorder', requireAuth, zValidator('json', reorderStageTemplatesSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const accountId = parseInt(c.req.param('id'));
+    if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
+    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
+
+    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
+
+    const { stageIds } = c.req.valid('json');
+    const existing = await db
+      .select({ id: accountStageTemplates.id })
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId));
+
+    if (existing.length === 0) {
+      return c.json({ error: 'No stage templates to reorder' }, 400);
+    }
+
+    if (stageIds.length !== existing.length) {
+      return c.json({ error: 'stageIds must include every template for this account' }, 400);
+    }
+
+    const existingIdSet = new Set(existing.map((row) => row.id));
+    if (!stageIds.every((id) => existingIdSet.has(id))) {
+      return c.json({ error: 'Invalid stageIds for this account' }, 400);
+    }
+
+    await Promise.all(
+      stageIds.map((stageId, orderIndex) =>
+        db.update(accountStageTemplates)
+          .set({ orderIndex })
+          .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId))),
+      ),
+    );
+
+    const templates = await db
+      .select()
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId))
+      .orderBy(accountStageTemplates.orderIndex);
+
+    return c.json({ data: templates });
+  } catch {
+    return c.json({ error: 'Failed to reorder stage templates' }, 500);
+  }
+});
+
 /* POST /accounts/:id/stage-templates/apply-to-jobs */
 accountsRouter.post('/:id/stage-templates/apply-to-jobs', requireAuth, async (c) => {
   try {
@@ -301,6 +423,7 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     const orgId = c.get('organizationId') as number | null;
     const view = c.req.query('view') ?? 'all';
     const typeFilter = c.req.query('type');
+    const statusFilter = c.req.query('status');
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
     const { page, pageSize } = parsePagination(c.req.query());
 
@@ -312,6 +435,7 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
       rows = rows.filter((r) => r.createdAt >= cutoff);
     }
     if (typeFilter && typeFilter !== 'all') rows = rows.filter((r) => r.type === typeFilter);
+    if (statusFilter && statusFilter !== 'all') rows = rows.filter((r) => r.status === statusFilter);
 
     const enriched = await Promise.all(rows.map(enrichAccount));
 
@@ -345,6 +469,26 @@ accountsRouter.post('/merge', requireAuth, requireRole('recruiter_admin'), zVali
     return c.json(await enrichAccount(target));
   } catch {
     return c.json({ error: 'Failed to merge accounts' }, 500);
+  }
+});
+
+/* GET /accounts/:id/delete-preview — must be before /:id */
+accountsRouter.get('/:id/delete-preview', requireAuth, requireRole('recruiter_admin'), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const [account] = await getAccountByIdSafe(id);
+    if (!account) return c.json({ error: 'Account not found' }, 404);
+    if (!belongsToOrganization(account.organizationId, orgId, account.createdBy, userId)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
+
+    return c.json(await getAccountDeletePreview(id));
+  } catch {
+    return c.json({ error: 'Failed to fetch delete preview' }, 500);
   }
 });
 
@@ -419,22 +563,48 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
     const b = c.req.valid('json');
     const now = new Date().toISOString();
 
-    const [created] = await db.insert(accounts).values({
-      name: b.name,
-      status: b.status ?? 'active',
-      type: b.type ?? 'client',
-      website: b.website ?? '',
-      description: b.description ?? '',
-      phone: b.phone ?? '',
-      email: b.email ?? '',
-      address: b.address ?? '',
-      city: b.city ?? '',
-      state: b.state ?? '',
-      country: b.country ?? '',
-      organizationId: orgId,
-      createdBy: userId,
-      updatedAt: now,
-    }).returning();
+    let created: typeof accounts.$inferSelect | undefined;
+    try {
+      const [row] = await db.insert(accounts).values({
+        name: b.name,
+        status: b.status ?? 'active',
+        type: b.type ?? 'client',
+        contractValue: b.contractValue ?? 0,
+        tags: JSON.stringify(b.tags ?? []),
+        alertsEnabled: b.alertsEnabled ? 1 : 0,
+        website: b.website ?? '',
+        description: b.description ?? '',
+        phone: b.phone ?? '',
+        email: b.email ?? '',
+        address: b.address ?? '',
+        city: b.city ?? '',
+        state: b.state ?? '',
+        country: b.country ?? '',
+        organizationId: orgId,
+        createdBy: userId,
+        updatedAt: now,
+      }).returning();
+      created = row;
+    } catch (error) {
+      if (!isSchemaDriftError(error)) throw error;
+      const [row] = await db.insert(accounts).values({
+        name: b.name,
+        status: b.status ?? 'active',
+        type: b.type ?? 'client',
+        website: b.website ?? '',
+        description: b.description ?? '',
+        phone: b.phone ?? '',
+        email: b.email ?? '',
+        address: b.address ?? '',
+        city: b.city ?? '',
+        state: b.state ?? '',
+        country: b.country ?? '',
+        organizationId: orgId,
+        createdBy: userId,
+        updatedAt: now,
+      }).returning();
+      created = { ...row, contractValue: 0, tags: '[]', alertsEnabled: 0 } as typeof accounts.$inferSelect;
+    }
 
     return c.json(await enrichAccount(created), 201);
   } catch {
@@ -445,15 +615,37 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
 /* PUT /accounts/:id */
 accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', accountBody.partial()), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
-    const b = c.req.valid('json');
-    const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
-    for (const k of ['name','status','type','website','description','phone','email','address','city','state','country'] as const) {
-      if (b[k] !== undefined) patch[k] = b[k];
+
+    const [existing] = await getAccountByIdSafe(id);
+    if (!existing) return c.json({ error: 'Account not found' }, 404);
+    if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
+      return c.json({ error: 'Account not found' }, 404);
     }
 
-    const [updated] = await db.update(accounts).set(patch as any).where(eq(accounts.id, id)).returning();
+    const b = c.req.valid('json');
+    const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+    for (const k of ['name','status','type','contractValue','website','description','phone','email','address','city','state','country','shortLogoUrl','longLogoUrl'] as const) {
+      if (b[k] !== undefined) patch[k] = b[k];
+    }
+    if (b.tags !== undefined) patch.tags = JSON.stringify(b.tags);
+    if (b.alertsEnabled !== undefined) patch.alertsEnabled = b.alertsEnabled ? 1 : 0;
+
+    let updated: typeof accounts.$inferSelect | undefined;
+    try {
+      const [row] = await db.update(accounts).set(patch as any).where(eq(accounts.id, id)).returning();
+      updated = row;
+    } catch (error) {
+      if (!isSchemaDriftError(error)) throw error;
+      delete patch.contractValue;
+      delete patch.tags;
+      delete patch.alertsEnabled;
+      const [row] = await db.update(accounts).set(patch as any).where(eq(accounts.id, id)).returning();
+      updated = { ...row, contractValue: 0, tags: '[]', alertsEnabled: 0 } as typeof accounts.$inferSelect;
+    }
     if (!updated) return c.json({ error: 'Account not found' }, 404);
     return c.json(await enrichAccount(updated));
   } catch {
@@ -464,13 +656,18 @@ accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
 /* DELETE /accounts/:id */
 accountsRouter.delete('/:id', requireAuth, requireRole('recruiter_admin'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
-    const linked = await db.select({ id: contacts.id }).from(contacts).where(eq(contacts.accountId, id)).limit(1);
-    if (linked.length) return c.json({ error: 'Cannot delete account with linked contacts' }, 409);
+    const [existing] = await getAccountByIdSafe(id);
+    if (!existing) return c.json({ error: 'Account not found' }, 404);
+    if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
 
-    await db.delete(accounts).where(eq(accounts.id, id));
+    await cascadeDeleteAccount(id);
     return c.json({ ok: true });
   } catch {
     return c.json({ error: 'Failed to delete account' }, 500);

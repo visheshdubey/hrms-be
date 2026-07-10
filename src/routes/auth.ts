@@ -6,10 +6,29 @@ import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { organizations, users } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
-import { sendVerificationEmail, sendInviteEmail, sendPasswordResetEmail } from '../utils/email.js';
+import { sendVerificationEmail, sendInviteEmail, sendPasswordResetEmail, sendPasswordOtpEmail } from '../utils/email.js';
+import {
+  queueInviteEmail,
+  queuePasswordOtpEmail,
+  queuePasswordResetEmail,
+  queueVerificationEmail,
+} from '../queue/email-service.js';
+
+async function dispatchEmail(
+  queueFn: () => Promise<{ queued: boolean; inline?: boolean }>,
+  fallbackFn: () => Promise<boolean>,
+): Promise<boolean> {
+  try {
+    const result = await queueFn();
+    return result.queued || result.inline === true;
+  } catch (error) {
+    console.error('[auth/email] queue failed, using inline fallback:', error);
+    return fallbackFn();
+  }
+}
+import { JWT_SECRET } from '../config.js';
 
 const auth = new Hono({ strict: false });
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
 
 type UserRole = 'recruiter_admin' | 'recruited_staff' | 'org_admin' | 'org_staff';
 type PortalType = 'org' | 'recruiter';
@@ -115,7 +134,10 @@ auth.post('/forgot-password', zValidator('json', forgotPasswordSchema), async (c
 
     if (user.length > 0 && user[0].isVerified === 1 && user[0].password) {
       const resetToken = jwt.sign({ email, type: 'reset' }, JWT_SECRET, { expiresIn: '1h' });
-      await sendPasswordResetEmail(email, resetToken).catch((err) => {
+      await dispatchEmail(
+        () => queuePasswordResetEmail(email, resetToken),
+        () => sendPasswordResetEmail(email, resetToken),
+      ).catch((err) => {
         console.error('[forgot-password] email delivery failed (non-fatal):', err);
       });
     }
@@ -259,7 +281,10 @@ auth.post('/register', zValidator('json', registerSchema), async (c) => {
     }).returning(userProfileFields);
 
     const verifyToken = jwt.sign({ email: newUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
-    const emailSent = await sendVerificationEmail(email, verifyToken);
+    const emailSent = await dispatchEmail(
+      () => queueVerificationEmail(email, verifyToken),
+      () => sendVerificationEmail(email, verifyToken),
+    );
 
     return c.json({
       message: 'User registered successfully. Please verify your email.',
@@ -312,7 +337,10 @@ auth.post('/invite', zValidator('json', inviteSchema), async (c) => {
     }).returning(userProfileFields);
 
     const verifyToken = jwt.sign({ email: newUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
-    const emailSent = await sendInviteEmail(email, inviterUser.name, verifyToken);
+    const emailSent = await dispatchEmail(
+      () => queueInviteEmail(email, inviterUser.name, verifyToken),
+      () => sendInviteEmail(email, inviterUser.name, verifyToken),
+    );
 
     return c.json({
       message: 'Invitation sent successfully. They will receive an email shortly.',
@@ -383,11 +411,21 @@ auth.post('/login', zValidator('json', loginSchema), async (c) => {
         role: user[0].role,
         portalType: user[0].portalType,
         organizationId: user[0].organizationId,
+        avatar: user[0].avatar ?? null,
+        country: user[0].country ?? null,
+        timezone: user[0].timezone ?? null,
+        bio: user[0].bio ?? null,
+        isActive: user[0].isActive,
       },
       token,
     }, 200);
   } catch (error) {
-    return c.json({ error: 'Internal Server Error' }, 500);
+    console.error('[POST /login] Error:', error);
+    const message =
+      error instanceof Error && /connect|ECONNREFUSED|timeout/i.test(error.message)
+        ? 'Database unavailable. Start Postgres: cd hrms-be && npm run db:up && npm run db:seed:users'
+        : 'Internal Server Error';
+    return c.json({ error: message }, 500);
   }
 });
 
@@ -604,7 +642,10 @@ auth.post('/resend-invite/:id', async (c) => {
     }
 
     const verifyToken = jwt.sign({ email: targetUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
-    await sendInviteEmail(targetUser[0].email, me[0].name, verifyToken);
+    await dispatchEmail(
+      () => queueInviteEmail(targetUser[0].email, me[0].name, verifyToken),
+      () => sendInviteEmail(targetUser[0].email, me[0].name, verifyToken),
+    );
 
     return c.json({ message: 'Invitation resent successfully' });
   } catch {
@@ -628,11 +669,12 @@ auth.post('/send-password-otp', async (c) => {
 
     await db.update(users).set({ passwordOtp: otp, passwordOtpExpiry: expiry }).where(eq(users.id, decoded.id));
 
-    // Send email via existing util or standard email
-    // For now we'll simulate sending OTP email using sendPasswordResetEmail modified or just a simple log
-    // Ideally we'd have a sendOtpEmail function, but since we don't, we'll try to use existing utils.
-    // Wait, let's just log it if we don't have sendOtpEmail, but since Nodemailer is configured in utils/email.ts, let's assume we can.
-    console.log(`[OTP] Generated OTP for ${me[0].email}: ${otp}`);
+    await dispatchEmail(
+      () => queuePasswordOtpEmail(me[0].email, otp),
+      () => sendPasswordOtpEmail(me[0].email, otp),
+    ).catch((err) => {
+      console.error('[send-password-otp] email delivery failed (non-fatal):', err);
+    });
 
     return c.json({ message: 'OTP sent to your email address' });
   } catch {
