@@ -1,6 +1,7 @@
 import { db } from '../db/index.js';
 import { accounts, users } from '../db/schema.js';
 import { eq, and, or, isNull, type SQL } from 'drizzle-orm';
+import { isSchemaDriftError } from './schemaDrift.js';
 
 export async function getOrgMemberIds(
   orgId: number | null,
@@ -74,6 +75,29 @@ export async function canAccessByCreator(
   return createdBy === userId;
 }
 
+async function getAccountAccessRow(accountId: number) {
+  try {
+    const [account] = await db
+      .select({
+        organizationId: accounts.organizationId,
+        createdBy: accounts.createdBy,
+      })
+      .from(accounts)
+      .where(eq(accounts.id, accountId))
+      .limit(1);
+    return account ?? null;
+  } catch (error) {
+    if (!isSchemaDriftError(error)) throw error;
+    const [account] = await db
+      .select({ createdBy: accounts.createdBy })
+      .from(accounts)
+      .where(eq(accounts.id, accountId))
+      .limit(1);
+    if (!account) return null;
+    return { organizationId: null as number | null, createdBy: account.createdBy };
+  }
+}
+
 /** Whether the caller may access a job via its linked account or creator. */
 export async function canAccessJob(
   job: { accountId: number | null; createdBy: number | null },
@@ -81,11 +105,7 @@ export async function canAccessJob(
   orgId: number | null,
 ): Promise<boolean> {
   if (job.accountId != null) {
-    const [account] = await db
-      .select()
-      .from(accounts)
-      .where(eq(accounts.id, job.accountId))
-      .limit(1);
+    const account = await getAccountAccessRow(job.accountId);
     if (!account) return false;
     return belongsToOrganization(account.organizationId, orgId, account.createdBy, userId);
   }

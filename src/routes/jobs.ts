@@ -2,14 +2,79 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { eq, desc, inArray, and, or, isNull } from 'drizzle-orm';
+import { eq, desc, inArray, and, or, isNull, type SQL } from 'drizzle-orm';
 import { requireAuth, type AppContext, type UserRole } from '../middleware.js';
 import { jobs, jobStages, JOB_STAGE_TYPES, accounts, applications, users } from '../db/schema.js';
 import { copyAccountStageTemplatesToJob, canWriteStageTemplates } from '../lib/stages.js';
 import { canAccessJob, getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
 import { defaultStageColor } from '../lib/stageColors.js';
+import { isSchemaDriftError } from '../lib/schemaDrift.js';
 
 const jobsRouter = new Hono<AppContext>({ strict: false });
+
+/** Core job columns present on older production DBs (excludes assigned_to). */
+const LEGACY_JOB_SELECT = {
+  id: jobs.id,
+  title: jobs.title,
+  department: jobs.department,
+  status: jobs.status,
+  type: jobs.type,
+  location: jobs.location,
+  applicants: jobs.applicants,
+  description: jobs.description,
+  postedDate: jobs.postedDate,
+  accountId: jobs.accountId,
+  payPackageMin: jobs.payPackageMin,
+  payPackageMax: jobs.payPackageMax,
+  payCurrency: jobs.payCurrency,
+  createdBy: jobs.createdBy,
+} as const;
+
+function withJobDefaults<T extends Record<string, unknown>>(row: T) {
+  return { ...row, assignedTo: null as number | null };
+}
+
+async function selectJobs(where?: SQL) {
+  try {
+    const query = db.select().from(jobs);
+    return where ? await query.where(where).orderBy(desc(jobs.id)) : await query.orderBy(desc(jobs.id));
+  } catch (error) {
+    if (!isSchemaDriftError(error)) throw error;
+    const query = db.select(LEGACY_JOB_SELECT).from(jobs);
+    const rows = where
+      ? await query.where(where).orderBy(desc(jobs.id))
+      : await query.orderBy(desc(jobs.id));
+    return rows.map(withJobDefaults);
+  }
+}
+
+async function selectJobById(id: number) {
+  try {
+    return await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+  } catch (error) {
+    if (!isSchemaDriftError(error)) throw error;
+    const rows = await db.select(LEGACY_JOB_SELECT).from(jobs).where(eq(jobs.id, id)).limit(1);
+    return rows.map(withJobDefaults);
+  }
+}
+
+async function selectAccountIdsSafe(orgId: number | null, userId: number): Promise<number[]> {
+  try {
+    const orgAccounts = await db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(orgOrCreatorScope(orgId, userId, accounts, accounts));
+    return orgAccounts.map((account) => account.id);
+  } catch (error) {
+    if (!isSchemaDriftError(error)) throw error;
+    const memberIds = await getOrgMemberIds(orgId, userId);
+    const orgAccounts = await db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(inArray(accounts.createdBy, memberIds));
+    return orgAccounts.map((account) => account.id);
+  }
+}
 
 type JobStatus = 'new' | 'draft' | 'ready' | 'submission_in_progress' | 'closed';
 
@@ -53,7 +118,7 @@ const statusSchema = z.object({
 
 async function canAccessJobForStages(params: { jobId: number; userId: number; orgId: number | null }) {
   const { jobId, userId, orgId } = params;
-  const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+  const [job] = await selectJobById(jobId);
   if (!job) return null;
   if (!await canAccessJob(job, userId, orgId)) return null;
   return job;
@@ -68,37 +133,21 @@ jobsRouter.get('/', requireAuth, async (c) => {
 
     let all;
     if (orgId != null) {
-      const orgAccounts = await db
-        .select({ id: accounts.id })
-        .from(accounts)
-        .where(orgOrCreatorScope(orgId, userId, accounts, accounts));
-      const accountIds = orgAccounts.map((account) => account.id);
+      const accountIds = await selectAccountIdsSafe(orgId, userId);
       const memberIds = await getOrgMemberIds(orgId, userId);
 
       if (accountIds.length === 0) {
-        all = await db
-          .select()
-          .from(jobs)
-          .where(and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)))
-          .orderBy(desc(jobs.id));
+        all = await selectJobs(and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)));
       } else {
-        all = await db
-          .select()
-          .from(jobs)
-          .where(
-            or(
-              inArray(jobs.accountId, accountIds),
-              and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)),
-            ),
-          )
-          .orderBy(desc(jobs.id));
+        all = await selectJobs(
+          or(
+            inArray(jobs.accountId, accountIds),
+            and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)),
+          ),
+        );
       }
     } else {
-      all = await db
-        .select()
-        .from(jobs)
-        .where(eq(jobs.createdBy, userId))
-        .orderBy(desc(jobs.id));
+      all = await selectJobs(eq(jobs.createdBy, userId));
     }
 
     if (accountIdParam) {
@@ -128,7 +177,7 @@ jobsRouter.get('/:id', requireAuth, async (c) => {
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
-    const row = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+    const row = await selectJobById(id);
     if (row.length === 0) return c.json({ error: 'Job not found' }, 404);
 
     if (!await canAccessJob(row[0], userId, orgId)) {
@@ -201,7 +250,7 @@ jobsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSchema), a
 
     const { status: nextStatus } = c.req.valid('json');
 
-    const row = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+    const row = await selectJobById(id);
     if (row.length === 0) return c.json({ error: 'Job not found' }, 404);
 
     if (!await canAccessJob(row[0], userId, orgId)) {
@@ -240,7 +289,7 @@ jobsRouter.put('/:id', requireAuth, zValidator('json', jobSchema), async (c) => 
     const id = parseInt(c.req.param('id'));
     const body = c.req.valid('json');
 
-    const existing = await db.select().from(jobs).where(eq(jobs.id, id));
+    const existing = await selectJobById(id);
     if (existing.length === 0) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
     }
@@ -272,7 +321,7 @@ jobsRouter.delete('/:id', requireAuth, async (c) => {
     const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
 
-    const existing = await db.select().from(jobs).where(eq(jobs.id, id));
+    const existing = await selectJobById(id);
     if (existing.length === 0) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
     }

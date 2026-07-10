@@ -14,6 +14,7 @@ import {
 import { cascadeDeleteAccount, getAccountDeletePreview } from '../lib/accountDelete.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
+import { isSchemaDriftError } from '../lib/schemaDrift.js';
 import { defaultStageColor } from '../lib/stageColors.js';
 
 const accountsRouter = new Hono<AppContext>({ strict: false });
@@ -65,11 +66,6 @@ async function enrichAccount(row: typeof accounts.$inferSelect) {
     statusLabel: STATUS_LABELS[row.status as AccStatus] ?? row.status,
     typeLabel: TYPE_LABELS[row.type as AccType] ?? row.type,
   };
-}
-
-function isAccountsSchemaDriftError(error: unknown): boolean {
-  const message = String(error ?? '').toLowerCase();
-  return message.includes('does not exist');
 }
 
 const LEGACY_ACCOUNT_SELECT = {
@@ -149,8 +145,7 @@ async function listAccountsSafe(orgId: number | null, userId: number) {
       .from(accounts)
       .where(scope)
       .orderBy(desc(accounts.updatedAt));
-  } catch (error) {
-    if (!isAccountsSchemaDriftError(error)) throw error;
+  } catch {
     return listAccountsLegacy(orgId, userId);
   }
 }
@@ -172,7 +167,7 @@ async function getAccountByIdSafe(id: number) {
       .limit(1);
     return rows;
   } catch (error) {
-    if (!isAccountsSchemaDriftError(error)) throw error;
+    if (!isSchemaDriftError(error)) throw error;
     return getAccountByIdLegacy(id);
   }
 }
@@ -591,7 +586,7 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
       }).returning();
       created = row;
     } catch (error) {
-      if (!isAccountsSchemaDriftError(error)) throw error;
+      if (!isSchemaDriftError(error)) throw error;
       const [row] = await db.insert(accounts).values({
         name: b.name,
         status: b.status ?? 'active',
@@ -644,7 +639,7 @@ accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
       const [row] = await db.update(accounts).set(patch as any).where(eq(accounts.id, id)).returning();
       updated = row;
     } catch (error) {
-      if (!isAccountsSchemaDriftError(error)) throw error;
+      if (!isSchemaDriftError(error)) throw error;
       delete patch.contractValue;
       delete patch.tags;
       delete patch.alertsEnabled;
