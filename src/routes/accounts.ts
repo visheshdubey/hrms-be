@@ -156,7 +156,20 @@ async function listAccountsSafe(orgId: number | null, userId: number) {
 
 async function getAccountByIdSafe(id: number) {
   try {
-    return await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+    const rows = await db
+      .select({
+        ...LEGACY_ACCOUNT_SELECT,
+        contractValue: accounts.contractValue,
+        tags: accounts.tags,
+        alertsEnabled: accounts.alertsEnabled,
+        shortLogoUrl: accounts.shortLogoUrl,
+        longLogoUrl: accounts.longLogoUrl,
+        organizationId: accounts.organizationId,
+      })
+      .from(accounts)
+      .where(eq(accounts.id, id))
+      .limit(1);
+    return rows;
   } catch (error) {
     if (!isAccountsSchemaDriftError(error)) throw error;
     return getAccountByIdLegacy(id);
