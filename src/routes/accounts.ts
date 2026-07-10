@@ -46,6 +46,75 @@ async function enrichAccount(row: typeof accounts.$inferSelect) {
   };
 }
 
+function isMissingAccountColumnError(error: unknown): boolean {
+  const message = String(error ?? '').toLowerCase();
+  return message.includes('does not exist') && message.includes('accounts');
+}
+
+async function listAccountsSafe(orgId: number | null, userId: number) {
+  try {
+    return await db
+      .select()
+      .from(accounts)
+      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
+      .orderBy(desc(accounts.updatedAt));
+  } catch (error) {
+    if (!isMissingAccountColumnError(error)) throw error;
+    return db
+      .select({
+        id: accounts.id,
+        name: accounts.name,
+        status: accounts.status,
+        type: accounts.type,
+        website: accounts.website,
+        description: accounts.description,
+        phone: accounts.phone,
+        email: accounts.email,
+        address: accounts.address,
+        city: accounts.city,
+        state: accounts.state,
+        country: accounts.country,
+        organizationId: accounts.organizationId,
+        createdBy: accounts.createdBy,
+        createdAt: accounts.createdAt,
+        updatedAt: accounts.updatedAt,
+      })
+      .from(accounts)
+      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
+      .orderBy(desc(accounts.updatedAt));
+  }
+}
+
+async function getAccountByIdSafe(id: number) {
+  try {
+    return db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+  } catch (error) {
+    if (!isMissingAccountColumnError(error)) throw error;
+    return db
+      .select({
+        id: accounts.id,
+        name: accounts.name,
+        status: accounts.status,
+        type: accounts.type,
+        website: accounts.website,
+        description: accounts.description,
+        phone: accounts.phone,
+        email: accounts.email,
+        address: accounts.address,
+        city: accounts.city,
+        state: accounts.state,
+        country: accounts.country,
+        organizationId: accounts.organizationId,
+        createdBy: accounts.createdBy,
+        createdAt: accounts.createdAt,
+        updatedAt: accounts.updatedAt,
+      })
+      .from(accounts)
+      .where(eq(accounts.id, id))
+      .limit(1);
+  }
+}
+
 const accountBody = z.object({
   name: z.string().min(1, 'Account name is required'),
   status: z.enum(ACCOUNT_STATUSES).optional(),
@@ -235,9 +304,7 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
     const { page, pageSize } = parsePagination(c.req.query());
 
-    let rows = await db.select().from(accounts)
-      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
-      .orderBy(desc(accounts.updatedAt));
+    let rows = await listAccountsSafe(orgId, userId);
 
     if (view === 'mine') rows = rows.filter((r) => r.createdBy === userId);
     if (view === 'recent') {
@@ -273,7 +340,7 @@ accountsRouter.post('/merge', requireAuth, requireRole('recruiter_admin'), zVali
       await db.delete(accounts).where(eq(accounts.id, sid));
     }
 
-    const [target] = await db.select().from(accounts).where(eq(accounts.id, targetId)).limit(1);
+    const [target] = await getAccountByIdSafe(targetId);
     if (!target) return c.json({ error: 'Target account not found' }, 404);
     return c.json(await enrichAccount(target));
   } catch {
@@ -289,7 +356,7 @@ accountsRouter.get('/:id/stats', requireAuth, requireRole('recruiter_admin', 're
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
-    const [account] = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+    const [account] = await getAccountByIdSafe(id);
     if (!account) return c.json({ error: 'Account not found' }, 404);
 
     if (!belongsToOrganization(account.organizationId, orgId, account.createdBy, userId)) {
@@ -331,7 +398,7 @@ accountsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
     const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
-    const row = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
+    const row = await getAccountByIdSafe(id);
     if (!row.length) return c.json({ error: 'Account not found' }, 404);
 
     if (!belongsToOrganization(row[0].organizationId, orgId, row[0].createdBy, userId)) {
