@@ -56,6 +56,7 @@ export const jobs = pgTable("jobs", {
   payPackageMax: real("pay_package_max"),
   payCurrency: text("pay_currency").default("INR"),
   createdBy: integer("created_by").references(() => users.id),
+  assignedTo: integer("assigned_to").references(() => users.id),
 });
 
 export const APP_STATUSES = [
@@ -77,6 +78,7 @@ export const applications = pgTable(
     candidateId: integer("candidate_id").notNull().references(() => candidates.id),
     status: text("status", { enum: APP_STATUSES }).notNull().default("applied"),
     notes: text("notes").default(""),
+    jobStageId: integer("job_stage_id").references(() => jobStages.id, { onDelete: "set null" }),
     assignedTo: integer("assigned_to").references(() => users.id),
     createdBy: integer("created_by").references(() => users.id),
     createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
@@ -491,6 +493,7 @@ export const accountStageTemplates = pgTable("account_stage_templates", {
   name: text("name").notNull(),
   orderIndex: integer("order_index").notNull().default(0),
   stageType: text("stage_type", { enum: JOB_STAGE_TYPES }).notNull().default("application"),
+  color: text("color").notNull().default("#6366f1"),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
@@ -500,6 +503,7 @@ export const jobStages = pgTable("job_stages", {
   name: text("name").notNull(),
   orderIndex: integer("order_index").notNull().default(0),
   stageType: text("stage_type", { enum: JOB_STAGE_TYPES }).notNull().default("application"),
+  color: text("color").notNull().default("#6366f1"),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 

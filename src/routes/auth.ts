@@ -7,6 +7,25 @@ import { db } from '../db/index.js';
 import { organizations, users } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
 import { sendVerificationEmail, sendInviteEmail, sendPasswordResetEmail, sendPasswordOtpEmail } from '../utils/email.js';
+import {
+  queueInviteEmail,
+  queuePasswordOtpEmail,
+  queuePasswordResetEmail,
+  queueVerificationEmail,
+} from '../queue/email-service.js';
+
+async function dispatchEmail(
+  queueFn: () => Promise<{ queued: boolean; inline?: boolean }>,
+  fallbackFn: () => Promise<boolean>,
+): Promise<boolean> {
+  try {
+    const result = await queueFn();
+    return result.queued || result.inline === true;
+  } catch (error) {
+    console.error('[auth/email] queue failed, using inline fallback:', error);
+    return fallbackFn();
+  }
+}
 import { JWT_SECRET } from '../config.js';
 
 const auth = new Hono({ strict: false });
@@ -115,7 +134,10 @@ auth.post('/forgot-password', zValidator('json', forgotPasswordSchema), async (c
 
     if (user.length > 0 && user[0].isVerified === 1 && user[0].password) {
       const resetToken = jwt.sign({ email, type: 'reset' }, JWT_SECRET, { expiresIn: '1h' });
-      await sendPasswordResetEmail(email, resetToken).catch((err) => {
+      await dispatchEmail(
+        () => queuePasswordResetEmail(email, resetToken),
+        () => sendPasswordResetEmail(email, resetToken),
+      ).catch((err) => {
         console.error('[forgot-password] email delivery failed (non-fatal):', err);
       });
     }
@@ -259,7 +281,10 @@ auth.post('/register', zValidator('json', registerSchema), async (c) => {
     }).returning(userProfileFields);
 
     const verifyToken = jwt.sign({ email: newUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
-    const emailSent = await sendVerificationEmail(email, verifyToken);
+    const emailSent = await dispatchEmail(
+      () => queueVerificationEmail(email, verifyToken),
+      () => sendVerificationEmail(email, verifyToken),
+    );
 
     return c.json({
       message: 'User registered successfully. Please verify your email.',
@@ -312,7 +337,10 @@ auth.post('/invite', zValidator('json', inviteSchema), async (c) => {
     }).returning(userProfileFields);
 
     const verifyToken = jwt.sign({ email: newUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
-    const emailSent = await sendInviteEmail(email, inviterUser.name, verifyToken);
+    const emailSent = await dispatchEmail(
+      () => queueInviteEmail(email, inviterUser.name, verifyToken),
+      () => sendInviteEmail(email, inviterUser.name, verifyToken),
+    );
 
     return c.json({
       message: 'Invitation sent successfully. They will receive an email shortly.',
@@ -614,7 +642,10 @@ auth.post('/resend-invite/:id', async (c) => {
     }
 
     const verifyToken = jwt.sign({ email: targetUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
-    await sendInviteEmail(targetUser[0].email, me[0].name, verifyToken);
+    await dispatchEmail(
+      () => queueInviteEmail(targetUser[0].email, me[0].name, verifyToken),
+      () => sendInviteEmail(targetUser[0].email, me[0].name, verifyToken),
+    );
 
     return c.json({ message: 'Invitation resent successfully' });
   } catch {
@@ -638,7 +669,10 @@ auth.post('/send-password-otp', async (c) => {
 
     await db.update(users).set({ passwordOtp: otp, passwordOtpExpiry: expiry }).where(eq(users.id, decoded.id));
 
-    await sendPasswordOtpEmail(me[0].email, otp).catch((err) => {
+    await dispatchEmail(
+      () => queuePasswordOtpEmail(me[0].email, otp),
+      () => sendPasswordOtpEmail(me[0].email, otp),
+    ).catch((err) => {
       console.error('[send-password-otp] email delivery failed (non-fatal):', err);
     });
 

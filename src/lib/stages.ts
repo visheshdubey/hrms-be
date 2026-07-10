@@ -8,6 +8,7 @@ import {
 } from '../db/schema.js';
 import { belongsToOrganization } from './orgScope.js';
 import type { UserRole } from '../middleware.js';
+import { defaultStageColor } from './stageColors.js';
 
 export function canWriteStageTemplates(role: UserRole | null | undefined): boolean {
   return role === 'org_admin' || role === 'recruiter_admin';
@@ -53,6 +54,7 @@ export async function copyAccountStageTemplatesToJob(
       name: template.name,
       orderIndex: template.orderIndex,
       stageType: template.stageType,
+      color: template.color ?? defaultStageColor(template.orderIndex),
     });
   }
 
