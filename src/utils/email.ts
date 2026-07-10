@@ -88,9 +88,6 @@ export const sendVerificationEmail = async (toEmail: string, verifyToken: string
 };
 
 /**
- * Sends an invite email to a team member
- */
-/**
  * Sends a password-reset email to an existing user
  */
 export const sendPasswordResetEmail = async (toEmail: string, resetToken: string) => {
@@ -152,6 +149,32 @@ export const sendInviteEmail = async (toEmail: string, inviterName: string, veri
   return deliverEmail('Invite email', {
     to: toEmail,
     subject: `Invitation from ${inviterName} to join HRMS`,
+    html,
+  });
+};
+
+/**
+ * Sends a one-time password for in-app password change (Settings → Profile).
+ */
+export const sendPasswordOtpEmail = async (toEmail: string, otp: string) => {
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eaeaea; border-radius: 8px;">
+      <h2 style="color: #333;">Password change verification</h2>
+      <p style="color: #555; line-height: 1.5;">
+        Use this one-time code to confirm your password change. It expires in 10 minutes.
+      </p>
+      <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px; text-align: center; color: #111;">
+        ${otp}
+      </p>
+      <p style="color: #888; font-size: 12px; text-align: center;">
+        If you did not request this, ignore this email.
+      </p>
+    </div>
+  `;
+
+  return deliverEmail('Password change OTP', {
+    to: toEmail,
+    subject: 'Your HRMS password change code',
     html,
   });
 };

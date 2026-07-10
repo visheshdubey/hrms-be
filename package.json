@@ -15,7 +15,9 @@
     "db:seed:users": "tsx src/db/seed-test-users.ts",
     "db:seed:stages": "tsx src/db/seed-stage-templates.ts",
     "db:seed:stress": "tsx src/db/seed-stress.ts",
-    "db:setup": "npm run db:push && npm run db:seed",
+    "db:seed:full": "tsx src/db/seed-faker-full.ts",
+    "db:demo": "npm run db:reset && npm run db:push && npm run db:seed:full",
+    "db:setup": "npm run db:push && npm run db:seed:full",
     "db:migrate:sqlite": "tsx src/db/migrate-sqlite-to-postgres.ts"
   },
   "dependencies": {

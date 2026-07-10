@@ -6,10 +6,10 @@ import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { organizations, users } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
-import { sendVerificationEmail, sendInviteEmail, sendPasswordResetEmail } from '../utils/email.js';
+import { sendVerificationEmail, sendInviteEmail, sendPasswordResetEmail, sendPasswordOtpEmail } from '../utils/email.js';
+import { JWT_SECRET } from '../config.js';
 
 const auth = new Hono({ strict: false });
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
 
 type UserRole = 'recruiter_admin' | 'recruited_staff' | 'org_admin' | 'org_staff';
 type PortalType = 'org' | 'recruiter';
@@ -383,11 +383,21 @@ auth.post('/login', zValidator('json', loginSchema), async (c) => {
         role: user[0].role,
         portalType: user[0].portalType,
         organizationId: user[0].organizationId,
+        avatar: user[0].avatar ?? null,
+        country: user[0].country ?? null,
+        timezone: user[0].timezone ?? null,
+        bio: user[0].bio ?? null,
+        isActive: user[0].isActive,
       },
       token,
     }, 200);
   } catch (error) {
-    return c.json({ error: 'Internal Server Error' }, 500);
+    console.error('[POST /login] Error:', error);
+    const message =
+      error instanceof Error && /connect|ECONNREFUSED|timeout/i.test(error.message)
+        ? 'Database unavailable. Start Postgres: cd hrms-be && npm run db:up && npm run db:seed:users'
+        : 'Internal Server Error';
+    return c.json({ error: message }, 500);
   }
 });
 
@@ -628,11 +638,9 @@ auth.post('/send-password-otp', async (c) => {
 
     await db.update(users).set({ passwordOtp: otp, passwordOtpExpiry: expiry }).where(eq(users.id, decoded.id));
 
-    // Send email via existing util or standard email
-    // For now we'll simulate sending OTP email using sendPasswordResetEmail modified or just a simple log
-    // Ideally we'd have a sendOtpEmail function, but since we don't, we'll try to use existing utils.
-    // Wait, let's just log it if we don't have sendOtpEmail, but since Nodemailer is configured in utils/email.ts, let's assume we can.
-    console.log(`[OTP] Generated OTP for ${me[0].email}: ${otp}`);
+    await sendPasswordOtpEmail(me[0].email, otp).catch((err) => {
+      console.error('[send-password-otp] email delivery failed (non-fatal):', err);
+    });
 
     return c.json({ message: 'OTP sent to your email address' });
   } catch {

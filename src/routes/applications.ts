@@ -12,6 +12,7 @@ import {
 } from '../db/schema.js';
 import { eq, desc, and } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import { canAccessJob } from '../lib/orgScope.js';
 
 const applicationsRouter = new Hono<AppContext>({ strict: false });
 
@@ -79,16 +80,39 @@ async function enrichApplication(app: Record<string, unknown>) {
   };
 }
 
+async function getJobIfAccessible(jobId: number, userId: number, orgId: number | null) {
+  const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+  if (!job || !await canAccessJob(job, userId, orgId)) return null;
+  return job;
+}
+
+async function getApplicationIfAccessible(
+  applicationId: number,
+  userId: number,
+  orgId: number | null,
+) {
+  const row = await db.select().from(applications).where(eq(applications.id, applicationId)).limit(1);
+  if (row.length === 0) return null;
+  const job = await getJobIfAccessible(row[0].jobId, userId, orgId);
+  if (!job) return null;
+  return row[0];
+}
+
 /* ═══════════════════════════════════════════════
    GET /applications?jobId=X
    All authenticated users can list applications.
 ═══════════════════════════════════════════════ */
 applicationsRouter.get('/', requireAuth, async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const jobId = c.req.query('jobId');
     if (!jobId) return c.json({ error: 'jobId query param is required' }, 400);
     const jid = parseInt(jobId);
     if (isNaN(jid)) return c.json({ error: 'Invalid jobId' }, 400);
+
+    const job = await getJobIfAccessible(jid, userId, orgId);
+    if (!job) return c.json({ error: 'Job not found' }, 404);
 
     const all = await db
       .select()
@@ -108,13 +132,15 @@ applicationsRouter.get('/', requireAuth, async (c) => {
 ═══════════════════════════════════════════════ */
 applicationsRouter.get('/:id', requireAuth, async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
-    const row = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
-    if (row.length === 0) return c.json({ error: 'Application not found' }, 404);
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
 
-    return c.json(await enrichApplication(row[0] as Record<string, unknown>));
+    return c.json(await enrichApplication(row as Record<string, unknown>));
   } catch {
     return c.json({ error: 'Failed to fetch application' }, 500);
   }
@@ -131,7 +157,11 @@ applicationsRouter.post(
   async (c) => {
     try {
       const userId = c.get('userId') as number;
+      const orgId = c.get('organizationId') as number | null;
       const { jobId, candidateId, notes } = c.req.valid('json');
+
+      const job = await getJobIfAccessible(jobId, userId, orgId);
+      if (!job) return c.json({ error: 'Job not found' }, 404);
 
       // Duplicate guard
       const dup = await db
@@ -174,15 +204,16 @@ applicationsRouter.post(
 applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSchema), async (c) => {
   try {
     const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id     = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
     const { status: nextStatus, note } = c.req.valid('json');
 
-    const row = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
-    if (row.length === 0) return c.json({ error: 'Application not found' }, 404);
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
 
-    const currentStatus = row[0].status as AppStatus;
+    const currentStatus = row.status as AppStatus;
     const allowed       = TRANSITIONS[currentStatus] ?? [];
 
     if (!allowed.includes(nextStatus)) {
@@ -217,8 +248,14 @@ applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSc
 ═══════════════════════════════════════════════ */
 applicationsRouter.patch('/:id/notes', requireAuth, zValidator('json', notesSchema), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
+
     const { notes } = c.req.valid('json');
     await db.update(applications).set({ notes, updatedAt: new Date().toISOString() }).where(eq(applications.id, id));
     return c.json({ message: 'Notes updated' });
@@ -232,8 +269,13 @@ applicationsRouter.patch('/:id/notes', requireAuth, zValidator('json', notesSche
 ═══════════════════════════════════════════════ */
 applicationsRouter.get('/:id/history', requireAuth, async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
 
     const rows = await db
       .select({
@@ -265,11 +307,13 @@ applicationsRouter.get('/:id/history', requireAuth, async (c) => {
 ═══════════════════════════════════════════════ */
 applicationsRouter.delete('/:id', requireAuth, requireRole('recruiter_admin'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
-    const row = await db.select({ id: applications.id }).from(applications).where(eq(applications.id, id)).limit(1);
-    if (row.length === 0) return c.json({ error: 'Application not found' }, 404);
+    const row = await getApplicationIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Application not found' }, 404);
 
     await db.delete(applicationStageHistory).where(eq(applicationStageHistory.applicationId, id));
     await db.delete(applications).where(eq(applications.id, id));

@@ -5,7 +5,7 @@ import { db } from '../db/index.js';
 import { contacts, accounts, users, CONTACT_STATUSES } from '../db/schema.js';
 import { eq, desc, inArray } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
-import { getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
+import { getOrgMemberIds, orgOrCreatorScope, belongsToOrganization } from '../lib/orgScope.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
@@ -91,10 +91,17 @@ contactsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
 /* GET /contacts/:id */
 contactsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
     const row = await db.select().from(contacts).where(eq(contacts.id, id)).limit(1);
     if (!row.length) return c.json({ error: 'Contact not found' }, 404);
+
+    if (!belongsToOrganization(row[0].organizationId, orgId, row[0].createdBy, userId)) {
+      return c.json({ error: 'Contact not found' }, 404);
+    }
+
     return c.json(await enrichContact(row[0]));
   } catch {
     return c.json({ error: 'Failed to fetch contact' }, 404);
@@ -111,6 +118,9 @@ contactsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
 
     const [acc] = await db.select().from(accounts).where(eq(accounts.id, b.accountId)).limit(1);
     if (!acc) return c.json({ error: 'Account not found' }, 404);
+    if (!belongsToOrganization(acc.organizationId, orgId, acc.createdBy, userId)) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
 
     const [created] = await db.insert(contacts).values({
       accountId: b.accountId,
@@ -136,9 +146,24 @@ contactsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
 /* PUT /contacts/:id */
 contactsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', contactBody.partial()), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const [existing] = await db.select().from(contacts).where(eq(contacts.id, id)).limit(1);
+    if (!existing) return c.json({ error: 'Contact not found' }, 404);
+    if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
+      return c.json({ error: 'Contact not found' }, 404);
+    }
+
     const b = c.req.valid('json');
+    if (b.accountId !== undefined) {
+      const [acc] = await db.select().from(accounts).where(eq(accounts.id, b.accountId)).limit(1);
+      if (!acc || !belongsToOrganization(acc.organizationId, orgId, acc.createdBy, userId)) {
+        return c.json({ error: 'Account not found' }, 404);
+      }
+    }
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const k of ['accountId','firstName','lastName','email','phone','jobTitle','department','status','linkedin'] as const) {
       if (b[k] !== undefined) patch[k] = b[k];
@@ -155,8 +180,17 @@ contactsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruite
 /* DELETE /contacts/:id */
 contactsRouter.delete('/:id', requireAuth, requireRole('recruiter_admin'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+
+    const [existing] = await db.select().from(contacts).where(eq(contacts.id, id)).limit(1);
+    if (!existing) return c.json({ error: 'Contact not found' }, 404);
+    if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
+      return c.json({ error: 'Contact not found' }, 404);
+    }
+
     await db.delete(contacts).where(eq(contacts.id, id));
     return c.json({ ok: true });
   } catch {
