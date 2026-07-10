@@ -26,6 +26,7 @@ import uploadsRoutes from './routes/uploads.js';
 import queueRoutes from './routes/queue.js';
 import { startQueueWorker } from './queue/worker.js';
 import { QUEUE_CONFIG } from './queue/config.js';
+import { ensureProdSchema } from './db/ensureProdSchema.js';
 
 const app = new Hono({ strict: false });
 
@@ -107,10 +108,21 @@ app.route('/queue', queueRoutes);
 app.route('/api/hono/queue', queueRoutes);
 
 const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-console.log(`✅ Server is running on port ${port}`);
 
-if (QUEUE_CONFIG.enableWorker) {
-  void startQueueWorker();
+async function boot() {
+  try {
+    await ensureProdSchema();
+  } catch (error) {
+    console.error('[boot] ensureProdSchema failed (continuing):', error);
+  }
+
+  console.log(`✅ Server is running on port ${port}`);
+
+  if (QUEUE_CONFIG.enableWorker) {
+    void startQueueWorker();
+  }
+
+  serve({ fetch: app.fetch, port });
 }
 
-serve({ fetch: app.fetch, port });
+void boot();

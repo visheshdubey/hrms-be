@@ -105,6 +105,33 @@ async function selectAccountIdsSafe(orgId: number | null, userId: number): Promi
   }
 }
 
+async function selectJobStages(jobId: number) {
+  try {
+    return await db
+      .select()
+      .from(jobStages)
+      .where(eq(jobStages.jobId, jobId))
+      .orderBy(jobStages.orderIndex);
+  } catch {
+    const rows = await db
+      .select({
+        id: jobStages.id,
+        jobId: jobStages.jobId,
+        name: jobStages.name,
+        orderIndex: jobStages.orderIndex,
+        stageType: jobStages.stageType,
+        createdAt: jobStages.createdAt,
+      })
+      .from(jobStages)
+      .where(eq(jobStages.jobId, jobId))
+      .orderBy(jobStages.orderIndex);
+    return rows.map((row, index) => ({
+      ...row,
+      color: defaultStageColor(index),
+    }));
+  }
+}
+
 type JobStatus = 'new' | 'draft' | 'ready' | 'submission_in_progress' | 'closed';
 
 /** Allowed forward/backward transitions per the Phase 2 lifecycle spec */
@@ -383,9 +410,7 @@ jobsRouter.get('/:jobId/stages', requireAuth, async (c) => {
     const job = await canAccessJobForStages({ jobId, userId, orgId });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
-    const stages = await db.select().from(jobStages)
-      .where(eq(jobStages.jobId, jobId))
-      .orderBy(jobStages.orderIndex);
+    const stages = await selectJobStages(jobId);
     return c.json({ data: stages });
   } catch {
     return c.json({ error: 'Failed to fetch job stages' }, 500);
