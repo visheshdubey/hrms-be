@@ -1,7 +1,6 @@
 services:
   redis:
     image: redis:7-alpine
-    container_name: hrms-be-redis-prod
     restart: always
     networks:
       - ats_network
@@ -19,7 +18,8 @@ services:
     volumes:
       - ./volume/env/.env:/app/.env
     environment:
-      REDIS_URL: redis://hrms-be-redis-prod:6379
+      # Compose service DNS name (avoid fixed container_name conflicts on redeploy)
+      REDIS_URL: redis://redis:6379
       ENABLE_QUEUE_WORKER: "true"
     depends_on:
       - redis

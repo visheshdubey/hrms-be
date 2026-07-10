@@ -117,9 +117,11 @@ commands:
                         docker compose -p "$compose_project" -f "$compose_file" down --remove-orphans || true
                         docker stop "$container_name" 2>/dev/null || true
                         docker rm -f "$container_name" 2>/dev/null || true
-                        # Wait for Docker to release the fixed container_name before recreate
+                        # Legacy fixed redis name from earlier compose revisions
+                        docker rm -f hrms-be-redis-prod 2>/dev/null || true
+                        # Wait for Docker to release fixed names before recreate
                         sleep 3
-                        docker rm -f "$container_name" 2>/dev/null || true
+                        docker rm -f "$container_name" hrms-be-redis-prod 2>/dev/null || true
 
                         docker compose -p "$compose_project" -f "$compose_file" up -d --build --force-recreate --remove-orphans
                       EOF
