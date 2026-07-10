@@ -30,13 +30,24 @@ const TYPE_LABELS: Record<AccType, string> = {
 async function enrichAccount(row: typeof accounts.$inferSelect) {
   let ownerName = '';
   if (row.createdBy) {
-    const [u] = await db.select({ name: users.name }).from(users).where(eq(users.id, row.createdBy));
-    ownerName = u?.name ?? '';
+    try {
+      const [u] = await db.select({ name: users.name }).from(users).where(eq(users.id, row.createdBy));
+      ownerName = u?.name ?? '';
+    } catch {
+      ownerName = '';
+    }
   }
-  const [countRow] = await db
-    .select({ count: sql<number>`count(*)` })
-    .from(contacts)
-    .where(eq(contacts.accountId, row.id));
+
+  let contactCount = 0;
+  try {
+    const [countRow] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(contacts)
+      .where(eq(contacts.accountId, row.id));
+    contactCount = Number(countRow?.count ?? 0);
+  } catch {
+    contactCount = 0;
+  }
 
   let parsedTags: string[] = [];
   try {
@@ -49,7 +60,7 @@ async function enrichAccount(row: typeof accounts.$inferSelect) {
     tags: parsedTags,
     alertsEnabled: Boolean(row.alertsEnabled),
     ownerName,
-    contactCount: Number(countRow?.count ?? 0),
+    contactCount,
     statusLabel: STATUS_LABELS[row.status as AccStatus] ?? row.status,
     typeLabel: TYPE_LABELS[row.type as AccType] ?? row.type,
   };
@@ -122,11 +133,20 @@ async function getAccountByIdLegacy(id: number) {
 }
 
 async function listAccountsSafe(orgId: number | null, userId: number) {
+  const scope = orgOrCreatorScope(orgId, userId, accounts, accounts);
   try {
     return await db
-      .select()
+      .select({
+        ...LEGACY_ACCOUNT_SELECT,
+        contractValue: accounts.contractValue,
+        tags: accounts.tags,
+        alertsEnabled: accounts.alertsEnabled,
+        shortLogoUrl: accounts.shortLogoUrl,
+        longLogoUrl: accounts.longLogoUrl,
+        organizationId: accounts.organizationId,
+      })
       .from(accounts)
-      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
+      .where(scope)
       .orderBy(desc(accounts.updatedAt));
   } catch (error) {
     if (!isAccountsSchemaDriftError(error)) throw error;
