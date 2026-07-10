@@ -3,9 +3,9 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { accounts, contacts, users, jobs, accountStageTemplates, JOB_STAGE_TYPES, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
-import { eq, desc, sql, and } from 'drizzle-orm';
+import { eq, desc, sql, and, inArray, type SQL } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext, type UserRole } from '../middleware.js';
-import { belongsToOrganization, orgOrCreatorScope } from '../lib/orgScope.js';
+import { belongsToOrganization, orgOrCreatorScope, getOrgMemberIds } from '../lib/orgScope.js';
 import {
   applyTemplatesToAccountJobsWithoutStages,
   canWriteStageTemplates,
@@ -55,14 +55,70 @@ async function enrichAccount(row: typeof accounts.$inferSelect) {
   };
 }
 
-function isMissingAccountMetadataColumnError(error: unknown): boolean {
+function isAccountsSchemaDriftError(error: unknown): boolean {
   const message = String(error ?? '').toLowerCase();
-  return (
-    message.includes('does not exist') &&
-    (message.includes('contract_value') ||
-      message.includes('alerts_enabled') ||
-      message.includes('tags'))
-  );
+  return message.includes('does not exist');
+}
+
+const LEGACY_ACCOUNT_SELECT = {
+  id: accounts.id,
+  name: accounts.name,
+  status: accounts.status,
+  type: accounts.type,
+  website: accounts.website,
+  description: accounts.description,
+  phone: accounts.phone,
+  email: accounts.email,
+  address: accounts.address,
+  city: accounts.city,
+  state: accounts.state,
+  country: accounts.country,
+  createdBy: accounts.createdBy,
+  createdAt: accounts.createdAt,
+  updatedAt: accounts.updatedAt,
+} as const;
+
+function withLegacyAccountDefaults<T extends Record<string, unknown>>(row: T) {
+  return {
+    ...row,
+    contractValue: 0,
+    tags: '[]',
+    alertsEnabled: 0,
+    shortLogoUrl: '',
+    longLogoUrl: '',
+    organizationId: null as number | null,
+  };
+}
+
+async function legacyAccountsScope(
+  orgId: number | null,
+  userId: number,
+): Promise<SQL | undefined> {
+  if (orgId != null) {
+    const memberIds = await getOrgMemberIds(orgId, userId);
+    if (memberIds.length === 0) return eq(accounts.createdBy, userId);
+    return inArray(accounts.createdBy, memberIds);
+  }
+  return eq(accounts.createdBy, userId);
+}
+
+async function listAccountsLegacy(orgId: number | null, userId: number) {
+  const scope = await legacyAccountsScope(orgId, userId);
+  const rows = await db
+    .select(LEGACY_ACCOUNT_SELECT)
+    .from(accounts)
+    .where(scope)
+    .orderBy(desc(accounts.updatedAt));
+  return rows.map(withLegacyAccountDefaults);
+}
+
+async function getAccountByIdLegacy(id: number) {
+  const rows = await db
+    .select(LEGACY_ACCOUNT_SELECT)
+    .from(accounts)
+    .where(eq(accounts.id, id))
+    .limit(1);
+  return rows.map(withLegacyAccountDefaults);
 }
 
 async function listAccountsSafe(orgId: number | null, userId: number) {
@@ -73,37 +129,8 @@ async function listAccountsSafe(orgId: number | null, userId: number) {
       .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
       .orderBy(desc(accounts.updatedAt));
   } catch (error) {
-    if (!isMissingAccountMetadataColumnError(error)) throw error;
-    const rows = await db
-      .select({
-        id: accounts.id,
-        name: accounts.name,
-        status: accounts.status,
-        type: accounts.type,
-        website: accounts.website,
-        description: accounts.description,
-        phone: accounts.phone,
-        email: accounts.email,
-        address: accounts.address,
-        city: accounts.city,
-        state: accounts.state,
-        country: accounts.country,
-        shortLogoUrl: accounts.shortLogoUrl,
-        longLogoUrl: accounts.longLogoUrl,
-        organizationId: accounts.organizationId,
-        createdBy: accounts.createdBy,
-        createdAt: accounts.createdAt,
-        updatedAt: accounts.updatedAt,
-      })
-      .from(accounts)
-      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
-      .orderBy(desc(accounts.updatedAt));
-    return rows.map((row) => ({
-      ...row,
-      contractValue: 0,
-      tags: '[]',
-      alertsEnabled: 0,
-    }));
+    if (!isAccountsSchemaDriftError(error)) throw error;
+    return listAccountsLegacy(orgId, userId);
   }
 }
 
@@ -111,37 +138,8 @@ async function getAccountByIdSafe(id: number) {
   try {
     return await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
   } catch (error) {
-    if (!isMissingAccountMetadataColumnError(error)) throw error;
-    const rows = await db
-      .select({
-        id: accounts.id,
-        name: accounts.name,
-        status: accounts.status,
-        type: accounts.type,
-        website: accounts.website,
-        description: accounts.description,
-        phone: accounts.phone,
-        email: accounts.email,
-        address: accounts.address,
-        city: accounts.city,
-        state: accounts.state,
-        country: accounts.country,
-        shortLogoUrl: accounts.shortLogoUrl,
-        longLogoUrl: accounts.longLogoUrl,
-        organizationId: accounts.organizationId,
-        createdBy: accounts.createdBy,
-        createdAt: accounts.createdAt,
-        updatedAt: accounts.updatedAt,
-      })
-      .from(accounts)
-      .where(eq(accounts.id, id))
-      .limit(1);
-    return rows.map((row) => ({
-      ...row,
-      contractValue: 0,
-      tags: '[]',
-      alertsEnabled: 0,
-    }));
+    if (!isAccountsSchemaDriftError(error)) throw error;
+    return getAccountByIdLegacy(id);
   }
 }
 
