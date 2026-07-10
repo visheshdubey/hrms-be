@@ -11,6 +11,26 @@ import { requireAuth, requireRole, type AppContext } from '../middleware.js';
 import { getOrgMemberIds } from '../lib/orgScope.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
+import { belongsToOrganization } from '../lib/orgScope.js';
+import { enqueueEmailBatch } from '../queue/email-queue.js';
+import { personalizeCampaignBody, wrapCampaignHtml } from '../queue/email-service.js';
+
+async function getCampaignForUser(
+  id: number,
+  userId: number,
+  orgId: number | null,
+) {
+  const [campaign] = await db.select().from(campaigns).where(eq(campaigns.id, id)).limit(1);
+  if (!campaign) return null;
+
+  const allowed = belongsToOrganization(
+    campaign.organizationId,
+    orgId,
+    campaign.createdBy,
+    userId,
+  );
+  return allowed ? campaign : null;
+}
 
 const campaignsRouter = new Hono<AppContext>({ strict: false });
 
@@ -96,7 +116,9 @@ campaignsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruit
   try {
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
-    const [row] = await db.select().from(campaigns).where(eq(campaigns.id, id)).limit(1);
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const row = await getCampaignForUser(id, userId, orgId);
     if (!row) return c.json({ error: 'Campaign not found' }, 404);
     return c.json(await enrichCampaign(row));
   } catch {
@@ -138,6 +160,11 @@ campaignsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruit
   try {
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const existing = await getCampaignForUser(id, userId, orgId);
+    if (!existing) return c.json({ error: 'Campaign not found' }, 404);
+
     const b = c.req.valid('json');
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     if (b.name !== undefined) patch.name = b.name;
@@ -162,12 +189,60 @@ campaignsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruit
   }
 });
 
-/* POST /campaigns/:id/send — must be before nothing, it's /:id/send */
+/* POST /campaigns/:id/send — enqueue all recipients, return 202 */
 campaignsRouter.post('/:id/send', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
   try {
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+
+    const campaign = await getCampaignForUser(id, userId, orgId);
+    if (!campaign) return c.json({ error: 'Campaign not found' }, 404);
+
+    if (campaign.status === 'sent') {
+      return c.json({ error: 'Campaign has already been sent' }, 409);
+    }
+
+    const recipients = JSON.parse(campaign.recipientsJson || '[]') as z.infer<typeof recipientSchema>[];
+    if (recipients.length === 0) {
+      return c.json({ error: 'Campaign has no recipients' }, 400);
+    }
+    if (!campaign.subject?.trim()) {
+      return c.json({ error: 'Campaign subject is required before sending' }, 400);
+    }
+    if (!campaign.body?.trim()) {
+      return c.json({ error: 'Campaign body is required before sending' }, 400);
+    }
+
     const now = new Date().toISOString();
+    const subject = campaign.subject.trim();
+    const bodyHtml = campaign.body.trim();
+
+    const batchItems = recipients
+      .filter((r) => r.email?.trim())
+      .map((recipient) => ({
+        type: 'campaign' as const,
+        to: recipient.email.trim(),
+        subject,
+        html: wrapCampaignHtml(personalizeCampaignBody(bodyHtml, recipient.name)),
+        metadata: {
+          campaignId: id,
+          recipientName: recipient.name,
+          candidateId: recipient.candidateId,
+        },
+      }));
+
+    if (batchItems.length === 0) {
+      return c.json({ error: 'No valid recipient emails found' }, 400);
+    }
+
+    const { batchId, queued, inline } = await enqueueEmailBatch(batchItems, {
+      campaignId: id,
+      label: `Campaign: ${campaign.name}`,
+      organizationId: campaign.organizationId,
+      createdBy: userId,
+    });
 
     const [updated] = await db.update(campaigns).set({
       status: 'sent',
@@ -175,9 +250,15 @@ campaignsRouter.post('/:id/send', requireAuth, requireRole('recruiter_admin', 'r
       updatedAt: now,
     }).where(eq(campaigns.id, id)).returning();
 
-    if (!updated) return c.json({ error: 'Campaign not found' }, 404);
-    return c.json(await enrichCampaign(updated));
-  } catch {
+    return c.json({
+      ...(await enrichCampaign(updated)),
+      batchId,
+      emailStatus: 'queued',
+      queued,
+      inline,
+    }, 202);
+  } catch (error) {
+    console.error('[campaigns/send]', error);
     return c.json({ error: 'Failed to send campaign' }, 500);
   }
 });
@@ -187,6 +268,10 @@ campaignsRouter.delete('/:id', requireAuth, requireRole('recruiter_admin'), asyn
   try {
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const existing = await getCampaignForUser(id, userId, orgId);
+    if (!existing) return c.json({ error: 'Campaign not found' }, 404);
     await db.delete(campaigns).where(eq(campaigns.id, id));
     return c.json({ ok: true });
   } catch {

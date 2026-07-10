@@ -4,9 +4,10 @@ import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { eq, desc, inArray, and, or, isNull } from 'drizzle-orm';
 import { requireAuth, type AppContext, type UserRole } from '../middleware.js';
-import { jobs, jobStages, JOB_STAGE_TYPES, accounts } from '../db/schema.js';
+import { jobs, jobStages, JOB_STAGE_TYPES, accounts, applications, users } from '../db/schema.js';
 import { copyAccountStageTemplatesToJob, canWriteStageTemplates } from '../lib/stages.js';
 import { canAccessJob, getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
+import { defaultStageColor } from '../lib/stageColors.js';
 
 const jobsRouter = new Hono<AppContext>({ strict: false });
 
@@ -32,12 +33,18 @@ const jobSchema = z.object({
   payPackageMin: z.number().nonnegative().optional().nullable(),
   payPackageMax: z.number().nonnegative().optional().nullable(),
   payCurrency: z.string().optional(),
+  assignedTo: z.number().int().positive().optional().nullable(),
 });
 
 const stageSchema = z.object({
   name: z.string().min(1),
   orderIndex: z.number().int().nonnegative().optional(),
   stageType: z.enum(JOB_STAGE_TYPES).optional(),
+  color: z.string().min(4).max(32).optional(),
+});
+
+const reorderStagesSchema = z.object({
+  stageIds: z.array(z.number().int().positive()).min(1),
 });
 
 const statusSchema = z.object({
@@ -129,11 +136,22 @@ jobsRouter.get('/:id', requireAuth, async (c) => {
     }
 
     const j = row[0];
+    let assignedToName: string | null = null;
+    if (j.assignedTo != null) {
+      const [assignee] = await db
+        .select({ name: users.name })
+        .from(users)
+        .where(eq(users.id, j.assignedTo))
+        .limit(1);
+      assignedToName = assignee?.name ?? null;
+    }
+
     return c.json({
       ...j,
       skills: j.description,
       postedDate: formatRelativeTime(j.postedDate, Date.now()),
       allowedTransitions: TRANSITIONS[j.status as JobStatus] ?? [],
+      assignedToName,
     });
   } catch {
     return c.json({ error: 'Failed to fetch job' }, 500);
@@ -231,7 +249,7 @@ jobsRouter.put('/:id', requireAuth, zValidator('json', jobSchema), async (c) => 
     }
 
     const patch: Record<string, unknown> = {};
-    for (const k of ['title','department','status','type','location','description','accountId','payPackageMin','payPackageMax','payCurrency'] as const) {
+    for (const k of ['title','department','status','type','location','description','accountId','payPackageMin','payPackageMax','payCurrency','assignedTo'] as const) {
       if (body[k] !== undefined) patch[k] = body[k];
     }
 
@@ -330,16 +348,72 @@ jobsRouter.post('/:jobId/stages', requireAuth, zValidator('json', stageSchema), 
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const b = c.req.valid('json');
+    const orderIndex = b.orderIndex ?? 0;
     const [created] = await db.insert(jobStages).values({
       jobId,
       name: b.name,
-      orderIndex: b.orderIndex ?? 0,
+      orderIndex,
       stageType: b.stageType ?? 'application',
+      color: b.color ?? defaultStageColor(orderIndex),
     }).returning();
 
     return c.json(created, 201);
   } catch {
     return c.json({ error: 'Failed to create job stage' }, 500);
+  }
+});
+
+// PUT /jobs/:jobId/stages/reorder — batch reorder after drag-and-drop
+jobsRouter.put('/:jobId/stages/reorder', requireAuth, zValidator('json', reorderStagesSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const jobId = parseInt(c.req.param('jobId'));
+    if (isNaN(jobId)) return c.json({ error: 'Invalid job id' }, 400);
+    if (!canWriteStageTemplates(role)) {
+      return c.json({ error: 'Only admins can modify job stages' }, 403);
+    }
+
+    const job = await canAccessJobForStages({ jobId, userId, orgId });
+    if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
+
+    const { stageIds } = c.req.valid('json');
+    const existing = await db
+      .select({ id: jobStages.id })
+      .from(jobStages)
+      .where(eq(jobStages.jobId, jobId));
+
+    if (existing.length === 0) {
+      return c.json({ error: 'No stages to reorder' }, 400);
+    }
+
+    if (stageIds.length !== existing.length) {
+      return c.json({ error: 'stageIds must include every stage for this job' }, 400);
+    }
+
+    const existingIdSet = new Set(existing.map((row) => row.id));
+    if (!stageIds.every((id) => existingIdSet.has(id))) {
+      return c.json({ error: 'Invalid stageIds for this job' }, 400);
+    }
+
+    await Promise.all(
+      stageIds.map((stageId, orderIndex) =>
+        db.update(jobStages)
+          .set({ orderIndex })
+          .where(and(eq(jobStages.id, stageId), eq(jobStages.jobId, jobId))),
+      ),
+    );
+
+    const stages = await db
+      .select()
+      .from(jobStages)
+      .where(eq(jobStages.jobId, jobId))
+      .orderBy(jobStages.orderIndex);
+
+    return c.json({ data: stages });
+  } catch {
+    return c.json({ error: 'Failed to reorder job stages' }, 500);
   }
 });
 
@@ -364,6 +438,7 @@ jobsRouter.put('/:jobId/stages/:stageId', requireAuth, zValidator('json', stageS
     if (b.name !== undefined) patch.name = b.name;
     if (b.orderIndex !== undefined) patch.orderIndex = b.orderIndex;
     if (b.stageType !== undefined) patch.stageType = b.stageType;
+    if (b.color !== undefined) patch.color = b.color;
 
     const [updated] = await db.update(jobStages).set(patch as typeof jobStages.$inferInsert)
       .where(and(eq(jobStages.id, stageId), eq(jobStages.jobId, jobId)))
@@ -395,6 +470,57 @@ jobsRouter.delete('/:jobId/stages/:stageId', requireAuth, async (c) => {
     return c.json({ ok: true });
   } catch {
     return c.json({ error: 'Failed to delete job stage' }, 500);
+  }
+});
+
+// GET /jobs/:jobId/stage-stats — candidate count per pipeline stage
+jobsRouter.get('/:jobId/stage-stats', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const jobId = parseInt(c.req.param('jobId'));
+    if (isNaN(jobId)) return c.json({ error: 'Invalid job id' }, 400);
+
+    const job = await canAccessJobForStages({ jobId, userId, orgId });
+    if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
+
+    const stages = await db
+      .select()
+      .from(jobStages)
+      .where(eq(jobStages.jobId, jobId))
+      .orderBy(jobStages.orderIndex);
+
+    const apps = await db
+      .select({ jobStageId: applications.jobStageId })
+      .from(applications)
+      .where(eq(applications.jobId, jobId));
+
+    const countByStage = new Map<number, number>();
+    let unassigned = 0;
+    for (const app of apps) {
+      if (app.jobStageId == null) {
+        unassigned += 1;
+      } else {
+        countByStage.set(app.jobStageId, (countByStage.get(app.jobStageId) ?? 0) + 1);
+      }
+    }
+
+    const data = stages.map((stage, index) => ({
+      stageId: stage.id,
+      stageKey: `S${index + 1}`,
+      name: stage.name,
+      color: stage.color,
+      orderIndex: stage.orderIndex,
+      count: countByStage.get(stage.id) ?? 0,
+    }));
+
+    return c.json({
+      data,
+      totalApplications: apps.length,
+      unassignedCount: unassigned,
+    });
+  } catch {
+    return c.json({ error: 'Failed to fetch stage stats' }, 500);
   }
 });
 
