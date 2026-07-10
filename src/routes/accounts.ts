@@ -14,6 +14,7 @@ import {
 import { cascadeDeleteAccount, getAccountDeletePreview } from '../lib/accountDelete.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
+import { defaultStageColor } from '../lib/stageColors.js';
 
 const accountsRouter = new Hono<AppContext>({ strict: false });
 
@@ -204,6 +205,11 @@ const stageTemplateSchema = z.object({
   name: z.string().min(1),
   orderIndex: z.number().int().nonnegative().optional(),
   stageType: z.enum(JOB_STAGE_TYPES).optional(),
+  color: z.string().min(4).max(32).optional(),
+});
+
+const reorderStageTemplatesSchema = z.object({
+  stageIds: z.array(z.number().int().positive()).min(1),
 });
 
 function stageWriteForbidden(c: { json: (body: unknown, status?: number) => Response }) {
@@ -265,11 +271,13 @@ accountsRouter.post('/:id/stage-templates', requireAuth, zValidator('json', stag
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
     const body = c.req.valid('json');
+    const orderIndex = body.orderIndex ?? 0;
     const [created] = await db.insert(accountStageTemplates).values({
       accountId,
       name: body.name,
-      orderIndex: body.orderIndex ?? 0,
+      orderIndex,
       stageType: body.stageType ?? 'application',
+      color: body.color ?? defaultStageColor(orderIndex),
     }).returning();
 
     return c.json(created, 201);
@@ -297,6 +305,7 @@ accountsRouter.put('/:id/stage-templates/:stageId', requireAuth, zValidator('jso
     if (body.name !== undefined) patch.name = body.name;
     if (body.orderIndex !== undefined) patch.orderIndex = body.orderIndex;
     if (body.stageType !== undefined) patch.stageType = body.stageType;
+    if (body.color !== undefined) patch.color = body.color;
 
     const [updated] = await db
       .update(accountStageTemplates)
@@ -334,6 +343,58 @@ accountsRouter.delete('/:id/stage-templates/:stageId', requireAuth, async (c) =>
     return c.json({ ok: true });
   } catch {
     return c.json({ error: 'Failed to delete stage template' }, 500);
+  }
+});
+
+/* PUT /accounts/:id/stage-templates/reorder — batch reorder after drag-and-drop */
+accountsRouter.put('/:id/stage-templates/reorder', requireAuth, zValidator('json', reorderStageTemplatesSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const accountId = parseInt(c.req.param('id'));
+    if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
+    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
+
+    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
+
+    const { stageIds } = c.req.valid('json');
+    const existing = await db
+      .select({ id: accountStageTemplates.id })
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId));
+
+    if (existing.length === 0) {
+      return c.json({ error: 'No stage templates to reorder' }, 400);
+    }
+
+    if (stageIds.length !== existing.length) {
+      return c.json({ error: 'stageIds must include every template for this account' }, 400);
+    }
+
+    const existingIdSet = new Set(existing.map((row) => row.id));
+    if (!stageIds.every((id) => existingIdSet.has(id))) {
+      return c.json({ error: 'Invalid stageIds for this account' }, 400);
+    }
+
+    await Promise.all(
+      stageIds.map((stageId, orderIndex) =>
+        db.update(accountStageTemplates)
+          .set({ orderIndex })
+          .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId))),
+      ),
+    );
+
+    const templates = await db
+      .select()
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId))
+      .orderBy(accountStageTemplates.orderIndex);
+
+    return c.json({ data: templates });
+  } catch {
+    return c.json({ error: 'Failed to reorder stage templates' }, 500);
   }
 });
 

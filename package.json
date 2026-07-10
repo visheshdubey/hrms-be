@@ -5,7 +5,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/src/index.js",
-    "db:up": "docker compose up -d postgres",
+    "db:up": "docker compose up -d postgres redis",
     "db:down": "docker compose down",
     "db:push": "drizzle-kit push",
     "db:reset": "tsx src/db/reset-db.ts",
@@ -14,11 +14,13 @@
     "db:seed": "tsx src/db/seed.ts",
     "db:seed:users": "tsx src/db/seed-test-users.ts",
     "db:seed:stages": "tsx src/db/seed-stage-templates.ts",
+    "db:backfill:phase2": "tsx src/db/backfill-jobs-phase2.ts",
     "db:seed:stress": "tsx src/db/seed-stress.ts",
     "db:seed:full": "tsx src/db/seed-faker-full.ts",
     "db:demo": "npm run db:reset && npm run db:push && npm run db:seed:full",
     "db:setup": "npm run db:push && npm run db:seed:full",
-    "db:migrate:sqlite": "tsx src/db/migrate-sqlite-to-postgres.ts"
+    "db:migrate:sqlite": "tsx src/db/migrate-sqlite-to-postgres.ts",
+    "worker:queue": "tsx src/queue/run-worker.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.14",
@@ -28,6 +30,7 @@
     "drizzle-kit": "^0.31.10",
     "drizzle-orm": "^0.45.2",
     "hono": "^4.12.12",
+    "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.3",
     "nodemailer": "^9.0.0",
     "pg": "^8.20.0",
