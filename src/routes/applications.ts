@@ -19,6 +19,7 @@ import { isSchemaDriftError } from '../lib/schemaDrift.js';
 import {
   incrementJobApplicantCount,
   resolveNewApplicationDefaults,
+  backfillNullApplicationStages,
 } from '../lib/applicationDefaults.js';
 
 const applicationsRouter = new Hono<AppContext>({ strict: false });
@@ -342,6 +343,8 @@ applicationsRouter.get('/', requireAuth, async (c) => {
 
     const job = await getJobIfAccessible(jid, userId, orgId);
     if (!job) return c.json({ error: 'Job not found' }, 404);
+
+    await backfillNullApplicationStages(jid);
 
     const all = await selectApplicationsForJob(jid);
 
