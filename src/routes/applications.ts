@@ -21,6 +21,7 @@ import {
   resolveNewApplicationDefaults,
   backfillNullApplicationStages,
 } from '../lib/applicationDefaults.js';
+import { createNotification, createNotificationsForUsers } from '../lib/notifications.js';
 
 const applicationsRouter = new Hono<AppContext>({ strict: false });
 
@@ -287,6 +288,31 @@ async function createApplicationRecord(params: {
 
   await incrementJobApplicantCount(params.jobId, 1);
 
+  const [job] = await db
+    .select({ title: jobs.title, createdBy: jobs.createdBy })
+    .from(jobs)
+    .where(eq(jobs.id, params.jobId))
+    .limit(1);
+  const [candidate] = await db
+    .select({ name: candidates.name })
+    .from(candidates)
+    .where(eq(candidates.id, params.candidateId))
+    .limit(1);
+
+  const candidateName = candidate?.name?.trim() || `Candidate #${params.candidateId}`;
+  const jobTitle = job?.title?.trim() || `Job #${params.jobId}`;
+
+  await createNotificationsForUsers(
+    [resolvedAssignee, job?.createdBy, params.userId],
+    {
+      title: 'New application received',
+      body: `${candidateName} was added to ${jobTitle}.`,
+      type: 'application',
+      relatedId: created[0].id,
+      relatedType: 'application',
+    },
+  );
+
   return created[0];
 }
 
@@ -522,6 +548,31 @@ applicationsRouter.patch(
 
       await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
 
+      if (body.assignedTo != null && body.assignedTo !== row.assignedTo) {
+        await createNotification({
+          userId: body.assignedTo,
+          title: 'Application assigned to you',
+          body: `You were assigned application #${id}.`,
+          type: 'application',
+          relatedId: id,
+          relatedType: 'application',
+        });
+      }
+
+      if (body.jobStageId !== undefined && body.jobStageId !== row.jobStageId) {
+        const notifyUserId = (body.assignedTo ?? row.assignedTo) as number | null;
+        if (notifyUserId) {
+          await createNotification({
+            userId: notifyUserId,
+            title: 'Application stage updated',
+            body: `Application #${id} moved to a new pipeline stage.`,
+            type: 'stage_change',
+            relatedId: id,
+            relatedType: 'application',
+          });
+        }
+      }
+
       const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
       return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
     } catch {
@@ -568,6 +619,17 @@ applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSc
       note:          note ?? '',
       changedBy:     userId,
     });
+
+    if (row.assignedTo) {
+      await createNotification({
+        userId: row.assignedTo as number,
+        title: 'Application status changed',
+        body: `Application #${id}: ${currentStatus} → ${nextStatus}.`,
+        type: 'stage_change',
+        relatedId: id,
+        relatedType: 'application',
+      });
+    }
 
     const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
     return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
