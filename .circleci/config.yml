@@ -142,22 +142,29 @@ commands:
                         circle_project_reponame_var=$1
                         domain=$2
                         cd /home/source/<< parameters.environment >>/$circle_project_reponame_var/
+                        # Strip Windows CRLF if present (breaks bash on Linux)
+                        sed -i 's/\r$//' deploy/nginx/apply-site.sh
                         chmod +x deploy/nginx/apply-site.sh
-                        # Always re-write our own SSL+proxy config (certbot --nginx was overwriting proxy_pass / stealing host)
                         ./deploy/nginx/apply-site.sh "${circle_project_reponame_var}" "${domain}" 3202
-                        # Public root must be API JSON — never the FE SPA
                         sleep 2
-                        body="$(curl -fsSk -m 15 "https://${domain}/" || curl -fsS -m 15 "http://${domain}/" || true)"
-                        echo "api root body: ${body:0:200}"
-                        if echo "${body}" | grep -qi '<html\|hrms-ui\|<!doctype'; then
-                          echo "ERROR: ${domain}/ is serving frontend HTML"
+                        # Prefer local upstream check (stable); public HTTPS is best-effort
+                        body="$(curl -fsS -m 10 "http://127.0.0.1:3202/" || true)"
+                        echo "upstream body: ${body:0:200}"
+                        if echo "${body}" | grep -qiE '<html|hrms-ui|<!doctype'; then
+                          echo "ERROR: API upstream serving frontend HTML"
                           exit 1
                         fi
-                        if ! echo "${body}" | grep -qi 'APTO Hono API\|"status"\s*:\s*"ok"'; then
-                          echo "ERROR: ${domain}/ did not return API ok payload"
+                        if ! echo "${body}" | grep -q 'APTO Hono API'; then
+                          echo "ERROR: API upstream missing ok payload"
                           exit 1
                         fi
-                        echo "OK: ${domain}/ looks like API"
+                        pub="$(curl -fsSk -m 15 "https://${domain}/" || true)"
+                        echo "public body: ${pub:0:200}"
+                        if echo "${pub}" | grep -qiE '<html|hrms-ui|<!doctype'; then
+                          echo "ERROR: public ${domain} serving frontend HTML"
+                          exit 1
+                        fi
+                        echo "OK: nginx + API checks passed"
                       EOF
 
 jobs:

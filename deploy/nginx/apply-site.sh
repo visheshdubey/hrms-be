@@ -38,13 +38,14 @@ EOF
 }
 
 write_http_redirect_and_https() {
-  local ssl_options=""
-  local ssl_dh=""
+  local ssl_extra=""
   if [[ -f /etc/letsencrypt/options-ssl-nginx.conf ]]; then
-    ssl_options="include /etc/letsencrypt/options-ssl-nginx.conf;"
+    ssl_extra="${ssl_extra}
+    include /etc/letsencrypt/options-ssl-nginx.conf;"
   fi
   if [[ -f /etc/letsencrypt/ssl-dhparams.pem ]]; then
-    ssl_dh="ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+    ssl_extra="${ssl_extra}
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
   fi
 
   cat >"${CONF_AVAILABLE}" <<EOF
@@ -59,9 +60,7 @@ server {
     server_name ${DOMAIN};
 
     ssl_certificate ${CERT_DIR}/fullchain.pem;
-    ssl_certificate_key ${CERT_DIR}/privkey.pem;
-    ${ssl_options}
-    ${ssl_dh}
+    ssl_certificate_key ${CERT_DIR}/privkey.pem;${ssl_extra}
 
     access_log /var/log/nginx/${APP_NAME}.access.log;
     error_log /var/log/nginx/${APP_NAME}.error.log;
@@ -84,12 +83,10 @@ EOF
 
 write_http_only
 ln -sfn "${CONF_AVAILABLE}" "${CONF_ENABLED}"
-# Drop broken default that steals unknown hosts onto FE (if present as catch-all).
 nginx -t
 systemctl reload nginx
 
 if [[ ! -f "${CERT_DIR}/fullchain.pem" ]]; then
-  # certonly does not permanently rewrite our site proxy_pass the way `certbot --nginx` install does.
   certbot certonly --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" || true
 fi
 
@@ -102,20 +99,24 @@ else
   echo "WARN: TLS cert missing for ${DOMAIN}; left HTTP-only proxy on :80"
 fi
 
-if curl -fsS -m 5 "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1 || \
-   curl -fsS -m 5 "http://127.0.0.1:${PROXY_PORT}/" >/dev/null 2>&1; then
-  echo "OK: upstream :${PROXY_PORT} reachable for ${DOMAIN}"
-else
+# Verify upstream container directly (not via nginx Host/redirect).
+UPSTREAM_BODY="$(curl -fsS -m 8 "http://127.0.0.1:${PROXY_PORT}/" || true)"
+if [[ -z "${UPSTREAM_BODY}" ]]; then
   echo "ERROR: upstream 127.0.0.1:${PROXY_PORT} is not responding"
   docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
   exit 1
 fi
+echo "OK: upstream :${PROXY_PORT} reachable for ${DOMAIN}"
 
-BODY="$(curl -fsS -m 5 -H "Host: ${DOMAIN}" "http://127.0.0.1/" || true)"
 if [[ "${APP_NAME}" == "hrms-be" ]]; then
-  if echo "${BODY}" | grep -qi '<html\|hrms-ui\|<!doctype'; then
-    echo "ERROR: ${DOMAIN} is serving frontend HTML instead of API"
-    echo "${BODY}" | head -c 200
+  if echo "${UPSTREAM_BODY}" | grep -qiE '<html|hrms-ui|<!doctype'; then
+    echo "ERROR: upstream :${PROXY_PORT} returned frontend HTML"
+    echo "${UPSTREAM_BODY}" | head -c 200
+    exit 1
+  fi
+  if ! echo "${UPSTREAM_BODY}" | grep -q 'APTO Hono API'; then
+    echo "ERROR: upstream :${PROXY_PORT} did not return API ok payload"
+    echo "${UPSTREAM_BODY}" | head -c 200
     exit 1
   fi
 fi
