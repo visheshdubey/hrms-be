@@ -7,7 +7,7 @@
 import bcrypt from 'bcryptjs';
 import { eq } from 'drizzle-orm';
 import { db } from './index.js';
-import { organizations, users } from './schema.js';
+import { organizations, users, notifications } from './schema.js';
 
 const DEMO_PASSWORD = 'Demo@12345';
 
@@ -105,6 +105,44 @@ async function seedTestUsers() {
             isActive: 1,
           },
         });
+    }
+
+    /* Backfill a few bell notifications when the inbox is empty (existing DBs). */
+    for (const user of TEST_USERS) {
+      const [row] = await db.select({ id: users.id }).from(users).where(eq(users.email, user.email)).limit(1);
+      if (!row) continue;
+
+      const existing = await db
+        .select({ id: notifications.id })
+        .from(notifications)
+        .where(eq(notifications.userId, row.id))
+        .limit(1);
+
+      if (existing.length > 0) continue;
+
+      await db.insert(notifications).values([
+        {
+          userId: row.id,
+          title: 'Welcome to HRMS',
+          body: 'Your demo workspace is ready.',
+          type: 'info',
+          isRead: 0,
+        },
+        {
+          userId: row.id,
+          title: 'New application received',
+          body: 'A candidate was added to a job in your workspace.',
+          type: 'application',
+          isRead: 0,
+        },
+        {
+          userId: row.id,
+          title: 'Pipeline stage updated',
+          body: 'An application moved to the next hiring round.',
+          type: 'stage_change',
+          isRead: 0,
+        },
+      ]);
     }
 
     console.log('✅ Test portal logins ready (password for all: Demo@12345)\n');

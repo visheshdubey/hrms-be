@@ -441,12 +441,49 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
 
     const filtered = search
       ? enriched.filter((a) => {
-          const blob = `${a.name} ${a.website} ${a.typeLabel} ${a.city} ${a.country}`.toLowerCase();
+          const blob = `${a.id} ${a.name} ${a.email ?? ''} ${a.website ?? ''} ${a.typeLabel} ${a.city ?? ''} ${a.country ?? ''} ${a.ownerName ?? ''}`.toLowerCase();
           return blob.includes(search);
         })
       : enriched;
 
-    return c.json(paginateInMemory(filtered, page, pageSize));
+    const idFilter = c.req.query('id')?.trim() ?? '';
+    const idFiltered = idFilter
+      ? filtered.filter((a) => String(a.id).includes(idFilter))
+      : filtered;
+
+    const sortBy = c.req.query('sortBy')?.trim() || 'updatedAt';
+    const sortDir = c.req.query('sortDir') === 'asc' ? 'asc' : 'desc';
+    const sorted = [...idFiltered].sort((a, b) => {
+      const dir = sortDir === 'asc' ? 1 : -1;
+      switch (sortBy) {
+        case 'name':
+        case 'orgName':
+          return dir * String(a.name ?? '').localeCompare(String(b.name ?? ''), undefined, { sensitivity: 'base' });
+        case 'type':
+        case 'accountType':
+        case 'typeLabel':
+          return dir * String(a.typeLabel ?? a.type ?? '').localeCompare(String(b.typeLabel ?? b.type ?? ''), undefined, {
+            sensitivity: 'base',
+          });
+        case 'status':
+        case 'statusLabel':
+          return dir * String(a.statusLabel ?? a.status ?? '').localeCompare(String(b.statusLabel ?? b.status ?? ''), undefined, {
+            sensitivity: 'base',
+          });
+        case 'contractValue':
+          return dir * (Number(a.contractValue ?? 0) - Number(b.contractValue ?? 0));
+        case 'contactCount':
+        case 'employees':
+          return dir * (Number(a.contactCount ?? 0) - Number(b.contactCount ?? 0));
+        case 'id':
+          return dir * (Number(a.id) - Number(b.id));
+        case 'updatedAt':
+        default:
+          return dir * String(a.updatedAt ?? '').localeCompare(String(b.updatedAt ?? ''));
+      }
+    });
+
+    return c.json(paginateInMemory(sorted, page, pageSize));
   } catch {
     return c.json({ error: 'Failed to fetch accounts' }, 500);
   }

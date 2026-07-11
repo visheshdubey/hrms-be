@@ -13,6 +13,7 @@ import {
   candidateGroups,
   candidateGroupMembers,
   accountStageTemplates,
+  notifications,
   APP_STATUSES,
 } from './schema.js';
 import { copyAccountStageTemplatesToJob } from '../lib/stages.js';
@@ -308,6 +309,38 @@ async function seed() {
         groupId: group.id,
         candidateId: cand.id,
       }).onConflictDoNothing();
+    }
+
+    /* ── Demo notifications (header bell) ── */
+    const demoNotifications = [
+      {
+        title: 'Welcome to HRMS',
+        body: 'Your demo workspace is ready. Start with Jobs or Clients.',
+        type: 'info',
+      },
+      {
+        title: 'New application received',
+        body: 'A candidate was added to Senior Frontend Developer.',
+        type: 'application',
+      },
+      {
+        title: 'Pipeline stage updated',
+        body: 'An application moved to Technical round.',
+        type: 'stage_change',
+      },
+    ];
+
+    for (const member of insertedUsers) {
+      for (const [index, item] of demoNotifications.entries()) {
+        await db.insert(notifications).values({
+          userId: member.id,
+          title: item.title,
+          body: item.body,
+          type: item.type,
+          isRead: index === 0 ? 1 : 0,
+          relatedType: item.type === 'application' ? 'application' : '',
+        });
+      }
     }
 
     // Silence unused variable warning for draft job
