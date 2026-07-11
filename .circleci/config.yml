@@ -145,19 +145,19 @@ commands:
                         chmod +x deploy/nginx/apply-site.sh
                         # Always re-write our own SSL+proxy config (certbot --nginx was overwriting proxy_pass / stealing host)
                         ./deploy/nginx/apply-site.sh "${circle_project_reponame_var}" "${domain}" 3202
-                        # Public health must be API JSON/text — never the FE SPA
+                        # Public root must be API JSON — never the FE SPA
                         sleep 2
-                        body="$(curl -fsSk -m 15 "https://${domain}/health" || curl -fsS -m 15 "http://${domain}/health" || true)"
-                        echo "health body: ${body:0:200}"
+                        body="$(curl -fsSk -m 15 "https://${domain}/" || curl -fsS -m 15 "http://${domain}/" || true)"
+                        echo "api root body: ${body:0:200}"
                         if echo "${body}" | grep -qi '<html\|hrms-ui\|<!doctype'; then
-                          echo "ERROR: ${domain}/health is serving frontend HTML"
+                          echo "ERROR: ${domain}/ is serving frontend HTML"
                           exit 1
                         fi
-                        if [[ -z "${body}" ]]; then
-                          echo "ERROR: ${domain}/health returned empty body"
+                        if ! echo "${body}" | grep -qi 'APTO Hono API\|"status"\s*:\s*"ok"'; then
+                          echo "ERROR: ${domain}/ did not return API ok payload"
                           exit 1
                         fi
-                        echo "OK: ${domain}/health looks like API"
+                        echo "OK: ${domain}/ looks like API"
                       EOF
 
 jobs:
