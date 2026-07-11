@@ -64,10 +64,19 @@ export async function runCandidateBulkImport(input: {
   }
 
   const existingEmailSet = await getExistingEmailSet(input.userId, input.organizationId ?? null);
-  const toInsert = sanitized.filter(
-    (row) => !(row.email && existingEmailSet.has(row.email.toLowerCase())),
-  );
-  const skipped = sanitized.length - toInsert.length;
+  const seenInBatch = new Set<string>();
+  const toInsert: typeof sanitized = [];
+  let skipped = 0;
+
+  for (const row of sanitized) {
+    const emailKey = row.email ? row.email.toLowerCase() : '';
+    if (emailKey && (existingEmailSet.has(emailKey) || seenInBatch.has(emailKey))) {
+      skipped += 1;
+      continue;
+    }
+    if (emailKey) seenInBatch.add(emailKey);
+    toInsert.push(row);
+  }
 
   if (toInsert.length === 0) {
     return { created: 0, skipped, total: sanitized.length };

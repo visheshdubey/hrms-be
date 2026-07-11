@@ -81,13 +81,13 @@ candidatesRouter.get('/', requireAuth, requireRecruiter, async (c) => {
         .select()
         .from(candidates)
         .where(inArray(candidates.createdBy, memberIds))
-        .orderBy(desc(candidates.matchScore));
+        .orderBy(desc(candidates.createdAt), desc(candidates.id));
     } else {
       all = await db
         .select()
         .from(candidates)
         .where(eq(candidates.createdBy, userId))
-        .orderBy(desc(candidates.matchScore));
+        .orderBy(desc(candidates.createdAt), desc(candidates.id));
     }
 
     const parsed = all.map((c: any, i: number) => ({
