@@ -138,15 +138,26 @@ commands:
                       printf -v circle_project_reponame %q "${CIRCLE_PROJECT_REPONAME}"
                       printf -v app_domain %q "hrms-be.devcognito.tech"
                       ssh -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame $app_domain" \<< 'EOF'
+                        set -euo pipefail
                         circle_project_reponame_var=$1
                         domain=$2
                         cd /home/source/<< parameters.environment >>/$circle_project_reponame_var/
-                        sed "s/__DOMAIN__/${domain}/g" deploy/nginx/site.conf > /etc/nginx/sites-available/${circle_project_reponame_var}.conf
-                        ln -sf /etc/nginx/sites-available/${circle_project_reponame_var}.conf /etc/nginx/sites-enabled/${circle_project_reponame_var}.conf
-                        nginx -t
-                        systemctl reload nginx
-                        certbot --nginx -d ${domain} --non-interactive --agree-tos -m admin@devcognito.tech --redirect
-                        systemctl reload nginx
+                        chmod +x deploy/nginx/apply-site.sh
+                        # Always re-write our own SSL+proxy config (certbot --nginx was overwriting proxy_pass / stealing host)
+                        ./deploy/nginx/apply-site.sh "${circle_project_reponame_var}" "${domain}" 3202
+                        # Public health must be API JSON/text — never the FE SPA
+                        sleep 2
+                        body="$(curl -fsSk -m 15 "https://${domain}/health" || curl -fsS -m 15 "http://${domain}/health" || true)"
+                        echo "health body: ${body:0:200}"
+                        if echo "${body}" | grep -qi '<html\|hrms-ui\|<!doctype'; then
+                          echo "ERROR: ${domain}/health is serving frontend HTML"
+                          exit 1
+                        fi
+                        if [[ -z "${body}" ]]; then
+                          echo "ERROR: ${domain}/health returned empty body"
+                          exit 1
+                        fi
+                        echo "OK: ${domain}/health looks like API"
                       EOF
 
 jobs:
