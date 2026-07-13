@@ -281,6 +281,58 @@ accountsRouter.post('/:id/stage-templates', requireAuth, zValidator('json', stag
   }
 });
 
+/* PUT /accounts/:id/stage-templates/reorder — MUST be registered before /:stageId */
+accountsRouter.put('/:id/stage-templates/reorder', requireAuth, zValidator('json', reorderStageTemplatesSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const accountId = parseInt(c.req.param('id'));
+    if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
+    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
+
+    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
+
+    const { stageIds } = c.req.valid('json');
+    const existing = await db
+      .select({ id: accountStageTemplates.id })
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId));
+
+    if (existing.length === 0) {
+      return c.json({ error: 'No stage templates to reorder' }, 400);
+    }
+
+    if (stageIds.length !== existing.length) {
+      return c.json({ error: 'stageIds must include every template for this account' }, 400);
+    }
+
+    const existingIdSet = new Set(existing.map((row) => row.id));
+    if (!stageIds.every((id) => existingIdSet.has(id))) {
+      return c.json({ error: 'Invalid stageIds for this account' }, 400);
+    }
+
+    await Promise.all(
+      stageIds.map((stageId, orderIndex) =>
+        db.update(accountStageTemplates)
+          .set({ orderIndex })
+          .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId))),
+      ),
+    );
+
+    const templates = await db
+      .select()
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId))
+      .orderBy(accountStageTemplates.orderIndex);
+
+    return c.json({ data: templates });
+  } catch {
+    return c.json({ error: 'Failed to reorder stage templates' }, 500);
+  }
+});
+
 /* PUT /accounts/:id/stage-templates/:stageId */
 accountsRouter.put('/:id/stage-templates/:stageId', requireAuth, zValidator('json', stageTemplateSchema.partial()), async (c) => {
   try {
@@ -338,58 +390,6 @@ accountsRouter.delete('/:id/stage-templates/:stageId', requireAuth, async (c) =>
     return c.json({ ok: true });
   } catch {
     return c.json({ error: 'Failed to delete stage template' }, 500);
-  }
-});
-
-/* PUT /accounts/:id/stage-templates/reorder — batch reorder after drag-and-drop */
-accountsRouter.put('/:id/stage-templates/reorder', requireAuth, zValidator('json', reorderStageTemplatesSchema), async (c) => {
-  try {
-    const userId = c.get('userId') as number;
-    const orgId = c.get('organizationId') as number | null;
-    const role = c.get('userRole') as UserRole | null;
-    const accountId = parseInt(c.req.param('id'));
-    if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
-    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
-
-    const account = await getAccountIfAccessible(accountId, userId, orgId);
-    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
-
-    const { stageIds } = c.req.valid('json');
-    const existing = await db
-      .select({ id: accountStageTemplates.id })
-      .from(accountStageTemplates)
-      .where(eq(accountStageTemplates.accountId, accountId));
-
-    if (existing.length === 0) {
-      return c.json({ error: 'No stage templates to reorder' }, 400);
-    }
-
-    if (stageIds.length !== existing.length) {
-      return c.json({ error: 'stageIds must include every template for this account' }, 400);
-    }
-
-    const existingIdSet = new Set(existing.map((row) => row.id));
-    if (!stageIds.every((id) => existingIdSet.has(id))) {
-      return c.json({ error: 'Invalid stageIds for this account' }, 400);
-    }
-
-    await Promise.all(
-      stageIds.map((stageId, orderIndex) =>
-        db.update(accountStageTemplates)
-          .set({ orderIndex })
-          .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId))),
-      ),
-    );
-
-    const templates = await db
-      .select()
-      .from(accountStageTemplates)
-      .where(eq(accountStageTemplates.accountId, accountId))
-      .orderBy(accountStageTemplates.orderIndex);
-
-    return c.json({ data: templates });
-  } catch {
-    return c.json({ error: 'Failed to reorder stage templates' }, 500);
   }
 });
 
