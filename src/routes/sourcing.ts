@@ -28,6 +28,21 @@ const shortlistSchema = z.object({
   notes: z.string().optional(),
 });
 
+const importProfileSchema = z.object({
+  id: z.string().min(1),
+  source: z.enum(['internal', 'linkedin', 'github']),
+  name: z.string().min(1),
+  headline: z.string().optional().default(''),
+  location: z.string().optional().default(''),
+  skills: z.array(z.string()).optional().default([]),
+  externalUrl: z.string().nullable().optional(),
+  matchScore: z.number().optional(),
+});
+
+const importSchema = z.object({
+  profiles: z.array(importProfileSchema).min(1).max(50),
+});
+
 function resolveCandidateId(raw: number | string): number | null {
   if (typeof raw === 'number') return raw;
   const internal = /^internal-(\d+)$/.exec(raw);
@@ -69,6 +84,10 @@ const tokenGroup = z
 
 const internalSchema = z.object({
   q: z.string().optional(),
+  jobId: z.coerce.number().int().positive().optional(),
+  similarCandidateId: z.coerce.number().int().positive().optional(),
+  jobDescription: z.string().optional(),
+  platform: z.enum(['internal', 'linkedin', 'github']).default('internal'),
   location: z
     .object({
       mode: z.enum(['city', 'zip', 'country_state']).default('city'),
@@ -216,11 +235,52 @@ async function searchInternal(
 
   const filters: SQL[] = [inArray(candidates.createdBy, memberIds)];
 
+  let similarSkills: string[] = [];
+  if (p.similarCandidateId != null) {
+    const [seed] = await db
+      .select({ skills: candidates.skills, id: candidates.id })
+      .from(candidates)
+      .where(and(eq(candidates.id, p.similarCandidateId), inArray(candidates.createdBy, memberIds)))
+      .limit(1);
+    if (!seed) {
+      return envelope('internal', p, p.page, p.pageSize, 0, Date.now() - started, []);
+    }
+    try {
+      const parsed = JSON.parse(seed.skills || '[]') as unknown;
+      similarSkills = Array.isArray(parsed)
+        ? parsed.map((s) => String(s).trim()).filter(Boolean)
+        : String(seed.skills || '')
+            .split(/[,|;]/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+    } catch {
+      similarSkills = String(seed.skills || '')
+        .split(/[,|;]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+  }
+
+  if (p.jobId != null) {
+    const applied = await db
+      .select({ candidateId: applications.candidateId })
+      .from(applications)
+      .where(eq(applications.jobId, p.jobId));
+    const ids = applied.map((row) => row.candidateId).filter((id): id is number => id != null);
+    if (ids.length === 0) {
+      return envelope('internal', p, p.page, p.pageSize, 0, Date.now() - started, []);
+    }
+    filters.push(inArray(candidates.id, ids));
+  }
+
   const quickQuery = (p.q ?? '').trim();
+  const jobDescription = (p.jobDescription ?? '').trim();
   const includeTokens = [
     ...(quickQuery ? [quickQuery] : []),
+    ...(jobDescription ? [jobDescription] : []),
     ...(p.include?.keywords ?? []),
     ...(p.include?.skills ?? []),
+    ...similarSkills.slice(0, 8),
     ...(p.include?.jobTitles ?? []),
   ].filter(Boolean);
 
@@ -483,6 +543,111 @@ async function searchLinkedIn(
     },
   };
 }
+
+/**
+ * POST /sourcing/import
+ * Upsert sourced (GitHub / LinkedIn / internal) profiles into the ATS pool so they
+ * can be assigned to groups or jobs. Internal rows reuse existing candidate ids.
+ */
+sourcingRouter.post('/import', zValidator('json', importSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const memberIds = await getOrgMemberIdsFromContext(c);
+    const { profiles } = c.req.valid('json');
+    const imported: Array<{
+      sourcingId: string;
+      candidateId: number;
+      created: boolean;
+    }> = [];
+
+    for (const profile of profiles) {
+      if (profile.source === 'internal') {
+        const existingId = resolveCandidateId(profile.id);
+        if (existingId) {
+          imported.push({ sourcingId: profile.id, candidateId: existingId, created: false });
+          continue;
+        }
+      }
+
+      const externalUrl = (profile.externalUrl ?? '').trim();
+      let existing:
+        | { id: number }
+        | undefined;
+
+      if (profile.source === 'github' && externalUrl) {
+        const [row] = await db
+          .select({ id: candidates.id })
+          .from(candidates)
+          .where(
+            and(
+              inArray(candidates.createdBy, memberIds),
+              or(eq(candidates.github, externalUrl), eq(candidates.portfolio, externalUrl)),
+            ),
+          )
+          .limit(1);
+        existing = row;
+      } else if (profile.source === 'linkedin' && externalUrl) {
+        const [row] = await db
+          .select({ id: candidates.id })
+          .from(candidates)
+          .where(
+            and(inArray(candidates.createdBy, memberIds), eq(candidates.linkedin, externalUrl)),
+          )
+          .limit(1);
+        existing = row;
+      }
+
+      if (existing) {
+        imported.push({
+          sourcingId: profile.id,
+          candidateId: existing.id,
+          created: false,
+        });
+        continue;
+      }
+
+      const slug = profile.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || String(Date.now());
+      const email = `${profile.source}-${slug}@sourced.hrms.local`;
+      const [created] = await db
+        .insert(candidates)
+        .values({
+          name: profile.name,
+          email,
+          location: profile.location || '',
+          experience: profile.headline || '',
+          skills: JSON.stringify(profile.skills ?? []),
+          matchScore: profile.matchScore ?? 0,
+          status: 'New',
+          source: profile.source,
+          summary: profile.headline || '',
+          linkedin: profile.source === 'linkedin' ? externalUrl : '',
+          github: profile.source === 'github' ? externalUrl : '',
+          portfolio: externalUrl,
+          filename: `${profile.source}-import`,
+          certifications: '[]',
+          languages: '[]',
+          workHistory: '[]',
+          createdBy: userId,
+        })
+        .returning({ id: candidates.id });
+
+      imported.push({
+        sourcingId: profile.id,
+        candidateId: created.id,
+        created: true,
+      });
+    }
+
+    return c.json({
+      imported,
+      candidateIds: imported.map((row) => row.candidateId),
+      createdCount: imported.filter((row) => row.created).length,
+    }, 201);
+  } catch (err) {
+    console.error('[sourcing] import failed:', err);
+    return c.json({ error: 'Failed to import sourced candidates' }, 500);
+  }
+});
 
 /* ── POST /sourcing/shortlist ── */
 sourcingRouter.post('/shortlist', zValidator('json', shortlistSchema), async (c) => {
