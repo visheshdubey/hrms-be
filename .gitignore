@@ -33,3 +33,5 @@ lerna-debug.log*
 dist/
 *.db
 sqlite.db
+
+uploads/

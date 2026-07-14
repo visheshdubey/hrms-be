@@ -44,8 +44,16 @@ export const jobs = pgTable("jobs", {
   title: text("title").notNull(),
   department: text("department").notNull().default("General"),
   status: text("status", {
-    enum: ["new", "draft", "ready", "submission_in_progress", "closed"],
-  }).notNull().default("new"),
+    enum: [
+      "new",
+      "draft",
+      "ready",
+      "on_hold",
+      "submission_in_progress",
+      "complete",
+      "closed",
+    ],
+  }).notNull().default("draft"),
   type: text("type", { enum: ["Full-time", "Part-time", "Contract"] }).notNull().default("Full-time"),
   location: text("location", { enum: ["Remote", "On-site", "Hybrid"] }).notNull().default("Remote"),
   applicants: integer("applicants").notNull().default(0),

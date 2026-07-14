@@ -425,6 +425,7 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     const typeFilter = c.req.query('type');
     const statusFilter = c.req.query('status');
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
+    const idFilter = c.req.query('id')?.trim() ?? '';
     const { page, pageSize } = parsePagination(c.req.query());
 
     let rows = await listAccountsSafe(orgId, userId);
@@ -439,21 +440,20 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
 
     const enriched = await Promise.all(rows.map(enrichAccount));
 
-    const filtered = search
-      ? enriched.filter((a) => {
-          const blob = `${a.id} ${a.name} ${a.email ?? ''} ${a.website ?? ''} ${a.typeLabel} ${a.city ?? ''} ${a.country ?? ''} ${a.ownerName ?? ''}`.toLowerCase();
-          return blob.includes(search);
-        })
-      : enriched;
-
-    const idFilter = c.req.query('id')?.trim() ?? '';
-    const idFiltered = idFilter
-      ? filtered.filter((a) => String(a.id).includes(idFilter))
-      : filtered;
+    let filtered = enriched;
+    if (idFilter) {
+      filtered = filtered.filter((a) => String(a.id).includes(idFilter));
+    }
+    if (search) {
+      filtered = filtered.filter((a) => {
+        const blob = `${a.id} ${a.name} ${a.email ?? ''} ${a.website ?? ''} ${a.typeLabel} ${a.city ?? ''} ${a.country ?? ''} ${a.ownerName ?? ''}`.toLowerCase();
+        return blob.includes(search);
+      });
+    }
 
     const sortBy = c.req.query('sortBy')?.trim() || 'updatedAt';
     const sortDir = c.req.query('sortDir') === 'asc' ? 'asc' : 'desc';
-    const sorted = [...idFiltered].sort((a, b) => {
+    const sorted = [...filtered].sort((a, b) => {
       const dir = sortDir === 'asc' ? 1 : -1;
       switch (sortBy) {
         case 'name':

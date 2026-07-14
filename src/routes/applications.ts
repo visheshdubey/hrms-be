@@ -240,6 +240,7 @@ async function getApplicationIfAccessible(
 async function resolveRequiredAssignee(
   jobId: number,
   assignedTo?: number | null,
+  fallbackUserId?: number,
 ): Promise<number> {
   if (assignedTo != null && assignedTo > 0) return assignedTo;
 
@@ -254,6 +255,9 @@ async function resolveRequiredAssignee(
     // assigned_to may be missing until ensureProdSchema runs
   }
 
+  // Prefer job owner; otherwise the recruiter performing the assign so Search → job works E2E.
+  if (fallbackUserId != null && fallbackUserId > 0) return fallbackUserId;
+
   throw new Error('ASSIGNMENT_REQUIRED');
 }
 
@@ -265,7 +269,11 @@ async function createApplicationRecord(params: {
   assignedTo?: number | null;
   jobStageId?: number | null;
 }) {
-  const resolvedAssignee = await resolveRequiredAssignee(params.jobId, params.assignedTo);
+  const resolvedAssignee = await resolveRequiredAssignee(
+    params.jobId,
+    params.assignedTo,
+    params.userId,
+  );
   const defaults = await resolveNewApplicationDefaults(params.jobId);
 
   const created = await db.insert(applications).values({
@@ -404,9 +412,16 @@ applicationsRouter.post(
       const job = await getJobIfAccessible(jobId, userId, orgId);
       if (!job) return c.json({ error: 'Job not found' }, 404);
 
+      if (job.status !== 'submission_in_progress') {
+        return c.json(
+          { error: 'Only Active jobs accept applications. Set the job status to Active first.' },
+          400,
+        );
+      }
+
       let resolvedAssignee: number;
       try {
-        resolvedAssignee = await resolveRequiredAssignee(jobId, assignedTo);
+        resolvedAssignee = await resolveRequiredAssignee(jobId, assignedTo, userId);
       } catch {
         return c.json({ error: 'Assign a job owner or staff member before bulk assigning' }, 400);
       }
@@ -484,6 +499,13 @@ applicationsRouter.post(
 
       const job = await getJobIfAccessible(jobId, userId, orgId);
       if (!job) return c.json({ error: 'Job not found' }, 404);
+
+      if (job.status !== 'submission_in_progress') {
+        return c.json(
+          { error: 'Only Active jobs accept applications. Set the job status to Active first.' },
+          400,
+        );
+      }
 
       const dup = await db
         .select({ id: applications.id })
