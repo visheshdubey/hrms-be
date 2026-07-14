@@ -110,19 +110,20 @@ app.route('/api/hono/queue', queueRoutes);
 const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
 async function boot() {
+  // Bind HTTP immediately so deploy health checks (nginx / CircleCI) do not race
+  // against schema migrations on cold start.
+  console.log(`✅ Server is running on port ${port}`);
+  serve({ fetch: app.fetch, port });
+
   try {
     await ensureProdSchema();
   } catch (error) {
     console.error('[boot] ensureProdSchema failed (continuing):', error);
   }
 
-  console.log(`✅ Server is running on port ${port}`);
-
   if (QUEUE_CONFIG.enableWorker) {
     void startQueueWorker();
   }
-
-  serve({ fetch: app.fetch, port });
 }
 
 void boot();
