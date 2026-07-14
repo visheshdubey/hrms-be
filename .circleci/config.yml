@@ -117,9 +117,11 @@ commands:
                         docker compose -p "$compose_project" -f "$compose_file" down --remove-orphans || true
                         docker stop "$container_name" 2>/dev/null || true
                         docker rm -f "$container_name" 2>/dev/null || true
-                        # Wait for Docker to release the fixed container_name before recreate
+                        # Legacy fixed redis name from earlier compose revisions
+                        docker rm -f hrms-be-redis-prod 2>/dev/null || true
+                        # Wait for Docker to release fixed names before recreate
                         sleep 3
-                        docker rm -f "$container_name" 2>/dev/null || true
+                        docker rm -f "$container_name" hrms-be-redis-prod 2>/dev/null || true
 
                         docker compose -p "$compose_project" -f "$compose_file" up -d --build --force-recreate --remove-orphans
                       EOF
@@ -136,15 +138,33 @@ commands:
                       printf -v circle_project_reponame %q "${CIRCLE_PROJECT_REPONAME}"
                       printf -v app_domain %q "hrms-be.devcognito.tech"
                       ssh -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame $app_domain" \<< 'EOF'
+                        set -euo pipefail
                         circle_project_reponame_var=$1
                         domain=$2
                         cd /home/source/<< parameters.environment >>/$circle_project_reponame_var/
-                        sed "s/__DOMAIN__/${domain}/g" deploy/nginx/site.conf > /etc/nginx/sites-available/${circle_project_reponame_var}.conf
-                        ln -sf /etc/nginx/sites-available/${circle_project_reponame_var}.conf /etc/nginx/sites-enabled/${circle_project_reponame_var}.conf
-                        nginx -t
-                        systemctl reload nginx
-                        certbot --nginx -d ${domain} --non-interactive --agree-tos -m admin@devcognito.tech --redirect
-                        systemctl reload nginx
+                        # Strip Windows CRLF if present (breaks bash on Linux)
+                        sed -i 's/\r$//' deploy/nginx/apply-site.sh
+                        chmod +x deploy/nginx/apply-site.sh
+                        ./deploy/nginx/apply-site.sh "${circle_project_reponame_var}" "${domain}" 3202
+                        sleep 2
+                        # Prefer local upstream check (stable); public HTTPS is best-effort
+                        body="$(curl -fsS -m 10 "http://127.0.0.1:3202/" || true)"
+                        echo "upstream body: ${body:0:200}"
+                        if echo "${body}" | grep -qiE '<html|hrms-ui|<!doctype'; then
+                          echo "ERROR: API upstream serving frontend HTML"
+                          exit 1
+                        fi
+                        if ! echo "${body}" | grep -q 'APTO Hono API'; then
+                          echo "ERROR: API upstream missing ok payload"
+                          exit 1
+                        fi
+                        pub="$(curl -fsSk -m 15 "https://${domain}/" || true)"
+                        echo "public body: ${pub:0:200}"
+                        if echo "${pub}" | grep -qiE '<html|hrms-ui|<!doctype'; then
+                          echo "ERROR: public ${domain} serving frontend HTML"
+                          exit 1
+                        fi
+                        echo "OK: nginx + API checks passed"
                       EOF
 
 jobs:

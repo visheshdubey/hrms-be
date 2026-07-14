@@ -18,7 +18,7 @@ notificationsRouter.get('/', requireAuth, async (c) => {
       .orderBy(desc(notifications.createdAt))
       .limit(50);
 
-    const unreadCount = rows.filter((n: any) => !n.isRead).length;
+    const unreadCount = rows.filter((n) => Number(n.isRead) === 0).length;
     return c.json({ notifications: rows, unreadCount });
   } catch {
     return c.json({ error: 'Failed to fetch notifications' }, 500);

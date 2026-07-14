@@ -14,10 +14,14 @@ import {
 import { eq, desc, and } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
 import { canAccessJob } from '../lib/orgScope.js';
+import { selectJobById } from '../lib/jobQueries.js';
+import { isSchemaDriftError } from '../lib/schemaDrift.js';
 import {
   incrementJobApplicantCount,
   resolveNewApplicationDefaults,
+  backfillNullApplicationStages,
 } from '../lib/applicationDefaults.js';
+import { createNotification, createNotificationsForUsers } from '../lib/notifications.js';
 
 const applicationsRouter = new Hono<AppContext>({ strict: false });
 
@@ -94,24 +98,47 @@ async function enrichApplication(app: Record<string, unknown>) {
     .from(candidates)
     .where(eq(candidates.id, app.candidateId as number));
 
-  const [job] = await db
-    .select({ id: jobs.id, title: jobs.title, department: jobs.department, assignedTo: jobs.assignedTo })
-    .from(jobs)
-    .where(eq(jobs.id, app.jobId as number));
+  let job: { id: number; title: string; department: string; assignedTo: number | null } | null = null;
+  try {
+    const [row] = await db
+      .select({ id: jobs.id, title: jobs.title, department: jobs.department, assignedTo: jobs.assignedTo })
+      .from(jobs)
+      .where(eq(jobs.id, app.jobId as number));
+    job = row ?? null;
+  } catch {
+    const [row] = await db
+      .select({ id: jobs.id, title: jobs.title, department: jobs.department })
+      .from(jobs)
+      .where(eq(jobs.id, app.jobId as number));
+    job = row ? { ...row, assignedTo: null } : null;
+  }
 
   let jobStage: { id: number; name: string; color: string; orderIndex: number } | null = null;
   if (app.jobStageId != null) {
-    const [stage] = await db
-      .select({
-        id: jobStages.id,
-        name: jobStages.name,
-        color: jobStages.color,
-        orderIndex: jobStages.orderIndex,
-      })
-      .from(jobStages)
-      .where(eq(jobStages.id, app.jobStageId as number))
-      .limit(1);
-    jobStage = stage ?? null;
+    try {
+      const [stage] = await db
+        .select({
+          id: jobStages.id,
+          name: jobStages.name,
+          color: jobStages.color,
+          orderIndex: jobStages.orderIndex,
+        })
+        .from(jobStages)
+        .where(eq(jobStages.id, app.jobStageId as number))
+        .limit(1);
+      jobStage = stage ?? null;
+    } catch {
+      const [stage] = await db
+        .select({
+          id: jobStages.id,
+          name: jobStages.name,
+          orderIndex: jobStages.orderIndex,
+        })
+        .from(jobStages)
+        .where(eq(jobStages.id, app.jobStageId as number))
+        .limit(1);
+      jobStage = stage ? { ...stage, color: '#6366f1' } : null;
+    }
   }
 
   let assignedToName: string | null = null;
@@ -141,9 +168,42 @@ async function enrichApplication(app: Record<string, unknown>) {
 }
 
 async function getJobIfAccessible(jobId: number, userId: number, orgId: number | null) {
-  const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+  const [job] = await selectJobById(jobId);
   if (!job || !await canAccessJob(job, userId, orgId)) return null;
   return job;
+}
+
+async function selectApplicationsForJob(jobId: number) {
+  try {
+    return await db
+      .select()
+      .from(applications)
+      .where(eq(applications.jobId, jobId))
+      .orderBy(desc(applications.createdAt));
+  } catch (error) {
+    if (!isSchemaDriftError(error) && !String(error).toLowerCase().includes('failed query')) {
+      // still try legacy shape
+    }
+    const rows = await db
+      .select({
+        id: applications.id,
+        jobId: applications.jobId,
+        candidateId: applications.candidateId,
+        status: applications.status,
+        notes: applications.notes,
+        createdBy: applications.createdBy,
+        createdAt: applications.createdAt,
+        updatedAt: applications.updatedAt,
+      })
+      .from(applications)
+      .where(eq(applications.jobId, jobId))
+      .orderBy(desc(applications.createdAt));
+    return rows.map((row) => ({
+      ...row,
+      assignedTo: null as number | null,
+      jobStageId: null as number | null,
+    }));
+  }
 }
 
 async function getApplicationIfAccessible(
@@ -151,11 +211,30 @@ async function getApplicationIfAccessible(
   userId: number,
   orgId: number | null,
 ) {
-  const row = await db.select().from(applications).where(eq(applications.id, applicationId)).limit(1);
+  let row: Array<typeof applications.$inferSelect | Record<string, unknown>> = [];
+  try {
+    row = await db.select().from(applications).where(eq(applications.id, applicationId)).limit(1);
+  } catch {
+    const legacy = await db
+      .select({
+        id: applications.id,
+        jobId: applications.jobId,
+        candidateId: applications.candidateId,
+        status: applications.status,
+        notes: applications.notes,
+        createdBy: applications.createdBy,
+        createdAt: applications.createdAt,
+        updatedAt: applications.updatedAt,
+      })
+      .from(applications)
+      .where(eq(applications.id, applicationId))
+      .limit(1);
+    row = legacy.map((r) => ({ ...r, assignedTo: null, jobStageId: null }));
+  }
   if (row.length === 0) return null;
-  const job = await getJobIfAccessible(row[0].jobId, userId, orgId);
+  const job = await getJobIfAccessible(row[0].jobId as number, userId, orgId);
   if (!job) return null;
-  return row[0];
+  return row[0] as typeof applications.$inferSelect;
 }
 
 async function resolveRequiredAssignee(
@@ -165,13 +244,16 @@ async function resolveRequiredAssignee(
 ): Promise<number> {
   if (assignedTo != null && assignedTo > 0) return assignedTo;
 
-  const [job] = await db
-    .select({ assignedTo: jobs.assignedTo })
-    .from(jobs)
-    .where(eq(jobs.id, jobId))
-    .limit(1);
-
-  if (job?.assignedTo != null && job.assignedTo > 0) return job.assignedTo;
+  try {
+    const [job] = await db
+      .select({ assignedTo: jobs.assignedTo })
+      .from(jobs)
+      .where(eq(jobs.id, jobId))
+      .limit(1);
+    if (job?.assignedTo != null && job.assignedTo > 0) return job.assignedTo;
+  } catch {
+    // assigned_to may be missing until ensureProdSchema runs
+  }
 
   // Prefer job owner; otherwise the recruiter performing the assign so Search → job works E2E.
   if (fallbackUserId != null && fallbackUserId > 0) return fallbackUserId;
@@ -213,6 +295,31 @@ async function createApplicationRecord(params: {
   });
 
   await incrementJobApplicantCount(params.jobId, 1);
+
+  const [job] = await db
+    .select({ title: jobs.title, createdBy: jobs.createdBy })
+    .from(jobs)
+    .where(eq(jobs.id, params.jobId))
+    .limit(1);
+  const [candidate] = await db
+    .select({ name: candidates.name })
+    .from(candidates)
+    .where(eq(candidates.id, params.candidateId))
+    .limit(1);
+
+  const candidateName = candidate?.name?.trim() || `Candidate #${params.candidateId}`;
+  const jobTitle = job?.title?.trim() || `Job #${params.jobId}`;
+
+  await createNotificationsForUsers(
+    [resolvedAssignee, job?.createdBy, params.userId],
+    {
+      title: 'New application received',
+      body: `${candidateName} was added to ${jobTitle}.`,
+      type: 'application',
+      relatedId: created[0].id,
+      relatedType: 'application',
+    },
+  );
 
   return created[0];
 }
@@ -271,11 +378,9 @@ applicationsRouter.get('/', requireAuth, async (c) => {
     const job = await getJobIfAccessible(jid, userId, orgId);
     if (!job) return c.json({ error: 'Job not found' }, 404);
 
-    const all = await db
-      .select()
-      .from(applications)
-      .where(eq(applications.jobId, jid))
-      .orderBy(desc(applications.createdAt));
+    await backfillNullApplicationStages(jid);
+
+    const all = await selectApplicationsForJob(jid);
 
     const enriched = await Promise.all(all.map((r) => enrichApplication(r as Record<string, unknown>)));
     const filtered = filterEnrichedApplications(enriched, {
@@ -465,6 +570,31 @@ applicationsRouter.patch(
 
       await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
 
+      if (body.assignedTo != null && body.assignedTo !== row.assignedTo) {
+        await createNotification({
+          userId: body.assignedTo,
+          title: 'Application assigned to you',
+          body: `You were assigned application #${id}.`,
+          type: 'application',
+          relatedId: id,
+          relatedType: 'application',
+        });
+      }
+
+      if (body.jobStageId !== undefined && body.jobStageId !== row.jobStageId) {
+        const notifyUserId = (body.assignedTo ?? row.assignedTo) as number | null;
+        if (notifyUserId) {
+          await createNotification({
+            userId: notifyUserId,
+            title: 'Application stage updated',
+            body: `Application #${id} moved to a new pipeline stage.`,
+            type: 'stage_change',
+            relatedId: id,
+            relatedType: 'application',
+          });
+        }
+      }
+
       const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
       return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
     } catch {
@@ -511,6 +641,17 @@ applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSc
       note:          note ?? '',
       changedBy:     userId,
     });
+
+    if (row.assignedTo) {
+      await createNotification({
+        userId: row.assignedTo as number,
+        title: 'Application status changed',
+        body: `Application #${id}: ${currentStatus} → ${nextStatus}.`,
+        type: 'stage_change',
+        relatedId: id,
+        relatedType: 'application',
+      });
+    }
 
     const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
     return c.json(await enrichApplication(updated[0] as Record<string, unknown>));

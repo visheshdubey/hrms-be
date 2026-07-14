@@ -4,7 +4,7 @@ import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { candidates, jobs, users } from '../db/schema.js';
 import { eq, desc, inArray, and, or, ilike, notInArray } from 'drizzle-orm';
-import { requireAuth, type AppContext } from '../middleware.js';
+import { requireAuth, requireRecruiter, type AppContext } from '../middleware.js';
 import { canAccessByCreator } from '../lib/orgScope.js';
 import {
   runCandidateBulkImport,
@@ -62,7 +62,7 @@ const bulkCandidateSchema = z.object({
 });
 
 // GET /candidates — list all candidates visible to the authenticated user's organization
-candidatesRouter.get('/', requireAuth, async (c) => {
+candidatesRouter.get('/', requireAuth, requireRecruiter, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
@@ -81,13 +81,13 @@ candidatesRouter.get('/', requireAuth, async (c) => {
         .select()
         .from(candidates)
         .where(inArray(candidates.createdBy, memberIds))
-        .orderBy(desc(candidates.matchScore));
+        .orderBy(desc(candidates.createdAt), desc(candidates.id));
     } else {
       all = await db
         .select()
         .from(candidates)
         .where(eq(candidates.createdBy, userId))
-        .orderBy(desc(candidates.matchScore));
+        .orderBy(desc(candidates.createdAt), desc(candidates.id));
     }
 
     const parsed = all.map((c: any, i: number) => ({
@@ -105,7 +105,7 @@ candidatesRouter.get('/', requireAuth, async (c) => {
 });
 
 // POST /candidates — save a parsed candidate from ATS
-candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), async (c) => {
+candidatesRouter.post('/', requireAuth, requireRecruiter, zValidator('json', candidateSchema), async (c) => {
   try {
     const body = c.req.valid('json');
     const {
@@ -187,7 +187,7 @@ candidatesRouter.post('/', requireAuth, zValidator('json', candidateSchema), asy
 });
 
 // POST /candidates/bulk — bulk create from parsed CSV rows (queued when Redis available)
-candidatesRouter.post('/bulk', requireAuth, zValidator('json', bulkCandidateSchema), async (c) => {
+candidatesRouter.post('/bulk', requireAuth, requireRecruiter, zValidator('json', bulkCandidateSchema), async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
@@ -231,7 +231,7 @@ candidatesRouter.post('/bulk', requireAuth, zValidator('json', bulkCandidateSche
 });
 
 // GET /candidates/options — lightweight search for pickers (bulk assign, etc.)
-candidatesRouter.get('/options', requireAuth, async (c) => {
+candidatesRouter.get('/options', requireAuth, requireRecruiter, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
@@ -283,7 +283,7 @@ candidatesRouter.get('/options', requireAuth, async (c) => {
 });
 
 // GET /candidates/csv — download CSV report for the organization's candidates
-candidatesRouter.get('/csv', requireAuth, async (c) => {
+candidatesRouter.get('/csv', requireAuth, requireRecruiter, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
@@ -362,7 +362,7 @@ candidatesRouter.get('/csv', requireAuth, async (c) => {
 });
 
 // GET /candidates/:id — single candidate (must come after /csv)
-candidatesRouter.get('/:id', requireAuth, async (c) => {
+candidatesRouter.get('/:id', requireAuth, requireRecruiter, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
@@ -410,7 +410,7 @@ const updateSchema = z.object({
 });
 
 // PUT /candidates/:id — update profile fields
-candidatesRouter.put('/:id', requireAuth, zValidator('json', updateSchema), async (c) => {
+candidatesRouter.put('/:id', requireAuth, requireRecruiter, zValidator('json', updateSchema), async (c) => {
   try {
     const userId = c.get('userId') as number;
     const id = parseInt(c.req.param('id'));
@@ -462,7 +462,7 @@ candidatesRouter.put('/:id', requireAuth, zValidator('json', updateSchema), asyn
 });
 
 // DELETE /candidates/:id
-candidatesRouter.delete('/:id', requireAuth, async (c) => {
+candidatesRouter.delete('/:id', requireAuth, requireRecruiter, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;

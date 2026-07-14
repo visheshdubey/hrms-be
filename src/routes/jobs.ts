@@ -9,6 +9,7 @@ import { copyAccountStageTemplatesToJob, canWriteStageTemplates } from '../lib/s
 import { canAccessJob, getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
 import { defaultStageColor } from '../lib/stageColors.js';
 import { isSchemaDriftError } from '../lib/schemaDrift.js';
+import { backfillNullApplicationStages } from '../lib/applicationDefaults.js';
 
 const jobsRouter = new Hono<AppContext>({ strict: false });
 
@@ -102,6 +103,33 @@ async function selectAccountIdsSafe(orgId: number | null, userId: number): Promi
       .from(accounts)
       .where(inArray(accounts.createdBy, memberIds));
     return orgAccounts.map((account) => account.id);
+  }
+}
+
+async function selectJobStages(jobId: number) {
+  try {
+    return await db
+      .select()
+      .from(jobStages)
+      .where(eq(jobStages.jobId, jobId))
+      .orderBy(jobStages.orderIndex);
+  } catch {
+    const rows = await db
+      .select({
+        id: jobStages.id,
+        jobId: jobStages.jobId,
+        name: jobStages.name,
+        orderIndex: jobStages.orderIndex,
+        stageType: jobStages.stageType,
+        createdAt: jobStages.createdAt,
+      })
+      .from(jobStages)
+      .where(eq(jobStages.jobId, jobId))
+      .orderBy(jobStages.orderIndex);
+    return rows.map((row, index) => ({
+      ...row,
+      color: defaultStageColor(index),
+    }));
   }
 }
 
@@ -402,9 +430,7 @@ jobsRouter.get('/:jobId/stages', requireAuth, async (c) => {
     const job = await canAccessJobForStages({ jobId, userId, orgId });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
-    const stages = await db.select().from(jobStages)
-      .where(eq(jobStages.jobId, jobId))
-      .orderBy(jobStages.orderIndex);
+    const stages = await selectJobStages(jobId);
     return c.json({ data: stages });
   } catch {
     return c.json({ error: 'Failed to fetch job stages' }, 500);
@@ -593,16 +619,19 @@ jobsRouter.get('/:jobId/stage-stats', requireAuth, async (c) => {
     const job = await canAccessJobForStages({ jobId, userId, orgId });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
-    const stages = await db
-      .select()
-      .from(jobStages)
-      .where(eq(jobStages.jobId, jobId))
-      .orderBy(jobStages.orderIndex);
+    await backfillNullApplicationStages(jobId);
 
-    const apps = await db
-      .select({ jobStageId: applications.jobStageId })
-      .from(applications)
-      .where(eq(applications.jobId, jobId));
+    const stages = await selectJobStages(jobId);
+
+    let apps: Array<{ jobStageId: number | null }> = [];
+    try {
+      apps = await db
+        .select({ jobStageId: applications.jobStageId })
+        .from(applications)
+        .where(eq(applications.jobId, jobId));
+    } catch {
+      apps = [];
+    }
 
     const countByStage = new Map<number, number>();
     let unassigned = 0;
@@ -618,7 +647,7 @@ jobsRouter.get('/:jobId/stage-stats', requireAuth, async (c) => {
       stageId: stage.id,
       stageKey: `S${index + 1}`,
       name: stage.name,
-      color: stage.color,
+      color: stage.color ?? defaultStageColor(index),
       orderIndex: stage.orderIndex,
       count: countByStage.get(stage.id) ?? 0,
     }));

@@ -281,6 +281,58 @@ accountsRouter.post('/:id/stage-templates', requireAuth, zValidator('json', stag
   }
 });
 
+/* PUT /accounts/:id/stage-templates/reorder — MUST be registered before /:stageId */
+accountsRouter.put('/:id/stage-templates/reorder', requireAuth, zValidator('json', reorderStageTemplatesSchema), async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const accountId = parseInt(c.req.param('id'));
+    if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
+    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
+
+    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
+
+    const { stageIds } = c.req.valid('json');
+    const existing = await db
+      .select({ id: accountStageTemplates.id })
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId));
+
+    if (existing.length === 0) {
+      return c.json({ error: 'No stage templates to reorder' }, 400);
+    }
+
+    if (stageIds.length !== existing.length) {
+      return c.json({ error: 'stageIds must include every template for this account' }, 400);
+    }
+
+    const existingIdSet = new Set(existing.map((row) => row.id));
+    if (!stageIds.every((id) => existingIdSet.has(id))) {
+      return c.json({ error: 'Invalid stageIds for this account' }, 400);
+    }
+
+    await Promise.all(
+      stageIds.map((stageId, orderIndex) =>
+        db.update(accountStageTemplates)
+          .set({ orderIndex })
+          .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId))),
+      ),
+    );
+
+    const templates = await db
+      .select()
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId))
+      .orderBy(accountStageTemplates.orderIndex);
+
+    return c.json({ data: templates });
+  } catch {
+    return c.json({ error: 'Failed to reorder stage templates' }, 500);
+  }
+});
+
 /* PUT /accounts/:id/stage-templates/:stageId */
 accountsRouter.put('/:id/stage-templates/:stageId', requireAuth, zValidator('json', stageTemplateSchema.partial()), async (c) => {
   try {
@@ -341,58 +393,6 @@ accountsRouter.delete('/:id/stage-templates/:stageId', requireAuth, async (c) =>
   }
 });
 
-/* PUT /accounts/:id/stage-templates/reorder — batch reorder after drag-and-drop */
-accountsRouter.put('/:id/stage-templates/reorder', requireAuth, zValidator('json', reorderStageTemplatesSchema), async (c) => {
-  try {
-    const userId = c.get('userId') as number;
-    const orgId = c.get('organizationId') as number | null;
-    const role = c.get('userRole') as UserRole | null;
-    const accountId = parseInt(c.req.param('id'));
-    if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
-    if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
-
-    const account = await getAccountIfAccessible(accountId, userId, orgId);
-    if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
-
-    const { stageIds } = c.req.valid('json');
-    const existing = await db
-      .select({ id: accountStageTemplates.id })
-      .from(accountStageTemplates)
-      .where(eq(accountStageTemplates.accountId, accountId));
-
-    if (existing.length === 0) {
-      return c.json({ error: 'No stage templates to reorder' }, 400);
-    }
-
-    if (stageIds.length !== existing.length) {
-      return c.json({ error: 'stageIds must include every template for this account' }, 400);
-    }
-
-    const existingIdSet = new Set(existing.map((row) => row.id));
-    if (!stageIds.every((id) => existingIdSet.has(id))) {
-      return c.json({ error: 'Invalid stageIds for this account' }, 400);
-    }
-
-    await Promise.all(
-      stageIds.map((stageId, orderIndex) =>
-        db.update(accountStageTemplates)
-          .set({ orderIndex })
-          .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId))),
-      ),
-    );
-
-    const templates = await db
-      .select()
-      .from(accountStageTemplates)
-      .where(eq(accountStageTemplates.accountId, accountId))
-      .orderBy(accountStageTemplates.orderIndex);
-
-    return c.json({ data: templates });
-  } catch {
-    return c.json({ error: 'Failed to reorder stage templates' }, 500);
-  }
-});
-
 /* POST /accounts/:id/stage-templates/apply-to-jobs */
 accountsRouter.post('/:id/stage-templates/apply-to-jobs', requireAuth, async (c) => {
   try {
@@ -446,12 +446,44 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
     }
     if (search) {
       filtered = filtered.filter((a) => {
-        const blob = `${a.id} ${a.name} ${a.email ?? ''} ${a.website} ${a.typeLabel} ${a.city} ${a.country}`.toLowerCase();
+        const blob = `${a.id} ${a.name} ${a.email ?? ''} ${a.website ?? ''} ${a.typeLabel} ${a.city ?? ''} ${a.country ?? ''} ${a.ownerName ?? ''}`.toLowerCase();
         return blob.includes(search);
       });
     }
 
-    return c.json(paginateInMemory(filtered, page, pageSize));
+    const sortBy = c.req.query('sortBy')?.trim() || 'updatedAt';
+    const sortDir = c.req.query('sortDir') === 'asc' ? 'asc' : 'desc';
+    const sorted = [...filtered].sort((a, b) => {
+      const dir = sortDir === 'asc' ? 1 : -1;
+      switch (sortBy) {
+        case 'name':
+        case 'orgName':
+          return dir * String(a.name ?? '').localeCompare(String(b.name ?? ''), undefined, { sensitivity: 'base' });
+        case 'type':
+        case 'accountType':
+        case 'typeLabel':
+          return dir * String(a.typeLabel ?? a.type ?? '').localeCompare(String(b.typeLabel ?? b.type ?? ''), undefined, {
+            sensitivity: 'base',
+          });
+        case 'status':
+        case 'statusLabel':
+          return dir * String(a.statusLabel ?? a.status ?? '').localeCompare(String(b.statusLabel ?? b.status ?? ''), undefined, {
+            sensitivity: 'base',
+          });
+        case 'contractValue':
+          return dir * (Number(a.contractValue ?? 0) - Number(b.contractValue ?? 0));
+        case 'contactCount':
+        case 'employees':
+          return dir * (Number(a.contactCount ?? 0) - Number(b.contactCount ?? 0));
+        case 'id':
+          return dir * (Number(a.id) - Number(b.id));
+        case 'updatedAt':
+        default:
+          return dir * String(a.updatedAt ?? '').localeCompare(String(b.updatedAt ?? ''));
+      }
+    });
+
+    return c.json(paginateInMemory(sorted, page, pageSize));
   } catch {
     return c.json({ error: 'Failed to fetch accounts' }, 500);
   }
