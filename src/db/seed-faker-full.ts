@@ -12,7 +12,7 @@
  */
 import { faker } from '@faker-js/faker';
 import bcrypt from 'bcryptjs';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { db } from './index.js';
 import {
   APP_STATUSES,
@@ -276,7 +276,7 @@ async function seedFakerFull() {
       status: pick(JOB_STATUSES),
       type: pick(JOB_TYPES),
       location: pick(JOB_LOCATIONS),
-      applicants: faker.number.int({ min: 0, max: 40 }),
+      applicants: 0,
       description: faker.lorem.paragraphs({ min: 1, max: 2 }),
       accountId,
       payPackageMin: faker.number.float({ min: 8, max: 25, fractionDigits: 1 }),
@@ -368,6 +368,15 @@ async function seedFakerFull() {
       await db.insert(applicationTags).values({ applicationId: app.id, tagId }).onConflictDoNothing();
       await db.insert(candidateTags).values({ candidateId: pair.candidateId, tagId }).onConflictDoNothing();
     }
+  }
+
+  // Keep denormalized jobs.applicants in sync with real application rows
+  for (const jobId of jobIds) {
+    const [{ count }] = await db
+      .select({ count: sql<number>`cast(count(*) as int)` })
+      .from(applications)
+      .where(eq(applications.jobId, jobId));
+    await db.update(jobs).set({ applicants: Number(count) }).where(eq(jobs.id, jobId));
   }
 
   /* ── Integrations (exactly one row per platform) ── */

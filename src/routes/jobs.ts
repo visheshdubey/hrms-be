@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { eq, desc, inArray, and, or, isNull, type SQL } from 'drizzle-orm';
+import { eq, desc, inArray, and, or, isNull, sql, type SQL } from 'drizzle-orm';
 import { requireAuth, requireRole, ORG_ROLES, type AppContext, type UserRole } from '../middleware.js';
 import { jobs, jobStages, JOB_STAGE_TYPES, accounts, applications, users } from '../db/schema.js';
 import { copyAccountStageTemplatesToJob, canWriteStageTemplates, getAccountIfAccessible } from '../lib/stages.js';
@@ -200,6 +200,22 @@ async function canAccessJobForStages(params: { jobId: number; userId: number; or
   return job;
 }
 
+/** Prefer live application counts over denormalized `jobs.applicants` (seed can drift). */
+async function attachRealApplicantCounts<T extends { id: number }>(rows: T[]): Promise<(T & { applicants: number })[]> {
+  if (rows.length === 0) return [];
+  const ids = rows.map((r) => r.id);
+  const counts = await db
+    .select({
+      jobId: applications.jobId,
+      count: sql<number>`cast(count(*) as int)`,
+    })
+    .from(applications)
+    .where(inArray(applications.jobId, ids))
+    .groupBy(applications.jobId);
+  const map = new Map(counts.map((c) => [c.jobId, Number(c.count)]));
+  return rows.map((r) => ({ ...r, applicants: map.get(r.id) ?? 0 }));
+}
+
 // GET /jobs — list all jobs visible to the authenticated user's organization
 jobsRouter.get('/', requireAuth, async (c) => {
   try {
@@ -239,8 +255,9 @@ jobsRouter.get('/', requireAuth, async (c) => {
       }
     }
 
+    const withCounts = await attachRealApplicantCounts(all as { id: number }[]);
     const now = Date.now();
-    const result = all.map((j: any) => ({
+    const result = withCounts.map((j: any) => ({
       ...j,
       skills: j.description,
       postedDate: formatRelativeTime(j.postedDate, now),
@@ -278,8 +295,9 @@ jobsRouter.get('/:id', requireAuth, async (c) => {
       assignedToName = assignee?.name ?? null;
     }
 
+    const [withCount] = await attachRealApplicantCounts([j]);
     return c.json({
-      ...j,
+      ...withCount,
       skills: j.description,
       postedDate: formatRelativeTime(j.postedDate, Date.now()),
       allowedTransitions: TRANSITIONS[j.status as JobStatus] ?? [],

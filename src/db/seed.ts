@@ -1,5 +1,5 @@
 import bcrypt from 'bcryptjs';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { db } from './index.js';
 import {
   organizations,
@@ -133,7 +133,7 @@ async function seed() {
       status: 'submission_in_progress',
       type: 'Full-time',
       location: 'Remote',
-      applicants: 3,
+      applicants: 0,
       description: 'React, TypeScript, and modern UI architecture.',
       accountId: accountRows[0].id,
       createdBy: userId,
@@ -147,7 +147,7 @@ async function seed() {
       status: 'ready',
       type: 'Full-time',
       location: 'Hybrid',
-      applicants: 2,
+      applicants: 0,
       description: 'Node.js, Hono, and PostgreSQL experience required.',
       accountId: accountRows[1].id,
       createdBy: userId,
@@ -175,7 +175,7 @@ async function seed() {
       status: 'closed',
       type: 'Contract',
       location: 'Remote',
-      applicants: 1,
+      applicants: 0,
       description: 'Figma, design systems, and user research.',
       accountId: accountRows[3].id,
       createdBy: userId,
@@ -295,6 +295,15 @@ async function seed() {
           changedBy: userId,
         });
       }
+    }
+
+    // Sync denormalized applicants from real application rows
+    for (const job of [jobFrontend, jobBackend, jobPM, jobUX]) {
+      const [{ count }] = await db
+        .select({ count: sql<number>`cast(count(*) as int)` })
+        .from(applications)
+        .where(eq(applications.jobId, job.id));
+      await db.update(jobs).set({ applicants: Number(count) }).where(eq(jobs.id, job.id));
     }
 
     const [group] = await db.insert(candidateGroups).values({
