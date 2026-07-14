@@ -124,6 +124,26 @@ commands:
                         docker rm -f "$container_name" hrms-be-redis-prod 2>/dev/null || true
 
                         docker compose -p "$compose_project" -f "$compose_file" up -d --build --force-recreate --remove-orphans
+
+                        # Wait until API root responds (schema/boot can lag behind "Up").
+                        echo "Waiting for API on :3202..."
+                        ready=0
+                        for attempt in $(seq 1 45); do
+                          body="$(curl -fsS -m 5 "http://127.0.0.1:3202/" 2>/dev/null || true)"
+                          if echo "$body" | grep -q 'APTO Hono API'; then
+                            echo "OK: API ready on attempt ${attempt}"
+                            ready=1
+                            break
+                          fi
+                          echo "API not ready yet (attempt ${attempt}/45)..."
+                          sleep 2
+                        done
+                        if [ "$ready" -ne 1 ]; then
+                          echo "ERROR: API failed to become ready on :3202"
+                          docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
+                          docker logs --tail 120 "$container_name" 2>/dev/null || true
+                          exit 1
+                        fi
                       EOF
 
     update-nginx:
@@ -146,16 +166,27 @@ commands:
                         sed -i 's/\r$//' deploy/nginx/apply-site.sh
                         chmod +x deploy/nginx/apply-site.sh
                         ./deploy/nginx/apply-site.sh "${circle_project_reponame_var}" "${domain}" 3202
-                        sleep 2
-                        # Prefer local upstream check (stable); public HTTPS is best-effort
-                        body="$(curl -fsS -m 10 "http://127.0.0.1:3202/" || true)"
+
+                        # Re-check with retries (port can flap briefly after nginx reload).
+                        body=""
+                        for attempt in $(seq 1 20); do
+                          body="$(curl -fsS -m 10 "http://127.0.0.1:3202/" 2>/dev/null || true)"
+                          if echo "${body}" | grep -q 'APTO Hono API'; then
+                            break
+                          fi
+                          echo "Post-nginx API check retry ${attempt}/20..."
+                          sleep 2
+                        done
                         echo "upstream body: ${body:0:200}"
                         if echo "${body}" | grep -qiE '<html|hrms-ui|<!doctype'; then
                           echo "ERROR: API upstream serving frontend HTML"
+                          docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
                           exit 1
                         fi
                         if ! echo "${body}" | grep -q 'APTO Hono API'; then
                           echo "ERROR: API upstream missing ok payload"
+                          docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
+                          docker logs --tail 120 hrms-be-prod 2>/dev/null || true
                           exit 1
                         fi
                         pub="$(curl -fsSk -m 15 "https://${domain}/" || true)"

@@ -100,10 +100,25 @@ else
 fi
 
 # Verify upstream container directly (not via nginx Host/redirect).
-UPSTREAM_BODY="$(curl -fsS -m 8 "http://127.0.0.1:${PROXY_PORT}/" || true)"
+# Retry — container may still be booting right after compose recreate.
+UPSTREAM_BODY=""
+for attempt in $(seq 1 30); do
+  UPSTREAM_BODY="$(curl -fsS -m 5 "http://127.0.0.1:${PROXY_PORT}/" 2>/dev/null || true)"
+  if [[ "${APP_NAME}" == "hrms-be" ]]; then
+    if echo "${UPSTREAM_BODY}" | grep -q 'APTO Hono API'; then
+      break
+    fi
+  elif [[ -n "${UPSTREAM_BODY}" ]]; then
+    break
+  fi
+  echo "Waiting for upstream :${PROXY_PORT} (attempt ${attempt}/30)..."
+  sleep 2
+done
+
 if [[ -z "${UPSTREAM_BODY}" ]]; then
   echo "ERROR: upstream 127.0.0.1:${PROXY_PORT} is not responding"
   docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
+  docker logs --tail 80 hrms-be-prod 2>/dev/null || true
   exit 1
 fi
 echo "OK: upstream :${PROXY_PORT} reachable for ${DOMAIN}"
