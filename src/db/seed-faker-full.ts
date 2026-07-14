@@ -49,6 +49,14 @@ type AppStatus = (typeof APP_STATUSES)[number];
 
 const DEMO_PASSWORD = 'Demo@12345';
 
+const PLATFORM_DISPLAY_LABELS: Record<(typeof INTEGRATION_PLATFORMS)[number], string> = {
+  linkedin: 'LinkedIn',
+  github: 'GitHub',
+  google_cse: 'Google CSE',
+  proxycurl: 'Proxycurl',
+  custom: 'Custom',
+};
+
 const DEMO_USERS = [
   { name: 'Alex Recruiter', email: 'recruiter@demo.com', role: 'recruiter_admin' as const, portalType: 'recruiter' as const },
   { name: 'Sam Staff', email: 'staff@demo.com', role: 'recruited_staff' as const, portalType: 'recruiter' as const },
@@ -117,7 +125,6 @@ async function seedFakerFull() {
   const candidateCount = envInt('SEED_CANDIDATES', 120);
   const applicationCount = envInt('SEED_APPLICATIONS', 100);
   const tagCount = envInt('SEED_TAGS', 20);
-  const integrationCount = envInt('SEED_INTEGRATIONS', 6);
   const groupCount = envInt('SEED_GROUPS', 5);
   const extraTeamCount = envInt('SEED_TEAM_EXTRAS', 8);
 
@@ -363,13 +370,12 @@ async function seedFakerFull() {
     }
   }
 
-  /* ── Integrations ── */
-  for (let i = 0; i < integrationCount; i++) {
-    const platform = INTEGRATION_PLATFORMS[i % INTEGRATION_PLATFORMS.length];
+  /* ── Integrations (exactly one row per platform) ── */
+  for (const platform of INTEGRATION_PLATFORMS) {
     await db.insert(integrations).values({
       organizationId: orgId,
       platform,
-      label: `${platform} — ${faker.company.name()}`,
+      label: PLATFORM_DISPLAY_LABELS[platform],
       apiKey: `demo_${faker.string.alphanumeric(24)}`,
       configJson: JSON.stringify({ env: 'demo', region: faker.location.countryCode() }),
       isActive: 1,
@@ -549,7 +555,7 @@ async function seedFakerFull() {
   console.log(`   Candidates   : ${candidateIds.length}`);
   console.log(`   Applications : ${applicationIds.length}`);
   console.log(`   Tags         : ${tagIds.length}`);
-  console.log(`   Integrations : ${integrationCount}`);
+  console.log(`   Integrations : ${INTEGRATION_PLATFORMS.length} (one per platform)`);
   console.log(`   Groups       : ${groupCount}`);
   console.log('\n   Start: npm run dev  (backend) + npm run dev (frontend in hrms-fe)');
 }

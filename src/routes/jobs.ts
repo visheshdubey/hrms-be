@@ -3,9 +3,9 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { eq, desc, inArray, and, or, isNull, type SQL } from 'drizzle-orm';
-import { requireAuth, type AppContext, type UserRole } from '../middleware.js';
+import { requireAuth, requireRole, ORG_ROLES, type AppContext, type UserRole } from '../middleware.js';
 import { jobs, jobStages, JOB_STAGE_TYPES, accounts, applications, users } from '../db/schema.js';
-import { copyAccountStageTemplatesToJob, canWriteStageTemplates } from '../lib/stages.js';
+import { copyAccountStageTemplatesToJob, canWriteStageTemplates, getAccountIfAccessible } from '../lib/stages.js';
 import { canAccessJob, getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
 import { defaultStageColor } from '../lib/stageColors.js';
 import { isSchemaDriftError } from '../lib/schemaDrift.js';
@@ -290,12 +290,19 @@ jobsRouter.get('/:id', requireAuth, async (c) => {
   }
 });
 
-// POST /jobs — create (defaults to 'new')
-jobsRouter.post('/', requireAuth, zValidator('json', jobSchema), async (c) => {
+// POST /jobs — create (client / org portal only)
+jobsRouter.post('/', requireAuth, requireRole(...ORG_ROLES), zValidator('json', jobSchema), async (c) => {
   try {
     const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const body = c.req.valid('json');
     const { title, department, status, type, location, description } = body;
+
+    let accountId = body.accountId ?? null;
+    if (accountId != null) {
+      const account = await getAccountIfAccessible(accountId, userId, orgId);
+      if (!account) return c.json({ error: 'Client account not found or unauthorized' }, 403);
+    }
 
     const created = await db.insert(jobs).values({
       title,
@@ -304,7 +311,7 @@ jobsRouter.post('/', requireAuth, zValidator('json', jobSchema), async (c) => {
       type: type || 'Full-time',
       location: location || 'Remote',
       description: description || '',
-      accountId: body.accountId ?? null,
+      accountId,
       payPackageMin: body.payPackageMin ?? null,
       payPackageMax: body.payPackageMax ?? null,
       payCurrency: body.payCurrency ?? 'INR',
