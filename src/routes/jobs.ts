@@ -105,21 +105,40 @@ async function selectAccountIdsSafe(orgId: number | null, userId: number): Promi
   }
 }
 
-type JobStatus = 'new' | 'draft' | 'ready' | 'submission_in_progress' | 'closed';
+type JobStatus =
+  | "new"
+  | "draft"
+  | "ready"
+  | "on_hold"
+  | "submission_in_progress"
+  | "complete"
+  | "closed";
 
-/** Allowed forward/backward transitions per the Phase 2 lifecycle spec */
+const JOB_STATUS_VALUES = [
+  "new",
+  "draft",
+  "ready",
+  "on_hold",
+  "submission_in_progress",
+  "complete",
+  "closed",
+] as const;
+
+/** Allowed forward/backward transitions — Details edit can also set status via PUT. */
 const TRANSITIONS: Record<JobStatus, JobStatus[]> = {
-  new:                    ['draft'],
-  draft:                  ['ready'],
-  ready:                  ['draft', 'submission_in_progress'],
-  submission_in_progress: ['closed'],
-  closed:                 [],
+  new: ["draft", "on_hold"],
+  draft: ["on_hold", "submission_in_progress"],
+  ready: ["draft", "on_hold", "submission_in_progress"],
+  on_hold: ["draft", "submission_in_progress", "closed"],
+  submission_in_progress: ["on_hold", "complete", "closed"],
+  complete: ["closed"],
+  closed: [],
 };
 
 const jobSchema = z.object({
   title: z.string().min(1, "Title is required"),
   department: z.string().optional(),
-  status: z.enum(["new", "draft", "ready", "submission_in_progress", "closed"]).optional(),
+  status: z.enum(JOB_STATUS_VALUES).optional(),
   type: z.enum(["Full-time", "Part-time", "Contract"]).optional(),
   location: z.enum(["Remote", "On-site", "Hybrid"]).optional(),
   description: z.string().optional(),
@@ -142,7 +161,7 @@ const reorderStagesSchema = z.object({
 });
 
 const statusSchema = z.object({
-  status: z.enum(["new", "draft", "ready", "submission_in_progress", "closed"]),
+  status: z.enum(JOB_STATUS_VALUES),
 });
 
 async function canAccessJobForStages(params: { jobId: number; userId: number; orgId: number | null }) {
@@ -253,7 +272,7 @@ jobsRouter.post('/', requireAuth, zValidator('json', jobSchema), async (c) => {
     const created = await db.insert(jobs).values({
       title,
       department: department || 'General',
-      status: status || 'new',
+      status: status || 'draft',
       type: type || 'Full-time',
       location: location || 'Remote',
       description: description || '',
@@ -551,8 +570,13 @@ jobsRouter.delete('/:jobId/stages/:stageId', requireAuth, async (c) => {
     const job = await canAccessJobForStages({ jobId, userId, orgId });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
+    const appsOnStage = await db
+      .select({ id: applications.id })
+      .from(applications)
+      .where(and(eq(applications.jobId, jobId), eq(applications.jobStageId, stageId)));
+
     await db.delete(jobStages).where(and(eq(jobStages.id, stageId), eq(jobStages.jobId, jobId)));
-    return c.json({ ok: true });
+    return c.json({ ok: true, applicationsUnassigned: appsOnStage.length });
   } catch {
     return c.json({ error: 'Failed to delete job stage' }, 500);
   }
