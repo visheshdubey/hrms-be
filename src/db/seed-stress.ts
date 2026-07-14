@@ -117,7 +117,7 @@ async function seedStress() {
       status: faker.helpers.arrayElement(JOB_STATUSES),
       type: faker.helpers.arrayElement(JOB_TYPES),
       location: faker.helpers.arrayElement(JOB_LOCATIONS),
-      applicants: faker.number.int({ min: 0, max: 120 }),
+      applicants: 0,
       description: faker.lorem.paragraphs(2),
       accountId: faker.helpers.arrayElement(accountIds),
       createdBy: userId,

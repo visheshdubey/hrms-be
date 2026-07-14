@@ -163,15 +163,8 @@ candidatesRouter.post('/', requireAuth, requireRecruiter, zValidator('json', can
       createdBy: c.get('userId') as number,
     }).returning();
 
-    // Increment applicant count for the job
-    if (resolvedJobId) {
-      const job = await db.select().from(jobs).where(eq(jobs.id, resolvedJobId));
-      if (job.length > 0) {
-        await db.update(jobs)
-          .set({ applicants: job[0].applicants + 1 })
-          .where(eq(jobs.id, resolvedJobId));
-      }
-    }
+    // Note: linking a candidate to a jobId does NOT create an application.
+    // jobs.applicants is updated only when an application row is created/deleted.
 
     return c.json({
       ...created[0],
