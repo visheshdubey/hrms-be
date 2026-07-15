@@ -508,7 +508,7 @@ jobsRouter.post('/:jobId/stages', requireAuth, zValidator('json', stageSchema), 
       jobId,
       name: b.name,
       orderIndex,
-      stageType: b.stageType ?? 'application',
+      stageType: b.stageType ?? 'initial',
       color: b.color ?? defaultStageColor(orderIndex),
     }).returning();
 
@@ -588,12 +588,20 @@ jobsRouter.put('/:jobId/stages/:stageId', requireAuth, zValidator('json', stageS
     const job = await canAccessJobForStages({ jobId, userId, orgId });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
+    const [existing] = await db.select().from(jobStages)
+      .where(and(eq(jobStages.id, stageId), eq(jobStages.jobId, jobId))).limit(1);
+    if (!existing) return c.json({ error: 'Stage not found' }, 404);
+
+    const LOCKED_TYPES = new Set(['initial', 'hired', 'rejected']);
+    const isLocked = LOCKED_TYPES.has(existing.stageType);
+
     const b = c.req.valid('json');
     const patch: Record<string, unknown> = {};
     if (b.name !== undefined) patch.name = b.name;
     if (b.orderIndex !== undefined) patch.orderIndex = b.orderIndex;
-    if (b.stageType !== undefined) patch.stageType = b.stageType;
     if (b.color !== undefined) patch.color = b.color;
+    // Locked stages (Start, Hired, Rejected) cannot have their type changed
+    if (b.stageType !== undefined && !isLocked) patch.stageType = b.stageType;
 
     const [updated] = await db.update(jobStages).set(patch as typeof jobStages.$inferInsert)
       .where(and(eq(jobStages.id, stageId), eq(jobStages.jobId, jobId)))
@@ -620,6 +628,15 @@ jobsRouter.delete('/:jobId/stages/:stageId', requireAuth, async (c) => {
 
     const job = await canAccessJobForStages({ jobId, userId, orgId });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
+
+    const [stage] = await db.select().from(jobStages)
+      .where(and(eq(jobStages.id, stageId), eq(jobStages.jobId, jobId))).limit(1);
+    if (!stage) return c.json({ error: 'Stage not found' }, 404);
+
+    const LOCKED_TYPES = new Set(['initial', 'hired', 'rejected']);
+    if (LOCKED_TYPES.has(stage.stageType)) {
+      return c.json({ error: 'Default stages (Start, Hired, Rejected) cannot be deleted' }, 403);
+    }
 
     const appsOnStage = await db
       .select({ id: applications.id })

@@ -30,11 +30,11 @@ const STATEMENTS = [
 
   // job stages color (Stages tab)
   `ALTER TABLE job_stages ADD COLUMN IF NOT EXISTS color text NOT NULL DEFAULT '#6366f1'`,
-  `ALTER TABLE job_stages ADD COLUMN IF NOT EXISTS stage_type text NOT NULL DEFAULT 'application'`,
+  `ALTER TABLE job_stages ADD COLUMN IF NOT EXISTS stage_type text NOT NULL DEFAULT 'initial'`,
 
   // account stage templates color
   `ALTER TABLE account_stage_templates ADD COLUMN IF NOT EXISTS color text NOT NULL DEFAULT '#6366f1'`,
-  `ALTER TABLE account_stage_templates ADD COLUMN IF NOT EXISTS stage_type text NOT NULL DEFAULT 'application'`,
+  `ALTER TABLE account_stage_templates ADD COLUMN IF NOT EXISTS stage_type text NOT NULL DEFAULT 'initial'`,
 
   // ensure job_stages table exists for older DBs
   `CREATE TABLE IF NOT EXISTS job_stages (
@@ -42,7 +42,7 @@ const STATEMENTS = [
     job_id integer NOT NULL,
     name text NOT NULL,
     order_index integer NOT NULL DEFAULT 0,
-    stage_type text NOT NULL DEFAULT 'application',
+    stage_type text NOT NULL DEFAULT 'initial',
     color text NOT NULL DEFAULT '#6366f1',
     created_at text NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -52,7 +52,7 @@ const STATEMENTS = [
     account_id integer NOT NULL,
     name text NOT NULL,
     order_index integer NOT NULL DEFAULT 0,
-    stage_type text NOT NULL DEFAULT 'application',
+    stage_type text NOT NULL DEFAULT 'initial',
     color text NOT NULL DEFAULT '#6366f1',
     created_at text NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
