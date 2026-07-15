@@ -1,8 +1,10 @@
 import { Hono } from 'hono';
 import { db } from '../db/index.js';
-import { jobs, candidates, users, applications, interviews, APP_STATUSES } from '../db/schema.js';
-import { eq, desc, and, sql, gte, inArray } from 'drizzle-orm';
+import { accounts, jobs, candidates, users, applications, interviews, APP_STATUSES } from '../db/schema.js';
+import { eq, desc, and, or, sql, gte, inArray } from 'drizzle-orm';
 import { requireAuth, type AppContext } from '../middleware.js';
+import { getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
+import { isSchemaDriftError } from '../lib/schemaDrift.js';
 
 const dashboardRouter = new Hono<AppContext>({ strict: false });
 
@@ -36,6 +38,12 @@ function periodToSince(period: string | undefined): string | null {
 /**
  * Decide how many buckets to show and the SQLite strftime format for the period.
  */
+function myJobsWhere(orgId: number | null, userId: number, memberIds: number[]) {
+  const personalScope = or(eq(jobs.assignedTo, userId), eq(jobs.createdBy, userId))!;
+  if (orgId == null) return personalScope;
+  return and(personalScope, inArray(jobs.createdBy, memberIds))!;
+}
+
 function chartConfig(period: string | undefined): {
   fmt: string; count: number; labelFn: (d: Date) => string;
 } {
@@ -61,24 +69,85 @@ dashboardRouter.get('/', requireAuth, async (c) => {
     const period = c.req.query('period');
     const since  = periodToSince(period);
 
-    let memberIds: number[] = [userId];
-    if (orgId != null) {
-      const orgMembers = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-      memberIds = orgMembers.map((u: { id: number }) => u.id);
-    }
+    const memberIds = await getOrgMemberIds(orgId, userId);
 
     const appWhere = memberIds.length === 1
       ? (since ? and(eq(applications.createdBy, userId), gte(applications.createdAt, since)) : eq(applications.createdBy, userId))
       : (since ? and(inArray(applications.createdBy, memberIds), gte(applications.createdAt, since)) : inArray(applications.createdBy, memberIds));
 
     const allApplications = await db.select().from(applications).where(appWhere);
-    const totalCandidates = allApplications.length;
+    const totalApplications = allApplications.length;
 
     const jobsWhere = memberIds.length === 1
       ? and(eq(jobs.status, 'submission_in_progress'), eq(jobs.createdBy, userId))
       : and(eq(jobs.status, 'submission_in_progress'), inArray(jobs.createdBy, memberIds));
     const activeJobsQuery = await db.select().from(jobs).where(jobsWhere);
     const activeJobs = activeJobsQuery.length;
+
+    const candidateWhere = memberIds.length === 1
+      ? eq(candidates.createdBy, userId)
+      : inArray(candidates.createdBy, memberIds);
+    const candidateCountRows = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(candidates)
+      .where(candidateWhere);
+    const totalCandidates = Number(candidateCountRows[0]?.count ?? 0);
+
+    let totalClients = 0;
+    try {
+      const clientCountRows = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(accounts)
+        .where(orgOrCreatorScope(orgId, userId, accounts, accounts));
+      totalClients = Number(clientCountRows[0]?.count ?? 0);
+    } catch (error) {
+      if (!isSchemaDriftError(error)) throw error;
+      const clientCountRows = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(accounts)
+        .where(inArray(accounts.createdBy, memberIds));
+      totalClients = Number(clientCountRows[0]?.count ?? 0);
+    }
+
+    const totalUsers = memberIds.length;
+
+    const myJobsRaw = await db
+      .select({
+        id: jobs.id,
+        title: jobs.title,
+        department: jobs.department,
+        location: jobs.location,
+        status: jobs.status,
+        applicants: jobs.applicants,
+        accountId: jobs.accountId,
+      })
+      .from(jobs)
+      .where(myJobsWhere(orgId, userId, memberIds))
+      .orderBy(desc(jobs.id))
+      .limit(10);
+
+    const accountIdsForJobs = [
+      ...new Set(myJobsRaw.map((row) => row.accountId).filter((id): id is number => id != null)),
+    ];
+    const accountNameMap = new Map<number, string>();
+    if (accountIdsForJobs.length > 0) {
+      const accountRows = await db
+        .select({ id: accounts.id, name: accounts.name })
+        .from(accounts)
+        .where(inArray(accounts.id, accountIdsForJobs));
+      accountRows.forEach((row) => accountNameMap.set(row.id, row.name));
+    }
+
+    const myJobs = myJobsRaw.map((row) => ({
+      id: row.id,
+      title: row.title,
+      department: row.department ?? 'General',
+      location: row.location ?? 'Remote',
+      status: row.status,
+      applicants: row.applicants ?? 0,
+      accountId: row.accountId,
+      accountName: row.accountId != null ? (accountNameMap.get(row.accountId) ?? '') : '',
+    }));
 
     const recentActivity = await db
       .select({
@@ -91,9 +160,11 @@ dashboardRouter.get('/', requireAuth, async (c) => {
         name: candidates.name,
         filename: candidates.filename,
         matchScore: candidates.matchScore,
+        jobTitle: jobs.title,
       })
       .from(applications)
       .innerJoin(candidates, eq(applications.candidateId, candidates.id))
+      .leftJoin(jobs, eq(applications.jobId, jobs.id))
       .where(appWhere)
       .orderBy(desc(applications.createdAt))
       .limit(10);
@@ -168,7 +239,16 @@ dashboardRouter.get('/', requireAuth, async (c) => {
     const scheduledInterviews = await db.select().from(interviews).where(interviewWhere);
 
     return c.json({
-      totalCandidates,
+      stats: {
+        totalClients,
+        totalCandidates,
+        totalApplications,
+        activeJobs,
+        totalUsers,
+      },
+      myJobs,
+      recentApplications: recentActivity,
+      totalCandidates: totalApplications,
       activeJobs,
       interviewsScheduled: scheduledInterviews.length,
       recentActivity,
