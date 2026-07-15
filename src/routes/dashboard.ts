@@ -1,8 +1,10 @@
 import { Hono } from 'hono';
 import { db } from '../db/index.js';
-import { jobs, candidates, users, applications, accounts } from '../db/schema.js';
+import { accounts, jobs, candidates, users, applications } from '../db/schema.js';
 import { eq, desc, and, or, sql, inArray } from 'drizzle-orm';
 import { requireAuth, type AppContext } from '../middleware.js';
+import { getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
+import { isSchemaDriftError } from '../lib/schemaDrift.js';
 
 const dashboardRouter = new Hono<AppContext>({ strict: false });
 
@@ -11,34 +13,45 @@ dashboardRouter.get('/', requireAuth, async (c) => {
     const userId = c.get('userId') as number;
     const orgId  = c.get('organizationId') as number | null;
 
-    let memberIds: number[] = [userId];
-    if (orgId != null) {
-      const orgMembers = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-      memberIds = orgMembers.map((u) => u.id);
-    }
+    const memberIds = await getOrgMemberIds(orgId, userId);
 
     // --- Stats ---
 
-    const totalClients = orgId != null
-      ? (await db.select({ cnt: sql<number>`count(*)` }).from(accounts).where(eq(accounts.organizationId, orgId)))[0]?.cnt ?? 0
-      : 0;
+    let totalClients = 0;
+    try {
+      const clientCountRows = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(accounts)
+        .where(orgOrCreatorScope(orgId, userId, accounts, accounts));
+      totalClients = Number(clientCountRows[0]?.count ?? 0);
+    } catch (error) {
+      if (!isSchemaDriftError(error)) throw error;
+      const clientCountRows = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(accounts)
+        .where(inArray(accounts.createdBy, memberIds));
+      totalClients = Number(clientCountRows[0]?.count ?? 0);
+    }
 
-    const totalCandidates = memberIds.length === 1
-      ? (await db.select({ cnt: sql<number>`count(*)` }).from(candidates).where(eq(candidates.createdBy, userId)))[0]?.cnt ?? 0
-      : (await db.select({ cnt: sql<number>`count(*)` }).from(candidates).where(inArray(candidates.createdBy, memberIds)))[0]?.cnt ?? 0;
+    const candidateWhere = memberIds.length === 1
+      ? eq(candidates.createdBy, userId)
+      : inArray(candidates.createdBy, memberIds);
+    const totalCandidates = Number(
+      (await db.select({ cnt: sql<number>`count(*)` }).from(candidates).where(candidateWhere))[0]?.cnt ?? 0,
+    );
 
     const totalApplications = memberIds.length === 1
-      ? (await db.select({ cnt: sql<number>`count(*)` }).from(applications).where(eq(applications.createdBy, userId)))[0]?.cnt ?? 0
-      : (await db.select({ cnt: sql<number>`count(*)` }).from(applications).where(inArray(applications.createdBy, memberIds)))[0]?.cnt ?? 0;
+      ? Number((await db.select({ cnt: sql<number>`count(*)` }).from(applications).where(eq(applications.createdBy, userId)))[0]?.cnt ?? 0)
+      : Number((await db.select({ cnt: sql<number>`count(*)` }).from(applications).where(inArray(applications.createdBy, memberIds)))[0]?.cnt ?? 0);
 
     const activeJobsWhere = memberIds.length === 1
       ? and(eq(jobs.status, 'submission_in_progress'), eq(jobs.createdBy, userId))
       : and(eq(jobs.status, 'submission_in_progress'), inArray(jobs.createdBy, memberIds));
-    const activeJobs = (await db.select({ cnt: sql<number>`count(*)` }).from(jobs).where(activeJobsWhere))[0]?.cnt ?? 0;
+    const activeJobs = Number(
+      (await db.select({ cnt: sql<number>`count(*)` }).from(jobs).where(activeJobsWhere))[0]?.cnt ?? 0,
+    );
 
-    const totalUsers = orgId != null
-      ? (await db.select({ cnt: sql<number>`count(*)` }).from(users).where(and(eq(users.organizationId, orgId), eq(users.isActive, 1))))[0]?.cnt ?? 0
-      : 1;
+    const totalUsers = memberIds.length;
 
     // --- My Jobs (assigned to or created by current user) ---
 
@@ -62,8 +75,8 @@ dashboardRouter.get('/', requireAuth, async (c) => {
     const myJobs = myJobsRows.map((row) => ({
       id: row.id,
       title: row.title,
-      department: row.department,
-      location: row.location,
+      department: row.department ?? 'General',
+      location: row.location ?? 'Remote',
       status: row.status,
       applicants: row.applicants ?? 0,
       accountId: row.accountId ?? null,
@@ -110,11 +123,11 @@ dashboardRouter.get('/', requireAuth, async (c) => {
 
     return c.json({
       stats: {
-        totalClients: Number(totalClients),
-        totalCandidates: Number(totalCandidates),
-        totalApplications: Number(totalApplications),
-        activeJobs: Number(activeJobs),
-        totalUsers: Number(totalUsers),
+        totalClients,
+        totalCandidates,
+        totalApplications,
+        activeJobs,
+        totalUsers,
       },
       myJobs,
       recentApplications,
