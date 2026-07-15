@@ -271,7 +271,7 @@ accountsRouter.post('/:id/stage-templates', requireAuth, zValidator('json', stag
       accountId,
       name: body.name,
       orderIndex,
-      stageType: body.stageType ?? 'application',
+      stageType: body.stageType ?? 'initial',
       color: body.color ?? defaultStageColor(orderIndex),
     }).returning();
 

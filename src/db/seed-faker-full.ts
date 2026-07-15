@@ -65,12 +65,12 @@ const DEMO_USERS = [
 ];
 
 const DEFAULT_CLIENT_STAGES = [
-  { name: 'Candidate applies', orderIndex: 0, stageType: 'application' as const },
-  { name: 'Email notification', orderIndex: 1, stageType: 'application' as const },
-  { name: 'Technical round', orderIndex: 2, stageType: 'interview' as const },
-  { name: 'Management round', orderIndex: 3, stageType: 'interview' as const },
-  { name: 'Offer letter', orderIndex: 4, stageType: 'application' as const },
-  { name: 'Job closed', orderIndex: 5, stageType: 'application' as const },
+  { name: 'Start', orderIndex: 0, stageType: 'initial' as const },
+  { name: 'Screening', orderIndex: 1, stageType: 'in_transit' as const },
+  { name: 'Technical Interview', orderIndex: 2, stageType: 'in_transit' as const },
+  { name: 'Final Interview', orderIndex: 3, stageType: 'in_transit' as const },
+  { name: 'Hired', orderIndex: 4, stageType: 'hired' as const },
+  { name: 'Rejected', orderIndex: 5, stageType: 'rejected' as const },
 ];
 
 const TAG_COLORS = ['#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#3b82f6', '#ef4444', '#14b8a6'];
