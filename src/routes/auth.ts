@@ -235,7 +235,26 @@ auth.put('/organization', zValidator('json', orgUpdateSchema), async (c) => {
     const patch: Record<string, unknown> = {};
     if (body.name != null) patch.name = body.name;
     if (body.logo != null) patch.logo = body.logo;
-    if (body.defaults != null) patch.defaults = JSON.stringify(body.defaults);
+    if (body.defaults != null) {
+      // Merge so partial workspace saves (e.g. logos only) do not wipe other defaults.
+      let existingDefaults: Record<string, unknown> = {};
+      const [currentOrg] = await db
+        .select({ defaults: organizations.defaults })
+        .from(organizations)
+        .where(eq(organizations.id, user[0].organizationId))
+        .limit(1);
+      try {
+        existingDefaults = JSON.parse(currentOrg?.defaults || '{}');
+      } catch {
+        /* ignore */
+      }
+      const merged: Record<string, unknown> = { ...existingDefaults };
+      for (const [key, value] of Object.entries(body.defaults)) {
+        if (value === undefined) continue;
+        merged[key] = value;
+      }
+      patch.defaults = JSON.stringify(merged);
+    }
 
     const [updated] = await db.update(organizations).set(patch as any)
       .where(eq(organizations.id, user[0].organizationId)).returning();

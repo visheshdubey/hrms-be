@@ -149,8 +149,8 @@ uploadsRouter.post('/logos', requireAuth, async (c) => {
     if (!file || !(file instanceof File)) {
       return c.json({ error: 'Logo file is required' }, 400);
     }
-    const { url } = await handleUpload(file, 'logos', LOGO_MIME, LOGO_MAX_BYTES);
-    return c.json({ url });
+    const { url, storagePath } = await handleUpload(file, 'logos', LOGO_MIME, LOGO_MAX_BYTES);
+    return c.json({ url, ...(storagePath ? { storagePath } : {}) });
   } catch (error: any) {
     if (error?.status === 400) return c.json({ error: error.message }, 400);
     console.error('Logo upload failed:', error);
@@ -206,34 +206,47 @@ uploadsRouter.delete('/file', requireAuth, async (c) => {
   }
 });
 
-// GET /uploads/images/:filename — serve locally stored images (fallback when CDN is off)
-uploadsRouter.get('/images/:filename', async (c) => {
+const LOCAL_FOLDERS = new Set(['images', 'logos', 'avatars', 'resumes', 'documents']);
+
+function contentTypeForExt(ext: string): string {
+  switch (ext) {
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.gif': return 'image/gif';
+    case '.webp': return 'image/webp';
+    case '.svg': return 'image/svg+xml';
+    case '.pdf': return 'application/pdf';
+    default: return 'application/octet-stream';
+  }
+}
+
+async function serveLocalUpload(folder: string, filename: string): Promise<Response> {
+  if (!LOCAL_FOLDERS.has(folder)) {
+    return Response.json({ error: 'Invalid folder' }, { status: 400 });
+  }
+  if (!filename || filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+    return Response.json({ error: 'Invalid filename' }, { status: 400 });
+  }
+
+  const filePath = path.join(process.cwd(), 'uploads', folder, filename);
+  const buffer = await readFile(filePath);
+  const contentType = contentTypeForExt(path.extname(filename).toLowerCase());
+
+  return new Response(buffer, {
+    headers: {
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    },
+  });
+}
+
+// GET /uploads/:folder/:filename — serve locally stored uploads (fallback when CDN is off)
+uploadsRouter.get('/:folder/:filename', async (c) => {
   try {
-    const filename = c.req.param('filename');
-    if (!filename || filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
-      return c.json({ error: 'Invalid filename' }, 400);
-    }
-
-    const filePath = path.join(process.cwd(), 'uploads', 'images', filename);
-    const buffer = await readFile(filePath);
-
-    const ext = path.extname(filename).toLowerCase();
-    const contentType =
-      ext === '.png' ? 'image/png'
-      : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
-      : ext === '.gif' ? 'image/gif'
-      : ext === '.webp' ? 'image/webp'
-      : ext === '.svg' ? 'image/svg+xml'
-      : 'application/octet-stream';
-
-    return new Response(buffer, {
-      headers: {
-        'Content-Type': contentType,
-        'Cache-Control': 'public, max-age=31536000, immutable',
-      },
-    });
+    return await serveLocalUpload(c.req.param('folder'), c.req.param('filename'));
   } catch {
-    return c.json({ error: 'Image not found' }, 404);
+    return c.json({ error: 'File not found' }, 404);
   }
 });
 
