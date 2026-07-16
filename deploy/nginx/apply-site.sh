@@ -12,6 +12,42 @@ CONF_AVAILABLE="/etc/nginx/sites-available/${APP_NAME}.conf"
 CONF_ENABLED="/etc/nginx/sites-enabled/${APP_NAME}.conf"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 
+# When two site files claim the same server_name, nginx keeps one and ignores the other
+# ("conflicting server name ... ignored"). That can leave the API domain pointing at FE HTML.
+purge_conflicting_server_names() {
+  local domain="$1"
+  local keep_base="$2"
+  local file base
+
+  for dir in /etc/nginx/sites-enabled /etc/nginx/conf.d; do
+    [[ -d "${dir}" ]] || continue
+    for file in "${dir}"/*; do
+      [[ -e "${file}" ]] || continue
+      base="$(basename "${file}")"
+      [[ "${base}" == "${keep_base}" ]] && continue
+      if grep -E "server_name[[:space:]]+[^;]*[[:space:]]${domain}([[:space:;]]|$)" "${file}" >/dev/null 2>&1 \
+        || grep -E "server_name[[:space:]]+${domain}([[:space:;]]|$)" "${file}" >/dev/null 2>&1; then
+        echo "WARN: removing conflicting nginx site ${file} (also claims ${domain})"
+        rm -f "${file}"
+      fi
+    done
+  done
+
+  # Drop stale available copies that are not our keep file (enabled symlinks already handled).
+  if [[ -d /etc/nginx/sites-available ]]; then
+    for file in /etc/nginx/sites-available/*; do
+      [[ -e "${file}" ]] || continue
+      base="$(basename "${file}")"
+      [[ "${base}" == "${keep_base}" ]] && continue
+      if grep -E "server_name[[:space:]]+[^;]*[[:space:]]${domain}([[:space:;]]|$)" "${file}" >/dev/null 2>&1 \
+        || grep -E "server_name[[:space:]]+${domain}([[:space:;]]|$)" "${file}" >/dev/null 2>&1; then
+        echo "WARN: archiving conflicting sites-available ${file}"
+        mv -f "${file}" "${file}.bak-conflict-$(date +%s)" 2>/dev/null || rm -f "${file}"
+      fi
+    done
+  fi
+}
+
 write_http_only() {
   cat >"${CONF_AVAILABLE}" <<EOF
 server {
@@ -81,8 +117,12 @@ server {
 EOF
 }
 
+purge_conflicting_server_names "${DOMAIN}" "${APP_NAME}.conf"
+
 write_http_only
 ln -sfn "${CONF_AVAILABLE}" "${CONF_ENABLED}"
+# Re-purge in case certbot / another process recreated a duplicate.
+purge_conflicting_server_names "${DOMAIN}" "${APP_NAME}.conf"
 nginx -t
 systemctl reload nginx
 
@@ -93,6 +133,7 @@ fi
 if [[ -f "${CERT_DIR}/fullchain.pem" ]]; then
   write_http_redirect_and_https
   ln -sfn "${CONF_AVAILABLE}" "${CONF_ENABLED}"
+  purge_conflicting_server_names "${DOMAIN}" "${APP_NAME}.conf"
   nginx -t
   systemctl reload nginx
 else
@@ -100,7 +141,6 @@ else
 fi
 
 # Verify upstream container directly (not via nginx Host/redirect).
-# Retry — container may still be booting right after compose recreate.
 UPSTREAM_BODY=""
 for attempt in $(seq 1 30); do
   UPSTREAM_BODY="$(curl -fsS -m 5 "http://127.0.0.1:${PROXY_PORT}/" 2>/dev/null || true)"
@@ -134,6 +174,27 @@ if [[ "${APP_NAME}" == "hrms-be" ]]; then
     echo "${UPSTREAM_BODY}" | head -c 200
     exit 1
   fi
+
+  # Hit local nginx with correct SNI/Host (avoids CDN/DNS surprises; catches wrong vhost).
+  LOCAL_PUB=""
+  if [[ -f "${CERT_DIR}/fullchain.pem" ]]; then
+    LOCAL_PUB="$(curl -fsSk -m 15 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" 2>/dev/null || true)"
+  else
+    LOCAL_PUB="$(curl -fsS -m 15 --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/" 2>/dev/null || true)"
+  fi
+  echo "local-nginx body: ${LOCAL_PUB:0:200}"
+  if echo "${LOCAL_PUB}" | grep -qiE '<html|hrms-ui|<!doctype'; then
+    echo "ERROR: local nginx still serving frontend HTML for ${DOMAIN}"
+    echo "---- nginx sites claiming ${DOMAIN} ----"
+    grep -RIn "server_name.*${DOMAIN}" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null || true
+    exit 1
+  fi
+  if ! echo "${LOCAL_PUB}" | grep -q 'APTO Hono API'; then
+    echo "ERROR: local nginx did not return API ok payload for ${DOMAIN}"
+    grep -RIn "server_name.*${DOMAIN}" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null || true
+    exit 1
+  fi
+  echo "OK: local nginx serves API for ${DOMAIN}"
 fi
 
 echo "OK: nginx site applied for ${DOMAIN} -> 127.0.0.1:${PROXY_PORT}"
