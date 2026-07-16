@@ -1,6 +1,9 @@
 services:
   redis:
     image: redis:7-alpine
+    # Fixed name so redeploys can always docker rm -f this container.
+    # (Default compose name hrms-be-prod-redis-1 races / conflicts on recreate.)
+    container_name: hrms-be-redis-prod
     restart: always
     networks:
       - ats_network
