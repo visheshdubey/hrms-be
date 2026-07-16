@@ -200,10 +200,17 @@ commands:
                           docker logs --tail 120 hrms-be-prod 2>/dev/null || true
                           exit 1
                         fi
-                        pub="$(curl -fsSk -m 15 "https://${domain}/" || true)"
+                        pub="$(curl -fsSk -m 15 --resolve "${domain}:443:127.0.0.1" "https://${domain}/" || true)"
                         echo "public body: ${pub:0:200}"
                         if echo "${pub}" | grep -qiE '<html|hrms-ui|<!doctype'; then
                           echo "ERROR: public ${domain} serving frontend HTML"
+                          echo "---- nginx sites claiming ${domain} ----"
+                          grep -RIn "server_name.*${domain}" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null || true
+                          exit 1
+                        fi
+                        if ! echo "${pub}" | grep -q 'APTO Hono API'; then
+                          echo "ERROR: public ${domain} missing API ok payload"
+                          grep -RIn "server_name.*${domain}" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null || true
                           exit 1
                         fi
                         echo "OK: nginx + API checks passed"
