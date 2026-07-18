@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { organizations, users } from '../db/schema.js';
+import { organizations, users, contacts } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
 import { sendVerificationEmail, sendInviteEmail, sendPasswordResetEmail, sendPasswordOtpEmail } from '../utils/email.js';
 import {
@@ -13,7 +13,9 @@ import {
   queuePasswordResetEmail,
   queueVerificationEmail,
 } from '../queue/email-service.js';
-import { ensureOrgDefaultAccount } from '../lib/ensure-org-account.js';
+import { ensureOrgDefaultAccount, createNamedClientAccount } from '../lib/ensure-org-account.js';
+import { resolveAgencyOrganizationId } from '../lib/agency-workspace.js';
+
 
 async function dispatchEmail(
   queueFn: () => Promise<{ queued: boolean; inline?: boolean }>,
@@ -306,14 +308,39 @@ auth.post('/register', zValidator('json', registerSchema), async (c) => {
     const { name, email, portalType, accountType, organization } = c.req.valid('json');
     const resolvedPortal = resolvePortalType(portalType, accountType);
     const resolvedRole = roleForPortal(resolvedPortal);
-    const orgName = organization?.trim() || `${name}'s Organization`;
+    const companyName = organization?.trim() || `${name}'s Company`;
 
     const existingUser = await db.select().from(users).where(eq(users.email, email));
     if (existingUser.length > 0) {
       return c.json({ error: 'User already exists' }, 400);
     }
 
-    const [newOrg] = await db.insert(organizations).values({ name: orgName }).returning({ id: organizations.id });
+    let organizationId: number;
+    let joinedAgency = false;
+
+    if (resolvedPortal === 'org') {
+      // Dual-portal model: Org/Client joins the existing recruiter agency workspace
+      // so the company appears under Recruiter → Clients (same organization_id).
+      const agencyId = await resolveAgencyOrganizationId();
+      if (agencyId != null) {
+        organizationId = agencyId;
+        joinedAgency = true;
+      } else {
+        // Bootstrap empty DB: no recruiter yet — create a workspace for this client.
+        const [newOrg] = await db
+          .insert(organizations)
+          .values({ name: companyName })
+          .returning({ id: organizations.id });
+        organizationId = newOrg.id;
+      }
+    } else {
+      // Recruiter signup always gets (or is) the agency workspace.
+      const [newOrg] = await db
+        .insert(organizations)
+        .values({ name: companyName })
+        .returning({ id: organizations.id });
+      organizationId = newOrg.id;
+    }
 
     const newUser = await db.insert(users).values({
       name,
@@ -322,16 +349,43 @@ auth.post('/register', zValidator('json', registerSchema), async (c) => {
       isVerified: 0,
       role: resolvedRole,
       portalType: resolvedPortal,
-      organizationId: newOrg.id,
+      organizationId,
     }).returning(userProfileFields);
 
-    // Org portal posts jobs against CRM accounts — create a default company account.
     if (resolvedPortal === 'org') {
-      await ensureOrgDefaultAccount({
-        organizationId: newOrg.id,
-        createdBy: newUser[0].id,
-        accountName: orgName,
-      });
+      const account = await (joinedAgency
+        ? createNamedClientAccount({
+            organizationId,
+            createdBy: newUser[0].id,
+            accountName: companyName,
+            email,
+          })
+        : ensureOrgDefaultAccount({
+            organizationId,
+            createdBy: newUser[0].id,
+            accountName: companyName,
+          }));
+
+      if (joinedAgency) {
+        const now = new Date().toISOString();
+        try {
+          await db.insert(contacts).values({
+            accountId: account.id,
+            firstName: name.trim().split(/\s+/)[0] || 'Client',
+            lastName: name.trim().split(/\s+/).slice(1).join(' ') || '',
+            email,
+            phone: '',
+            jobTitle: 'Primary contact',
+            department: 'HR',
+            status: 'active',
+            organizationId,
+            createdBy: newUser[0].id,
+            updatedAt: now,
+          });
+        } catch (error) {
+          console.error('[register] contact create failed (non-fatal):', error);
+        }
+      }
     }
 
     const verifyToken = jwt.sign({ email: newUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
@@ -341,11 +395,15 @@ auth.post('/register', zValidator('json', registerSchema), async (c) => {
     );
 
     return c.json({
-      message: 'User registered successfully. Please verify your email.',
+      message: joinedAgency
+        ? 'Registered as a client in the agency workspace. Verify your email to sign in.'
+        : 'User registered successfully. Please verify your email.',
       user: newUser[0],
       emailSent,
+      joinedAgency,
     }, 201);
   } catch (error) {
+    console.error('[register] failed:', error);
     return c.json({ error: 'Internal Server Error' }, 500);
   }
 });
