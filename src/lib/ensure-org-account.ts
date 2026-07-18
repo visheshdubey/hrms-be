@@ -3,9 +3,38 @@ import { db } from '../db/index.js';
 import { accounts, organizations } from '../db/schema.js';
 
 /**
- * Org portal posts jobs against CRM "client" accounts.
- * New org registrations used to create zero accounts → empty Post Job dropdown.
- * Ensure at least one account exists for the organization (named after the org).
+ * Create a CRM client account in a workspace (always inserts a new named company).
+ * Used when an Org portal user joins the agency via public signup.
+ */
+export async function createNamedClientAccount(input: {
+  organizationId: number;
+  createdBy: number;
+  accountName: string;
+  email?: string;
+  phone?: string;
+}): Promise<{ id: number; name: string }> {
+  const name = input.accountName.trim() || 'Client company';
+  const now = new Date().toISOString();
+  const [created] = await db
+    .insert(accounts)
+    .values({
+      name,
+      status: 'active',
+      type: 'client',
+      email: input.email ?? '',
+      phone: input.phone ?? '',
+      organizationId: input.organizationId,
+      createdBy: input.createdBy,
+      updatedAt: now,
+    })
+    .returning({ id: accounts.id, name: accounts.name });
+
+  return created;
+}
+
+/**
+ * Ensure at least one CRM account exists for a workspace (Post Job empty-state fix).
+ * If any account already exists, returns the first — does not create duplicates.
  */
 export async function ensureOrgDefaultAccount(input: {
   organizationId: number;
@@ -32,18 +61,9 @@ export async function ensureOrgDefaultAccount(input: {
     name = org?.name?.trim() || 'My Company';
   }
 
-  const now = new Date().toISOString();
-  const [created] = await db
-    .insert(accounts)
-    .values({
-      name,
-      status: 'active',
-      type: 'client',
-      organizationId: input.organizationId,
-      createdBy: input.createdBy,
-      updatedAt: now,
-    })
-    .returning({ id: accounts.id, name: accounts.name });
-
-  return created;
+  return createNamedClientAccount({
+    organizationId: input.organizationId,
+    createdBy: input.createdBy,
+    accountName: name,
+  });
 }
