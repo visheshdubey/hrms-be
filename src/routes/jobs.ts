@@ -4,11 +4,15 @@ import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { eq, desc, inArray, and, or, isNull, sql, type SQL } from 'drizzle-orm';
 import { requireAuth, requireRole, ORG_ROLES, type AppContext, type UserRole } from '../middleware.js';
-import { jobs, jobStages, JOB_STAGE_TYPES, accounts, applications, users } from '../db/schema.js';
+import { jobs, jobStages, JOB_STAGE_TYPES, applications, users } from '../db/schema.js';
 import { copyAccountStageTemplatesToJob, canWriteStageTemplates, getAccountIfAccessible } from '../lib/stages.js';
-import { canAccessJob, getOrgMemberIds, orgOrCreatorScope } from '../lib/orgScope.js';
+import {
+  canAccessJob,
+  getAccessibleAccountIds,
+  getOrgMemberIds,
+  isOrgPortalRole,
+} from '../lib/orgScope.js';
 import { defaultStageColor } from '../lib/stageColors.js';
-import { isSchemaDriftError } from '../lib/schemaDrift.js';
 import { backfillNullApplicationStages } from '../lib/applicationDefaults.js';
 
 const jobsRouter = new Hono<AppContext>({ strict: false });
@@ -85,24 +89,6 @@ async function selectJobById(id: number) {
       const rows = await db.select(MINIMAL_JOB_SELECT).from(jobs).where(eq(jobs.id, id)).limit(1);
       return rows.map(withJobDefaults);
     }
-  }
-}
-
-async function selectAccountIdsSafe(orgId: number | null, userId: number): Promise<number[]> {
-  try {
-    const orgAccounts = await db
-      .select({ id: accounts.id })
-      .from(accounts)
-      .where(orgOrCreatorScope(orgId, userId, accounts, accounts));
-    return orgAccounts.map((account) => account.id);
-  } catch (error) {
-    if (!isSchemaDriftError(error)) throw error;
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    const orgAccounts = await db
-      .select({ id: accounts.id })
-      .from(accounts)
-      .where(inArray(accounts.createdBy, memberIds));
-    return orgAccounts.map((account) => account.id);
   }
 }
 
@@ -192,11 +178,16 @@ const statusSchema = z.object({
   status: z.enum(JOB_STATUS_VALUES),
 });
 
-async function canAccessJobForStages(params: { jobId: number; userId: number; orgId: number | null }) {
-  const { jobId, userId, orgId } = params;
+async function canAccessJobForStages(params: {
+  jobId: number;
+  userId: number;
+  orgId: number | null;
+  role?: UserRole | null;
+}) {
+  const { jobId, userId, orgId, role } = params;
   const [job] = await selectJobById(jobId);
   if (!job) return null;
-  if (!await canAccessJob(job, userId, orgId)) return null;
+  if (!await canAccessJob(job, userId, orgId, role)) return null;
   return job;
 }
 
@@ -216,41 +207,65 @@ async function attachRealApplicantCounts<T extends { id: number }>(rows: T[]): P
   return rows.map((r) => ({ ...r, applicants: map.get(r.id) ?? 0 }));
 }
 
-// GET /jobs — list all jobs visible to the authenticated user's organization
+// GET /jobs — recruiters: all agency jobs; org portal: only linked client account jobs
 jobsRouter.get('/', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const accountIdParam = c.req.query('accountId');
 
     let all;
     try {
       if (orgId != null) {
-        const accountIds = await selectAccountIdsSafe(orgId, userId);
-        const memberIds = await getOrgMemberIds(orgId, userId);
+        const accountIds = await getAccessibleAccountIds(userId, orgId, role);
+        const orgPortal = isOrgPortalRole(role);
 
-        if (accountIds.length === 0) {
-          all = await selectJobs(and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)));
+        if (orgPortal) {
+          // Client users: only their account(s); orphan jobs only if they created them.
+          if (accountIds.length === 0) {
+            all = await selectJobs(and(isNull(jobs.accountId), eq(jobs.createdBy, userId)));
+          } else {
+            all = await selectJobs(
+              or(
+                inArray(jobs.accountId, accountIds),
+                and(isNull(jobs.accountId), eq(jobs.createdBy, userId)),
+              ),
+            );
+          }
         } else {
-          all = await selectJobs(
-            or(
-              inArray(jobs.accountId, accountIds),
-              and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)),
-            ),
-          );
+          const memberIds = await getOrgMemberIds(orgId, userId);
+          if (accountIds.length === 0) {
+            all = await selectJobs(and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)));
+          } else {
+            all = await selectJobs(
+              or(
+                inArray(jobs.accountId, accountIds),
+                and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds)),
+              ),
+            );
+          }
         }
       } else {
         all = await selectJobs(eq(jobs.createdBy, userId));
       }
     } catch {
-      // Last resort: return all jobs created by org members / user without account join.
-      const memberIds = orgId != null ? await getOrgMemberIds(orgId, userId) : [userId];
-      all = await selectJobs(inArray(jobs.createdBy, memberIds));
+      // Last resort: never fall back to all org members for client portal users.
+      if (isOrgPortalRole(role)) {
+        all = await selectJobs(eq(jobs.createdBy, userId));
+      } else {
+        const memberIds = orgId != null ? await getOrgMemberIds(orgId, userId) : [userId];
+        all = await selectJobs(inArray(jobs.createdBy, memberIds));
+      }
     }
 
     if (accountIdParam) {
       const accountId = parseInt(accountIdParam);
       if (!isNaN(accountId)) {
+        const allowed = await getAccessibleAccountIds(userId, orgId, role);
+        if (!allowed.includes(accountId)) {
+          return c.json({ error: 'Client account not found or unauthorized' }, 403);
+        }
         all = all.filter((j) => j.accountId === accountId);
       }
     }
@@ -274,13 +289,14 @@ jobsRouter.get('/:id', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
     const row = await selectJobById(id);
     if (row.length === 0) return c.json({ error: 'Job not found' }, 404);
 
-    if (!await canAccessJob(row[0], userId, orgId)) {
+    if (!await canAccessJob(row[0], userId, orgId, role)) {
       return c.json({ error: 'Job not found' }, 404);
     }
 
@@ -313,13 +329,22 @@ jobsRouter.post('/', requireAuth, requireRole(...ORG_ROLES), zValidator('json', 
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const body = c.req.valid('json');
     const { title, department, status, type, location, description } = body;
 
     let accountId = body.accountId ?? null;
+    const linkedIds = await getAccessibleAccountIds(userId, orgId, role);
+
     if (accountId != null) {
-      const account = await getAccountIfAccessible(accountId, userId, orgId);
+      const account = await getAccountIfAccessible(accountId, userId, orgId, role);
       if (!account) return c.json({ error: 'Client account not found or unauthorized' }, 403);
+    } else if (linkedIds.length === 1) {
+      accountId = linkedIds[0];
+    } else if (linkedIds.length === 0) {
+      return c.json({ error: 'No client account linked to your login. Contact your recruiter.' }, 400);
+    } else {
+      return c.json({ error: 'accountId is required when multiple client accounts are linked' }, 400);
     }
 
     const created = await db.insert(jobs).values({
@@ -353,6 +378,7 @@ jobsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSchema), a
   try {
     const orgId = c.get('organizationId') as number | null;
     const userId = c.get('userId') as number;
+    const role = c.get('userRole') as UserRole | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
@@ -361,7 +387,7 @@ jobsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSchema), a
     const row = await selectJobById(id);
     if (row.length === 0) return c.json({ error: 'Job not found' }, 404);
 
-    if (!await canAccessJob(row[0], userId, orgId)) {
+    if (!await canAccessJob(row[0], userId, orgId, role)) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
     }
 
@@ -394,6 +420,7 @@ jobsRouter.put('/:id', requireAuth, zValidator('json', jobSchema), async (c) => 
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const id = parseInt(c.req.param('id'));
     const body = c.req.valid('json');
 
@@ -401,8 +428,13 @@ jobsRouter.put('/:id', requireAuth, zValidator('json', jobSchema), async (c) => 
     if (existing.length === 0) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
     }
-    if (!await canAccessJob(existing[0], userId, orgId)) {
+    if (!await canAccessJob(existing[0], userId, orgId, role)) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
+    }
+
+    if (body.accountId != null) {
+      const account = await getAccountIfAccessible(body.accountId, userId, orgId, role);
+      if (!account) return c.json({ error: 'Client account not found or unauthorized' }, 403);
     }
 
     const patch: Record<string, unknown> = {};
@@ -427,13 +459,14 @@ jobsRouter.delete('/:id', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const id = parseInt(c.req.param('id'));
 
     const existing = await selectJobById(id);
     if (existing.length === 0) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
     }
-    if (!await canAccessJob(existing[0], userId, orgId)) {
+    if (!await canAccessJob(existing[0], userId, orgId, role)) {
       return c.json({ error: 'Job not found or unauthorized' }, 403);
     }
 
@@ -449,10 +482,11 @@ jobsRouter.get('/:jobId/stages', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const jobId = parseInt(c.req.param('jobId'));
     if (isNaN(jobId)) return c.json({ error: 'Invalid job id' }, 400);
 
-    const job = await canAccessJobForStages({ jobId, userId, orgId });
+    const job = await canAccessJobForStages({ jobId, userId, orgId, role });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const stages = await selectJobStages(jobId);
@@ -474,7 +508,7 @@ jobsRouter.post('/:jobId/stages/sync-from-template', requireAuth, async (c) => {
       return c.json({ error: 'Only admins can modify job stages' }, 403);
     }
 
-    const job = await canAccessJobForStages({ jobId, userId, orgId });
+    const job = await canAccessJobForStages({ jobId, userId, orgId, role });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
     if (job.accountId == null) {
       return c.json({ error: 'Job is not linked to a client account' }, 400);
@@ -499,7 +533,7 @@ jobsRouter.post('/:jobId/stages', requireAuth, zValidator('json', stageSchema), 
       return c.json({ error: 'Only admins can modify job stages' }, 403);
     }
 
-    const job = await canAccessJobForStages({ jobId, userId, orgId });
+    const job = await canAccessJobForStages({ jobId, userId, orgId, role });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const b = c.req.valid('json');
@@ -530,7 +564,7 @@ jobsRouter.put('/:jobId/stages/reorder', requireAuth, zValidator('json', reorder
       return c.json({ error: 'Only admins can modify job stages' }, 403);
     }
 
-    const job = await canAccessJobForStages({ jobId, userId, orgId });
+    const job = await canAccessJobForStages({ jobId, userId, orgId, role });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const { stageIds } = c.req.valid('json');
@@ -585,7 +619,7 @@ jobsRouter.put('/:jobId/stages/:stageId', requireAuth, zValidator('json', stageS
       return c.json({ error: 'Only admins can modify job stages' }, 403);
     }
 
-    const job = await canAccessJobForStages({ jobId, userId, orgId });
+    const job = await canAccessJobForStages({ jobId, userId, orgId, role });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const [existing] = await db.select().from(jobStages)
@@ -626,7 +660,7 @@ jobsRouter.delete('/:jobId/stages/:stageId', requireAuth, async (c) => {
       return c.json({ error: 'Only admins can modify job stages' }, 403);
     }
 
-    const job = await canAccessJobForStages({ jobId, userId, orgId });
+    const job = await canAccessJobForStages({ jobId, userId, orgId, role });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const [stage] = await db.select().from(jobStages)
@@ -655,10 +689,11 @@ jobsRouter.get('/:jobId/stage-stats', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const jobId = parseInt(c.req.param('jobId'));
     if (isNaN(jobId)) return c.json({ error: 'Invalid job id' }, 400);
 
-    const job = await canAccessJobForStages({ jobId, userId, orgId });
+    const job = await canAccessJobForStages({ jobId, userId, orgId, role });
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     await backfillNullApplicationStages(jobId);
