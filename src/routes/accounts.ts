@@ -12,6 +12,8 @@ import {
   getAccountIfAccessible,
 } from '../lib/stages.js';
 import { cascadeDeleteAccount, getAccountDeletePreview } from '../lib/accountDelete.js';
+import { ensureOrgDefaultAccount } from '../lib/ensure-org-account.js';
+import { inviteClientPortalUser } from '../lib/invite-client-portal.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 import { isSchemaDriftError } from '../lib/schemaDrift.js';
@@ -211,11 +213,17 @@ function stageWriteForbidden(c: { json: (body: unknown, status?: number) => Resp
   return c.json({ error: 'Only admins can modify stage templates' }, 403);
 }
 
-/* GET /accounts/options — lightweight list for stage settings */
+/* GET /accounts/options — lightweight list for stage settings / Post Job */
 accountsRouter.get('/options', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const userRole = c.get('userRole') as string | null;
+
+    // Existing org users (registered before default-account fix) get a company account on demand.
+    if (orgId != null && (userRole === 'org_admin' || userRole === 'org_staff')) {
+      await ensureOrgDefaultAccount({ organizationId: orgId, createdBy: userId });
+    }
 
     const rows = await db
       .select({ id: accounts.id, name: accounts.name })
@@ -643,7 +651,28 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
       created = { ...row, contractValue: 0, tags: '[]', alertsEnabled: 0 } as typeof accounts.$inferSelect;
     }
 
-    return c.json(await enrichAccount(created), 201);
+    let portalInvite: Awaited<ReturnType<typeof inviteClientPortalUser>> | null = null;
+    const inviteEmail = (b.email ?? '').trim();
+    if (inviteEmail) {
+      const [inviter] = await db
+        .select({ name: users.name })
+        .from(users)
+        .where(eq(users.id, userId))
+        .limit(1);
+
+      portalInvite = await inviteClientPortalUser({
+        email: inviteEmail,
+        companyName: created.name,
+        accountId: created.id,
+        organizationId: orgId,
+        invitedByUserId: userId,
+        inviterName: inviter?.name?.trim() || 'Your recruiter',
+        contactPhone: b.phone ?? '',
+      });
+    }
+
+    const enriched = await enrichAccount(created);
+    return c.json({ ...enriched, portalInvite }, 201);
   } catch {
     return c.json({ error: 'Failed to create account' }, 500);
   }
