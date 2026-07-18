@@ -101,7 +101,10 @@ async function getAccountIdsInOrg(orgId: number | null, userId: number): Promise
 /**
  * Account IDs the caller may use.
  * Recruiters: all accounts in the agency workspace.
- * Org portal users: only accounts linked via contact email or createdBy (their client company).
+ * Org portal users: only their client company, linked by:
+ *   1) contacts.email match
+ *   2) accounts.email match (Add client email)
+ *   3) accounts.created_by = this user (org self-signup company)
  */
 export async function getAccessibleAccountIds(
   userId: number,
@@ -130,6 +133,20 @@ export async function getAccessibleAccountIds(
     for (const row of contactRows) {
       if (row.accountId != null) ids.add(row.accountId);
     }
+
+    const accountEmailWhere =
+      orgId != null
+        ? and(
+            sql`lower(trim(${accounts.email})) = ${email}`,
+            or(eq(accounts.organizationId, orgId), isNull(accounts.organizationId)),
+          )
+        : sql`lower(trim(${accounts.email})) = ${email}`;
+
+    const byAccountEmail = await db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(accountEmailWhere!);
+    for (const row of byAccountEmail) ids.add(row.id);
   }
 
   const createdWhere =
@@ -143,7 +160,7 @@ export async function getAccessibleAccountIds(
   const createdRows = await db.select({ id: accounts.id }).from(accounts).where(createdWhere!);
   for (const row of createdRows) ids.add(row.id);
 
-  // If contact matched accounts outside this org, drop them when org is set.
+  // Drop accounts outside this agency when org is set.
   if (orgId != null && ids.size > 0) {
     const scoped = await db
       .select({ id: accounts.id, organizationId: accounts.organizationId })
