@@ -5,14 +5,14 @@ import { db } from '../db/index.js';
 import { accounts, contacts, users, jobs, accountStageTemplates, JOB_STAGE_TYPES, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
 import { eq, desc, sql, and, inArray, type SQL } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext, type UserRole } from '../middleware.js';
-import { belongsToOrganization, orgOrCreatorScope, getOrgMemberIds } from '../lib/orgScope.js';
+import { belongsToOrganization, orgOrCreatorScope, getOrgMemberIds, getAccessibleAccountIds, isOrgPortalRole } from '../lib/orgScope.js';
 import {
   applyTemplatesToAccountJobsWithoutStages,
   canWriteStageTemplates,
   getAccountIfAccessible,
 } from '../lib/stages.js';
 import { cascadeDeleteAccount, getAccountDeletePreview } from '../lib/accountDelete.js';
-import { ensureOrgDefaultAccount } from '../lib/ensure-org-account.js';
+import { ensureOrgUserLinkedAccount } from '../lib/ensure-org-account.js';
 import { inviteClientPortalUser } from '../lib/invite-client-portal.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
@@ -220,9 +220,26 @@ accountsRouter.get('/options', requireAuth, async (c) => {
     const orgId = c.get('organizationId') as number | null;
     const userRole = c.get('userRole') as string | null;
 
-    // Existing org users (registered before default-account fix) get a company account on demand.
-    if (orgId != null && (userRole === 'org_admin' || userRole === 'org_staff')) {
-      await ensureOrgDefaultAccount({ organizationId: orgId, createdBy: userId });
+    if (orgId != null && isOrgPortalRole(userRole)) {
+      // Ensure THIS client has a linked account — never borrow another client's company.
+      await ensureOrgUserLinkedAccount({
+        organizationId: orgId,
+        userId,
+        role: userRole,
+      });
+
+      const linkedIds = await getAccessibleAccountIds(userId, orgId, userRole);
+      if (linkedIds.length === 0) {
+        return c.json({ data: [] });
+      }
+
+      const rows = await db
+        .select({ id: accounts.id, name: accounts.name })
+        .from(accounts)
+        .where(inArray(accounts.id, linkedIds))
+        .orderBy(desc(accounts.updatedAt));
+
+      return c.json({ data: rows });
     }
 
     const rows = await db
@@ -242,10 +259,11 @@ accountsRouter.get('/:id/stage-templates', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const accountId = parseInt(c.req.param('id'));
     if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
 
-    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    const account = await getAccountIfAccessible(accountId, userId, orgId, role);
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
     const stages = await db
@@ -270,7 +288,7 @@ accountsRouter.post('/:id/stage-templates', requireAuth, zValidator('json', stag
     if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
     if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
 
-    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    const account = await getAccountIfAccessible(accountId, userId, orgId, role);
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
     const body = c.req.valid('json');
@@ -299,7 +317,7 @@ accountsRouter.put('/:id/stage-templates/reorder', requireAuth, zValidator('json
     if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
     if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
 
-    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    const account = await getAccountIfAccessible(accountId, userId, orgId, role);
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
     const { stageIds } = c.req.valid('json');
@@ -352,7 +370,7 @@ accountsRouter.put('/:id/stage-templates/:stageId', requireAuth, zValidator('jso
     if (isNaN(accountId) || isNaN(stageId)) return c.json({ error: 'Invalid id' }, 400);
     if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
 
-    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    const account = await getAccountIfAccessible(accountId, userId, orgId, role);
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
     const body = c.req.valid('json');
@@ -386,7 +404,7 @@ accountsRouter.delete('/:id/stage-templates/:stageId', requireAuth, async (c) =>
     if (isNaN(accountId) || isNaN(stageId)) return c.json({ error: 'Invalid id' }, 400);
     if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
 
-    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    const account = await getAccountIfAccessible(accountId, userId, orgId, role);
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
     const [deleted] = await db
@@ -411,7 +429,7 @@ accountsRouter.post('/:id/stage-templates/apply-to-jobs', requireAuth, async (c)
     if (isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400);
     if (!canWriteStageTemplates(role)) return stageWriteForbidden(c);
 
-    const account = await getAccountIfAccessible(accountId, userId, orgId);
+    const account = await getAccountIfAccessible(accountId, userId, orgId, role);
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
     const result = await applyTemplatesToAccountJobsWithoutStages(accountId);

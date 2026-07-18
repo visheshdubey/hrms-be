@@ -6,7 +6,7 @@ import {
   jobStages,
   jobs,
 } from '../db/schema.js';
-import { belongsToOrganization } from './orgScope.js';
+import { belongsToOrganization, canAccessAccountId, isOrgPortalRole } from './orgScope.js';
 import type { UserRole } from '../middleware.js';
 import { defaultStageColor } from './stageColors.js';
 
@@ -18,9 +18,14 @@ export async function getAccountIfAccessible(
   accountId: number,
   userId: number,
   orgId: number | null,
+  role?: UserRole | string | null,
 ) {
   const [account] = await db.select().from(accounts).where(eq(accounts.id, accountId)).limit(1);
   if (!account) return null;
+  if (isOrgPortalRole(role)) {
+    if (!(await canAccessAccountId(accountId, userId, orgId, role))) return null;
+    return account;
+  }
   if (!belongsToOrganization(account.organizationId, orgId, account.createdBy, userId)) {
     return null;
   }

@@ -1,7 +1,12 @@
 import { db } from '../db/index.js';
-import { accounts, users } from '../db/schema.js';
-import { eq, and, or, isNull, type SQL } from 'drizzle-orm';
+import { accounts, contacts, users } from '../db/schema.js';
+import { eq, and, or, isNull, sql, inArray, type SQL } from 'drizzle-orm';
 import { isSchemaDriftError } from './schemaDrift.js';
+import type { UserRole } from '../middleware.js';
+
+export function isOrgPortalRole(role: UserRole | string | null | undefined): boolean {
+  return role === 'org_admin' || role === 'org_staff';
+}
 
 export async function getOrgMemberIds(
   orgId: number | null,
@@ -75,6 +80,97 @@ export async function canAccessByCreator(
   return createdBy === userId;
 }
 
+async function getAccountIdsInOrg(orgId: number | null, userId: number): Promise<number[]> {
+  try {
+    const orgAccounts = await db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(orgOrCreatorScope(orgId, userId, accounts, accounts));
+    return orgAccounts.map((account) => account.id);
+  } catch (error) {
+    if (!isSchemaDriftError(error)) throw error;
+    const memberIds = await getOrgMemberIds(orgId, userId);
+    const orgAccounts = await db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(inArray(accounts.createdBy, memberIds));
+    return orgAccounts.map((account) => account.id);
+  }
+}
+
+/**
+ * Account IDs the caller may use.
+ * Recruiters: all accounts in the agency workspace.
+ * Org portal users: only accounts linked via contact email or createdBy (their client company).
+ */
+export async function getAccessibleAccountIds(
+  userId: number,
+  orgId: number | null,
+  role: UserRole | string | null | undefined,
+): Promise<number[]> {
+  if (!isOrgPortalRole(role)) {
+    return getAccountIdsInOrg(orgId, userId);
+  }
+
+  const [user] = await db
+    .select({ email: users.email })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  const email = user?.email?.trim().toLowerCase() ?? '';
+  const ids = new Set<number>();
+
+  if (email) {
+    const contactRows = await db
+      .select({ accountId: contacts.accountId })
+      .from(contacts)
+      .where(sql`lower(trim(${contacts.email})) = ${email}`);
+
+    for (const row of contactRows) {
+      if (row.accountId != null) ids.add(row.accountId);
+    }
+  }
+
+  const createdWhere =
+    orgId != null
+      ? and(
+          eq(accounts.createdBy, userId),
+          or(eq(accounts.organizationId, orgId), isNull(accounts.organizationId)),
+        )
+      : eq(accounts.createdBy, userId);
+
+  const createdRows = await db.select({ id: accounts.id }).from(accounts).where(createdWhere!);
+  for (const row of createdRows) ids.add(row.id);
+
+  // If contact matched accounts outside this org, drop them when org is set.
+  if (orgId != null && ids.size > 0) {
+    const scoped = await db
+      .select({ id: accounts.id, organizationId: accounts.organizationId })
+      .from(accounts)
+      .where(inArray(accounts.id, [...ids]));
+    return scoped
+      .filter(
+        (row) =>
+          row.organizationId === orgId ||
+          row.organizationId == null,
+      )
+      .map((row) => row.id);
+  }
+
+  return [...ids];
+}
+
+export async function canAccessAccountId(
+  accountId: number,
+  userId: number,
+  orgId: number | null,
+  role: UserRole | string | null | undefined,
+): Promise<boolean> {
+  const accessible = await getAccessibleAccountIds(userId, orgId, role);
+  return accessible.includes(accountId);
+}
+
 async function getAccountAccessRow(accountId: number) {
   try {
     const [account] = await db
@@ -103,7 +199,16 @@ export async function canAccessJob(
   job: { accountId: number | null; createdBy: number | null },
   userId: number,
   orgId: number | null,
+  role?: UserRole | string | null,
 ): Promise<boolean> {
+  if (isOrgPortalRole(role)) {
+    if (job.accountId != null) {
+      return canAccessAccountId(job.accountId, userId, orgId, role);
+    }
+    // Orphan jobs (no account): only the creator in the org portal.
+    return job.createdBy === userId;
+  }
+
   if (job.accountId != null) {
     const account = await getAccountAccessRow(job.accountId);
     if (!account) return false;
