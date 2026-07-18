@@ -12,13 +12,26 @@ CONF_AVAILABLE="/etc/nginx/sites-available/${APP_NAME}.conf"
 CONF_ENABLED="/etc/nginx/sites-enabled/${APP_NAME}.conf"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 
+# Escape hostname for use in grep -E / sed -E (] must be first in the class).
+escape_regex() {
+  printf '%s' "$1" | sed -e 's/[][\\.^$*+?(){}|]/g' '\\&'
+}
+
 # True if a site file's server_name line claims this hostname (quoted/unquoted, multi-name).
 file_claims_server_name() {
   local file="$1"
   local domain="$2"
   local escaped
-  escaped="$(printf '%s' "${domain}" | sed -e 's/[.[\*^$()+?{|]/g' '\\&')"
-  grep -Eiq "server_name[[:space:]]+[^;]*${escaped}([\"[:space:];]|$)" "${file}" 2>/dev/null
+  escaped="$(escape_regex "${domain}")"
+  grep -Eiq "server_name[[:space:]]+[^;#]*${escaped}([\"[:space:];]|$)" "${file}" 2>/dev/null
+}
+
+# Frontend / other app vhosts — never delete these when applying the API site.
+is_protected_vhost() {
+  case "$1" in
+    hrms-fe.conf|MF-FE.conf|hrms.conf) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Remove only this hostname from server_name lines — do NOT delete whole FE vhosts.
@@ -27,15 +40,13 @@ strip_server_name_from_file() {
   local file="$1"
   local domain="$2"
   local escaped tmp
-  escaped="$(printf '%s' "${domain}" | sed -e 's/[.[\*^$()+?{|]/g' '\\&')"
+  escaped="$(escape_regex "${domain}")"
   tmp="$(mktemp)"
-  # Drop the hostname token (optionally quoted) from server_name directives.
   sed -E \
     -e "s/([\"[:space:]])${escaped}([\"[:space:];])/\\1\\2/g" \
     -e "s/server_name[[:space:]]+${escaped}([\"[:space:];])/server_name\\1/g" \
     -e "s/server_name[[:space:]]+\"${escaped}\"([\"[:space:];])/server_name\\1/g" \
     "${file}" >"${tmp}"
-  # Clean leftover empty/broken server_name lines → comment them out so nginx still parses.
   sed -E -i \
     -e 's/server_name[[:space:]]*;/# server_name removed (conflict purge);/g' \
     -e 's/server_name[[:space:]]+;/# server_name removed (conflict purge);/g' \
@@ -45,7 +56,7 @@ strip_server_name_from_file() {
 }
 
 # When another site file also claims our API domain, strip that name only.
-# Only disable the whole file if it no longer has any server_name left (orphan API-only vhost).
+# Never delete protected FE vhosts (that caused ERR_CERT_COMMON_NAME_INVALID for hrms.devcognito.tech).
 purge_conflicting_server_names() {
   local domain="$1"
   local keep_base="$2"
@@ -61,6 +72,10 @@ purge_conflicting_server_names() {
         echo "WARN: stripping ${domain} from conflicting nginx site ${file}"
         cp -a "${file}" "${file}.bak-strip-$(date +%s)" 2>/dev/null || true
         strip_server_name_from_file "${file}" "${domain}"
+        if is_protected_vhost "${base}"; then
+          echo "WARN: keeping protected vhost ${base} (FE TLS)"
+          continue
+        fi
         if ! grep -Eq 'server_name[[:space:]]+[^;#]+;' "${file}" 2>/dev/null; then
           echo "WARN: ${file} has no remaining server_name — disabling"
           rm -f "${file}"
