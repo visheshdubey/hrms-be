@@ -16,14 +16,36 @@ CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 file_claims_server_name() {
   local file="$1"
   local domain="$2"
-  # Escape regex metacharacters in the hostname (especially dots).
   local escaped
   escaped="$(printf '%s' "${domain}" | sed -e 's/[.[\*^$()+?{|]/g' '\\&')"
   grep -Eiq "server_name[[:space:]]+[^;]*${escaped}([\"[:space:];]|$)" "${file}" 2>/dev/null
 }
 
-# When two site files claim the same server_name, nginx keeps one and ignores the other
-# ("conflicting server name ... ignored"). That can leave the API domain pointing at FE HTML.
+# Remove only this hostname from server_name lines — do NOT delete whole FE vhosts.
+# Deleting MF-FE.conf / hrms-fe.conf wholesale breaks hrms.devcognito.tech TLS (wrong default cert).
+strip_server_name_from_file() {
+  local file="$1"
+  local domain="$2"
+  local escaped tmp
+  escaped="$(printf '%s' "${domain}" | sed -e 's/[.[\*^$()+?{|]/g' '\\&')"
+  tmp="$(mktemp)"
+  # Drop the hostname token (optionally quoted) from server_name directives.
+  sed -E \
+    -e "s/([\"[:space:]])${escaped}([\"[:space:];])/\\1\\2/g" \
+    -e "s/server_name[[:space:]]+${escaped}([\"[:space:];])/server_name\\1/g" \
+    -e "s/server_name[[:space:]]+\"${escaped}\"([\"[:space:];])/server_name\\1/g" \
+    "${file}" >"${tmp}"
+  # Clean leftover empty/broken server_name lines → comment them out so nginx still parses.
+  sed -E -i \
+    -e 's/server_name[[:space:]]*;/# server_name removed (conflict purge);/g' \
+    -e 's/server_name[[:space:]]+;/# server_name removed (conflict purge);/g' \
+    "${tmp}"
+  cat "${tmp}" >"${file}"
+  rm -f "${tmp}"
+}
+
+# When another site file also claims our API domain, strip that name only.
+# Only disable the whole file if it no longer has any server_name left (orphan API-only vhost).
 purge_conflicting_server_names() {
   local domain="$1"
   local keep_base="$2"
@@ -36,12 +58,12 @@ purge_conflicting_server_names() {
       base="$(basename "${file}")"
       [[ "${base}" == "${keep_base}" ]] && continue
       if file_claims_server_name "${file}" "${domain}"; then
-        echo "WARN: removing conflicting nginx site ${file} (also claims ${domain})"
-        rm -f "${file}"
-        # Park sites-available source so another deploy does not re-enable a bad vhost.
-        if [[ -f "/etc/nginx/sites-available/${base}" ]]; then
-          mv -f "/etc/nginx/sites-available/${base}" \
-            "/etc/nginx/sites-available/${base}.bak-conflict-$(date +%s)" 2>/dev/null || true
+        echo "WARN: stripping ${domain} from conflicting nginx site ${file}"
+        cp -a "${file}" "${file}.bak-strip-$(date +%s)" 2>/dev/null || true
+        strip_server_name_from_file "${file}" "${domain}"
+        if ! grep -Eq 'server_name[[:space:]]+[^;#]+;' "${file}" 2>/dev/null; then
+          echo "WARN: ${file} has no remaining server_name — disabling"
+          rm -f "${file}"
         fi
       fi
     done
@@ -53,11 +75,12 @@ purge_conflicting_server_names() {
       base="$(basename "${file}")"
       [[ "${base}" == "${keep_base}" ]] && continue
       case "${base}" in
-        *.bak-conflict-*) continue ;;
+        *.bak-conflict-*|*.bak-strip-*) continue ;;
       esac
       if file_claims_server_name "${file}" "${domain}"; then
-        echo "WARN: archiving conflicting sites-available ${file}"
-        mv -f "${file}" "${file}.bak-conflict-$(date +%s)" 2>/dev/null || rm -f "${file}"
+        echo "WARN: stripping ${domain} from sites-available ${file}"
+        cp -a "${file}" "${file}.bak-strip-$(date +%s)" 2>/dev/null || true
+        strip_server_name_from_file "${file}" "${domain}"
       fi
     done
   fi
