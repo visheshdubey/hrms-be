@@ -110,14 +110,14 @@ export function buildInviteEmailHtml(inviterName: string, verifyToken: string) {
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eaeaea; border-radius: 8px;">
       <h2 style="color: #333;">You've been invited!</h2>
       <p style="color: #555; line-height: 1.5;">
-        <strong>${inviterName}</strong> has invited you to join their team on the HRMS platform.
+        <strong>${inviterName}</strong> has invited you to the HRMS client portal so you can post jobs and track hiring.
       </p>
       <p style="color: #555; line-height: 1.5;">
-        Click the button below to accept the invitation and set up your account.
+        Click the button below to verify your email and set your login password.
       </p>
       <div style="text-align: center; margin: 30px 0;">
         <a href="${verifyLink}" style="background-color: #000; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; display: inline-block;">
-          Accept Invitation
+          Set password &amp; sign in
         </a>
       </div>
       <p style="color: #555; font-size: 14px;">
@@ -126,7 +126,7 @@ export function buildInviteEmailHtml(inviterName: string, verifyToken: string) {
       </p>
     </div>
   `;
-  return { subject: `Invitation from ${inviterName} to join HRMS`, html };
+  return { subject: `Set up your HRMS client login (invite from ${inviterName})`, html };
 }
 
 export function buildPasswordOtpEmailHtml(otp: string) {

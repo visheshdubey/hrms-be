@@ -13,6 +13,7 @@ import {
   queuePasswordResetEmail,
   queueVerificationEmail,
 } from '../queue/email-service.js';
+import { ensureOrgDefaultAccount } from '../lib/ensure-org-account.js';
 
 async function dispatchEmail(
   queueFn: () => Promise<{ queued: boolean; inline?: boolean }>,
@@ -63,25 +64,50 @@ function roleForPortal(portal: PortalType): UserRole {
 function normalizeInviteRole(role: string | undefined, portal: PortalType): UserRole {
   const normalized = (role ?? '').toLowerCase().replace(/\s+/g, '_');
 
-  if (portal === 'org') {
-    if (normalized === 'org_admin' || normalized === 'admin') return 'org_admin';
-    return 'org_staff';
+  // Explicit org / recruiter API roles (recruiter admin may invite client portal users)
+  if (normalized === 'org_admin') return 'org_admin';
+  if (normalized === 'org_staff') return 'org_staff';
+  if (normalized === 'recruiter_admin' || normalized === 'admin') {
+    return portal === 'org' ? 'org_admin' : 'recruiter_admin';
+  }
+  if (normalized === 'recruited_staff' || normalized === 'staff') {
+    return portal === 'org' ? 'org_staff' : 'recruited_staff';
   }
 
-  // recruiter portal
-  if (normalized === 'recruiter_admin' || normalized === 'admin') return 'recruiter_admin';
+  if (portal === 'org') {
+    return 'org_staff';
+  }
   return 'recruited_staff';
+}
+
+function portalForRole(role: UserRole, inviterPortal: PortalType): PortalType {
+  if (role === 'org_admin' || role === 'org_staff') return 'org';
+  if (role === 'recruiter_admin' || role === 'recruited_staff') return 'recruiter';
+  return inviterPortal;
 }
 
 const RECRUITER_ROLES: UserRole[] = ['recruiter_admin', 'recruited_staff'];
 const ORG_ROLES: UserRole[] = ['org_admin', 'org_staff'];
 
-function assertRoleMatchesPortal(role: UserRole, portal: PortalType): string | null {
-  if (portal === 'recruiter' && !RECRUITER_ROLES.includes(role)) {
-    return 'Recruiter admins can only invite Recruiter Admin or Recruiter Staff roles.';
+function assertCanInvite(
+  inviterPortal: PortalType,
+  inviterRole: UserRole,
+  targetRole: UserRole,
+): string | null {
+  if (inviterPortal === 'org') {
+    if (!ORG_ROLES.includes(targetRole)) {
+      return 'Org admins can only invite Org Admin or Org Staff roles.';
+    }
+    return null;
   }
-  if (portal === 'org' && !ORG_ROLES.includes(role)) {
-    return 'Org admins can only invite Org Admin or Org Staff roles.';
+
+  // Recruiter admin may invite both recruiter team and client (org) portal users.
+  if (inviterRole === 'recruiter_admin') {
+    return null;
+  }
+
+  if (!RECRUITER_ROLES.includes(targetRole)) {
+    return 'Recruiter staff can only invite Recruiter Admin or Recruiter Staff roles.';
   }
   return null;
 }
@@ -299,6 +325,15 @@ auth.post('/register', zValidator('json', registerSchema), async (c) => {
       organizationId: newOrg.id,
     }).returning(userProfileFields);
 
+    // Org portal posts jobs against CRM accounts — create a default company account.
+    if (resolvedPortal === 'org') {
+      await ensureOrgDefaultAccount({
+        organizationId: newOrg.id,
+        createdBy: newUser[0].id,
+        accountName: orgName,
+      });
+    }
+
     const verifyToken = jwt.sign({ email: newUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
     const emailSent = await dispatchEmail(
       () => queueVerificationEmail(email, verifyToken),
@@ -338,12 +373,14 @@ auth.post('/invite', zValidator('json', inviteSchema), async (c) => {
     }
 
     const inviterUser = inviter[0];
-    const portal = (inviterUser.portalType ?? 'recruiter') as PortalType;
-    const resolvedRole = normalizeInviteRole(inviteRole, portal);
-    const portalError = assertRoleMatchesPortal(resolvedRole, portal);
-    if (portalError) {
-      return c.json({ error: portalError }, 403);
+    const inviterPortal = (inviterUser.portalType ?? 'recruiter') as PortalType;
+    const inviterRole = (inviterUser.role ?? 'recruited_staff') as UserRole;
+    const resolvedRole = normalizeInviteRole(inviteRole, inviterPortal);
+    const inviteError = assertCanInvite(inviterPortal, inviterRole, resolvedRole);
+    if (inviteError) {
+      return c.json({ error: inviteError }, 403);
     }
+    const portal = portalForRole(resolvedRole, inviterPortal);
 
     const newUser = await db.insert(users).values({
       name,
@@ -598,12 +635,18 @@ auth.patch('/users/:id/role', zValidator('json', z.object({ role: z.string() }))
       return c.json({ error: 'Target user not in your organization' }, 403);
     }
 
-    const portal = targetUser[0].portalType as PortalType;
-    const resolvedRole = normalizeInviteRole(role, portal);
-    const portalError = assertRoleMatchesPortal(resolvedRole, portal);
-    if (portalError) return c.json({ error: portalError }, 400);
+    const inviterPortal = (me[0].portalType ?? 'recruiter') as PortalType;
+    const inviterRole = (me[0].role ?? 'recruited_staff') as UserRole;
+    const resolvedRole = normalizeInviteRole(role, inviterPortal);
+    const inviteError = assertCanInvite(inviterPortal, inviterRole, resolvedRole);
+    if (inviteError) return c.json({ error: inviteError }, 400);
+    const nextPortal = portalForRole(resolvedRole, inviterPortal);
 
-    const updated = await db.update(users).set({ role: resolvedRole }).where(eq(users.id, targetId)).returning(userProfileFields);
+    const updated = await db
+      .update(users)
+      .set({ role: resolvedRole, portalType: nextPortal })
+      .where(eq(users.id, targetId))
+      .returning(userProfileFields);
     return c.json({ message: 'Role updated successfully', user: updated[0] });
   } catch {
     return c.json({ error: 'Invalid or expired token' }, 401);
