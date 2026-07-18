@@ -12,6 +12,16 @@ CONF_AVAILABLE="/etc/nginx/sites-available/${APP_NAME}.conf"
 CONF_ENABLED="/etc/nginx/sites-enabled/${APP_NAME}.conf"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 
+# True if a site file's server_name line claims this hostname (quoted/unquoted, multi-name).
+file_claims_server_name() {
+  local file="$1"
+  local domain="$2"
+  # Escape regex metacharacters in the hostname (especially dots).
+  local escaped
+  escaped="$(printf '%s' "${domain}" | sed -e 's/[.[\*^$()+?{|]/g' '\\&')"
+  grep -Eiq "server_name[[:space:]]+[^;]*${escaped}([\"[:space:];]|$)" "${file}" 2>/dev/null
+}
+
 # When two site files claim the same server_name, nginx keeps one and ignores the other
 # ("conflicting server name ... ignored"). That can leave the API domain pointing at FE HTML.
 purge_conflicting_server_names() {
@@ -25,22 +35,27 @@ purge_conflicting_server_names() {
       [[ -e "${file}" ]] || continue
       base="$(basename "${file}")"
       [[ "${base}" == "${keep_base}" ]] && continue
-      if grep -E "server_name[[:space:]]+[^;]*[[:space:]]${domain}([[:space:;]]|$)" "${file}" >/dev/null 2>&1 \
-        || grep -E "server_name[[:space:]]+${domain}([[:space:;]]|$)" "${file}" >/dev/null 2>&1; then
+      if file_claims_server_name "${file}" "${domain}"; then
         echo "WARN: removing conflicting nginx site ${file} (also claims ${domain})"
         rm -f "${file}"
+        # Park sites-available source so another deploy does not re-enable a bad vhost.
+        if [[ -f "/etc/nginx/sites-available/${base}" ]]; then
+          mv -f "/etc/nginx/sites-available/${base}" \
+            "/etc/nginx/sites-available/${base}.bak-conflict-$(date +%s)" 2>/dev/null || true
+        fi
       fi
     done
   done
 
-  # Drop stale available copies that are not our keep file (enabled symlinks already handled).
   if [[ -d /etc/nginx/sites-available ]]; then
     for file in /etc/nginx/sites-available/*; do
       [[ -e "${file}" ]] || continue
       base="$(basename "${file}")"
       [[ "${base}" == "${keep_base}" ]] && continue
-      if grep -E "server_name[[:space:]]+[^;]*[[:space:]]${domain}([[:space:;]]|$)" "${file}" >/dev/null 2>&1 \
-        || grep -E "server_name[[:space:]]+${domain}([[:space:;]]|$)" "${file}" >/dev/null 2>&1; then
+      case "${base}" in
+        *.bak-conflict-*) continue ;;
+      esac
+      if file_claims_server_name "${file}" "${domain}"; then
         echo "WARN: archiving conflicting sites-available ${file}"
         mv -f "${file}" "${file}.bak-conflict-$(date +%s)" 2>/dev/null || rm -f "${file}"
       fi
@@ -175,18 +190,42 @@ if [[ "${APP_NAME}" == "hrms-be" ]]; then
     exit 1
   fi
 
-  # Hit local nginx with correct SNI/Host (avoids CDN/DNS surprises; catches wrong vhost).
-  LOCAL_PUB=""
-  if [[ -f "${CERT_DIR}/fullchain.pem" ]]; then
-    LOCAL_PUB="$(curl -fsSk -m 15 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" 2>/dev/null || true)"
-  else
-    LOCAL_PUB="$(curl -fsS -m 15 --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/" 2>/dev/null || true)"
-  fi
+  verify_local_nginx_api() {
+    local body=""
+    if [[ -f "${CERT_DIR}/fullchain.pem" ]]; then
+      body="$(curl -fsSk -m 15 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" 2>/dev/null || true)"
+    else
+      body="$(curl -fsS -m 15 --resolve "${DOMAIN}:80:127.0.0.1" "http://${DOMAIN}/" 2>/dev/null || true)"
+    fi
+    echo "${body}"
+  }
+
+  LOCAL_PUB="$(verify_local_nginx_api)"
   echo "local-nginx body: ${LOCAL_PUB:0:200}"
+
+  # One repair pass if another vhost (e.g. MF-FE.conf) still steals this Host.
+  if echo "${LOCAL_PUB}" | grep -qiE '<html|hrms-ui|<!doctype' \
+    || ! echo "${LOCAL_PUB}" | grep -q 'APTO Hono API'; then
+    echo "WARN: local nginx not serving API yet — forcing conflict purge + reload"
+    purge_conflicting_server_names "${DOMAIN}" "${APP_NAME}.conf"
+    if [[ -f "${CERT_DIR}/fullchain.pem" ]]; then
+      write_http_redirect_and_https
+    else
+      write_http_only
+    fi
+    ln -sfn "${CONF_AVAILABLE}" "${CONF_ENABLED}"
+    nginx -t
+    systemctl reload nginx
+    sleep 1
+    LOCAL_PUB="$(verify_local_nginx_api)"
+    echo "local-nginx body (after repair): ${LOCAL_PUB:0:200}"
+  fi
+
   if echo "${LOCAL_PUB}" | grep -qiE '<html|hrms-ui|<!doctype'; then
     echo "ERROR: local nginx still serving frontend HTML for ${DOMAIN}"
     echo "---- nginx sites claiming ${DOMAIN} ----"
     grep -RIn "server_name.*${DOMAIN}" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null || true
+    ls -la /etc/nginx/sites-enabled/ || true
     exit 1
   fi
   if ! echo "${LOCAL_PUB}" | grep -q 'APTO Hono API'; then
