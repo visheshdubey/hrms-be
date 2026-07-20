@@ -31,13 +31,24 @@ restore_latest() {
 }
 
 restore_latest "MF-FE.conf"
+restore_latest "MF-FF.conf"
 restore_latest "hrms-fe.conf"
 
 echo
 echo "========== 4) CRITICAL: remove API hostname from FE configs (keep FE domain) =========="
 # Do NOT leave hrms-be.devcognito.tech on FE/MF-FE — that was the original bug.
-for f in /etc/nginx/sites-available/MF-FE.conf /etc/nginx/sites-available/hrms-fe.conf; do
+for f in /etc/nginx/sites-available/MF-FE.conf \
+         /etc/nginx/sites-available/MF-FF.conf \
+         /etc/nginx/sites-available/hrms-fe.conf \
+         /etc/nginx/sites-enabled/MF-FE.conf \
+         /etc/nginx/sites-enabled/MF-FF.conf \
+         /etc/nginx/sites-enabled/hrms-fe.conf; do
   [[ -f "$f" ]] || continue
+  # Fix empty server_name left by broken conflict-strip sed (nginx -t fails otherwise).
+  sed -E -i \
+    -e 's/^([[:space:]]*)server_name[[:space:]]*;/\1# server_name removed (invalid empty);/g' \
+    -e 's/^([[:space:]]*)server_name[[:space:]]+"[[:space:]]*";/\1# server_name removed (invalid empty);/g' \
+    "$f" || true
   if grep -Eiq 'server_name[^;]*hrms-be\.devcognito\.tech' "$f"; then
     echo "Stripping hrms-be.devcognito.tech from $f (keeps other server_names)"
     cp -a "$f" "${f}.pre-fix-$(date +%s)"
