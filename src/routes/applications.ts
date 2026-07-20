@@ -22,6 +22,7 @@ import {
   backfillNullApplicationStages,
 } from '../lib/applicationDefaults.js';
 import { createNotification, createNotificationsForUsers } from '../lib/notifications.js';
+import { insertApplicationStageHistory } from '../lib/application-history.js';
 
 const applicationsRouter = new Hono<AppContext>({ strict: false });
 
@@ -308,10 +309,12 @@ async function createApplicationRecord(params: {
     createdBy: params.userId,
   }).returning();
 
-  await db.insert(applicationStageHistory).values({
+  await insertApplicationStageHistory({
     applicationId: created[0].id,
     fromStatus:    null,
     toStatus:      'applied',
+    fromStageId:   null,
+    toStageId:     params.jobStageId ?? defaults.jobStageId ?? null,
     note:          'Application created',
     changedBy:     params.userId,
   });
@@ -627,10 +630,12 @@ applicationsRouter.patch(
         patch.status = nextStatus;
 
         await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
-        await db.insert(applicationStageHistory).values({
+        await insertApplicationStageHistory({
           applicationId: id,
           fromStatus: currentStatus,
           toStatus: nextStatus,
+          fromStageId: (row.jobStageId as number | null) ?? null,
+          toStageId: stage.id,
           note: body.note?.trim() || `Reopened → ${stage.name}`,
           changedBy: userId,
         });
@@ -684,18 +689,23 @@ applicationsRouter.patch(
         }
 
         const nextStatus: AppStatus = body.closeAs === 'hired' ? 'offer' : 'rejected';
+        const prevStageId = (row.jobStageId as number | null) ?? null;
         const historyNote =
           body.note?.trim() ||
-          (body.closeAs === 'hired' ? `Hired (${stage.name})` : `Rejected (${stage.name})`);
+          (body.closeAs === 'hired'
+            ? `Hired from stage #${prevStageId ?? 'n/a'} → ${stage.name}`
+            : `Rejected from stage #${prevStageId ?? 'n/a'} → ${stage.name}`);
 
         patch.jobStageId = stage.id;
         patch.status = nextStatus;
 
         await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
-        await db.insert(applicationStageHistory).values({
+        await insertApplicationStageHistory({
           applicationId: id,
           fromStatus: currentStatus,
           toStatus: nextStatus,
+          fromStageId: prevStageId,
+          toStageId: stage.id,
           note: historyNote,
           changedBy: userId,
         });
@@ -745,10 +755,12 @@ applicationsRouter.patch(
           patch.jobStageId = body.jobStageId;
 
           if (body.jobStageId !== row.jobStageId) {
-            await db.insert(applicationStageHistory).values({
+            await insertApplicationStageHistory({
               applicationId: id,
               fromStatus: currentStatus,
               toStatus: currentStatus,
+              fromStageId: (row.jobStageId as number | null) ?? null,
+              toStageId: body.jobStageId,
               note: `Moved to ${stage.name}`,
               changedBy: userId,
             });
@@ -835,10 +847,12 @@ applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSc
       .set({ status: nextStatus, updatedAt: now })
       .where(eq(applications.id, id));
 
-    await db.insert(applicationStageHistory).values({
+    await insertApplicationStageHistory({
       applicationId: id,
       fromStatus:    currentStatus,
       toStatus:      nextStatus,
+      fromStageId:   (row.jobStageId as number | null) ?? null,
+      toStageId:     (row.jobStageId as number | null) ?? null,
       note:          note ?? '',
       changedBy:     userId,
     });

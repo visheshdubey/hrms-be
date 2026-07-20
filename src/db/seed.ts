@@ -109,11 +109,8 @@ async function seed() {
     /* ── 4b. Client stage templates + jobs (4 statuses) linked to accounts ── */
     const defaultClientStages = [
       { name: 'Start', orderIndex: 0, stageType: 'initial' as const },
-      { name: 'Screening', orderIndex: 1, stageType: 'in_transit' as const },
-      { name: 'Technical Interview', orderIndex: 2, stageType: 'in_transit' as const },
-      { name: 'Final Interview', orderIndex: 3, stageType: 'in_transit' as const },
-      { name: 'Hired', orderIndex: 4, stageType: 'hired' as const },
-      { name: 'Rejected', orderIndex: 5, stageType: 'rejected' as const },
+      { name: 'Hired', orderIndex: 1, stageType: 'hired' as const },
+      { name: 'Rejected', orderIndex: 2, stageType: 'rejected' as const },
     ];
 
     for (const account of accountRows) {

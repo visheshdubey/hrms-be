@@ -102,6 +102,10 @@ export const applicationStageHistory = pgTable("application_stage_history", {
   applicationId: integer("application_id").notNull().references(() => applications.id),
   fromStatus: text("from_status"),
   toStatus: text("to_status", { enum: APP_STATUSES }).notNull(),
+  /** Pipeline stage the application left (null on first assign). */
+  fromStageId: integer("from_stage_id").references(() => jobStages.id),
+  /** Pipeline stage the application entered. */
+  toStageId: integer("to_stage_id").references(() => jobStages.id),
   note: text("note").default(""),
   changedBy: integer("changed_by").references(() => users.id),
   changedAt: text("changed_at").default(sql`CURRENT_TIMESTAMP`).notNull(),

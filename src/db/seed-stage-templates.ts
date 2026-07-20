@@ -7,13 +7,11 @@ import { db } from './index.js';
 import { accounts, accountStageTemplates } from './schema.js';
 import { applyTemplatesToAccountJobsWithoutStages } from '../lib/stages.js';
 
+/** System defaults only — users add In-Transit stages per job as needed. */
 const DEFAULT_CLIENT_STAGES = [
   { name: 'Start', orderIndex: 0, stageType: 'initial' as const },
-  { name: 'Screening', orderIndex: 1, stageType: 'in_transit' as const },
-  { name: 'Technical Interview', orderIndex: 2, stageType: 'in_transit' as const },
-  { name: 'Final Interview', orderIndex: 3, stageType: 'in_transit' as const },
-  { name: 'Hired', orderIndex: 4, stageType: 'hired' as const },
-  { name: 'Rejected', orderIndex: 5, stageType: 'rejected' as const },
+  { name: 'Hired', orderIndex: 1, stageType: 'hired' as const },
+  { name: 'Rejected', orderIndex: 2, stageType: 'rejected' as const },
 ];
 
 async function seedStageTemplates() {

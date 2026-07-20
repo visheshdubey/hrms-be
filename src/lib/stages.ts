@@ -14,6 +14,40 @@ export function canWriteStageTemplates(role: UserRole | null | undefined): boole
   return role === 'org_admin' || role === 'recruiter_admin';
 }
 
+/** Locked system stages every job must have. Delete/type-change disabled in API + UI. */
+export const DEFAULT_JOB_STAGES = [
+  { name: 'Start', orderIndex: 0, stageType: 'initial' as const, color: '#8b5cf6' },
+  { name: 'Hired', orderIndex: 1, stageType: 'hired' as const, color: '#06b6d4' },
+  { name: 'Rejected', orderIndex: 2, stageType: 'rejected' as const, color: '#ef4444' },
+] as const;
+
+/** Ensure Start / Hired / Rejected exist on a job (by stageType). Safe to re-run. */
+export async function ensureDefaultJobStages(jobId: number): Promise<number> {
+  const existing = await db
+    .select({ id: jobStages.id, stageType: jobStages.stageType, orderIndex: jobStages.orderIndex })
+    .from(jobStages)
+    .where(eq(jobStages.jobId, jobId));
+
+  const have = new Set(existing.map((s) => s.stageType));
+  let maxOrder = existing.reduce((m, s) => Math.max(m, s.orderIndex), -1);
+  let inserted = 0;
+
+  for (const def of DEFAULT_JOB_STAGES) {
+    if (have.has(def.stageType)) continue;
+    maxOrder += 1;
+    await db.insert(jobStages).values({
+      jobId,
+      name: def.name,
+      orderIndex: def.stageType === 'initial' ? 0 : maxOrder,
+      stageType: def.stageType,
+      color: def.color,
+    });
+    inserted += 1;
+  }
+
+  return inserted;
+}
+
 export async function getAccountIfAccessible(
   accountId: number,
   userId: number,
@@ -32,38 +66,54 @@ export async function getAccountIfAccessible(
   return account;
 }
 
-/** Copy client templates into a job when it has no stages yet. Returns count copied. */
+/** Copy client templates into a job when it has no stages yet. Always ensures Start/Hired/Rejected. */
 export async function copyAccountStageTemplatesToJob(
   accountId: number,
   jobId: number,
 ): Promise<number> {
-  const templates = await db
-    .select()
-    .from(accountStageTemplates)
-    .where(eq(accountStageTemplates.accountId, accountId))
-    .orderBy(accountStageTemplates.orderIndex);
-
-  if (templates.length === 0) return 0;
-
   const existing = await db
     .select({ id: jobStages.id })
     .from(jobStages)
     .where(eq(jobStages.jobId, jobId))
     .limit(1);
 
-  if (existing.length > 0) return 0;
+  if (existing.length > 0) {
+    await ensureDefaultJobStages(jobId);
+    return 0;
+  }
 
-  for (const template of templates) {
+  const templates = await db
+    .select()
+    .from(accountStageTemplates)
+    .where(eq(accountStageTemplates.accountId, accountId))
+    .orderBy(accountStageTemplates.orderIndex);
+
+  const source = templates.length > 0
+    ? templates.map((t) => ({
+        name: t.name,
+        orderIndex: t.orderIndex,
+        stageType: t.stageType,
+        color: t.color ?? defaultStageColor(t.orderIndex),
+      }))
+    : DEFAULT_JOB_STAGES.map((d) => ({
+        name: d.name,
+        orderIndex: d.orderIndex,
+        stageType: d.stageType,
+        color: d.color,
+      }));
+
+  for (const stage of source) {
     await db.insert(jobStages).values({
       jobId,
-      name: template.name,
-      orderIndex: template.orderIndex,
-      stageType: template.stageType,
-      color: template.color ?? defaultStageColor(template.orderIndex),
+      name: stage.name,
+      orderIndex: stage.orderIndex,
+      stageType: stage.stageType,
+      color: stage.color,
     });
   }
 
-  return templates.length;
+  await ensureDefaultJobStages(jobId);
+  return source.length;
 }
 
 /** Apply templates to all account jobs that have no stages configured. */

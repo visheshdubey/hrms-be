@@ -4,7 +4,7 @@ import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { eq, desc, inArray, and, or, isNull, sql, type SQL } from 'drizzle-orm';
 import { requireAuth, requireRole, ORG_ROLES, type AppContext, type UserRole } from '../middleware.js';
-import { jobs, jobStages, JOB_STAGE_TYPES, applications, users } from '../db/schema.js';
+import { jobs, jobStages, JOB_STAGE_TYPES, applications, users, applicationStageHistory } from '../db/schema.js';
 import { copyAccountStageTemplatesToJob, canWriteStageTemplates, getAccountIfAccessible } from '../lib/stages.js';
 import {
   canAccessJob,
@@ -14,6 +14,7 @@ import {
 } from '../lib/orgScope.js';
 import { defaultStageColor } from '../lib/stageColors.js';
 import { backfillNullApplicationStages } from '../lib/applicationDefaults.js';
+import { ensureApplicationHistoryStageColumns } from '../lib/application-history.js';
 
 const jobsRouter = new Hono<AppContext>({ strict: false });
 
@@ -547,11 +548,12 @@ jobsRouter.post('/:jobId/stages', requireAuth, zValidator('json', stageSchema), 
         .where(eq(jobStages.jobId, jobId));
       orderIndex = (maxRow?.max ?? -1) + 1;
     }
+    // Custom stages are always In-Transit. Start/Hired/Rejected are system-only.
     const [created] = await db.insert(jobStages).values({
       jobId,
       name: b.name,
       orderIndex,
-      stageType: b.stageType ?? 'initial',
+      stageType: 'in_transit',
       color: b.color ?? defaultStageColor(orderIndex),
     }).returning();
 
@@ -693,7 +695,7 @@ jobsRouter.delete('/:jobId/stages/:stageId', requireAuth, async (c) => {
   }
 });
 
-// GET /jobs/:jobId/stage-stats — candidate count per pipeline stage
+// GET /jobs/:jobId/stage-stats — headcounts + transition edge counts for pipeline mindmap
 jobsRouter.get('/:jobId/stage-stats', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
@@ -706,8 +708,10 @@ jobsRouter.get('/:jobId/stage-stats', requireAuth, async (c) => {
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     await backfillNullApplicationStages(jobId);
+    await ensureApplicationHistoryStageColumns();
 
     const stages = await selectJobStages(jobId);
+    const stageIdSet = new Set(stages.map((s) => s.id));
 
     let apps: Array<{ jobStageId: number | null }> = [];
     try {
@@ -738,8 +742,46 @@ jobsRouter.get('/:jobId/stage-stats', requireAuth, async (c) => {
       count: countByStage.get(stage.id) ?? 0,
     }));
 
+    // Transition edges: how many candidates moved from stage A → stage B
+    const transitions: Array<{ fromStageId: number; toStageId: number; count: number }> = [];
+    try {
+      const appIds = (
+        await db.select({ id: applications.id }).from(applications).where(eq(applications.jobId, jobId))
+      ).map((r) => r.id);
+
+      if (appIds.length > 0) {
+        const historyRows = await db
+          .select({
+            fromStageId: applicationStageHistory.fromStageId,
+            toStageId: applicationStageHistory.toStageId,
+          })
+          .from(applicationStageHistory)
+          .where(inArray(applicationStageHistory.applicationId, appIds));
+
+        const edgeCounts = new Map<string, number>();
+        for (const row of historyRows) {
+          if (row.fromStageId == null || row.toStageId == null) continue;
+          if (!stageIdSet.has(row.fromStageId) || !stageIdSet.has(row.toStageId)) continue;
+          if (row.fromStageId === row.toStageId) continue;
+          const key = `${row.fromStageId}->${row.toStageId}`;
+          edgeCounts.set(key, (edgeCounts.get(key) ?? 0) + 1);
+        }
+        for (const [key, count] of edgeCounts) {
+          const [fromRaw, toRaw] = key.split('->');
+          transitions.push({
+            fromStageId: Number(fromRaw),
+            toStageId: Number(toRaw),
+            count,
+          });
+        }
+      }
+    } catch {
+      // Columns may not exist yet on older DBs — mindmap falls back to headcounts.
+    }
+
     return c.json({
       data,
+      transitions,
       totalApplications: apps.length,
       unassignedCount: unassigned,
     });

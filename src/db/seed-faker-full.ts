@@ -64,13 +64,11 @@ const DEMO_USERS = [
   { name: 'Owen Org Staff', email: 'orgstaff@demo.com', role: 'org_staff' as const, portalType: 'org' as const },
 ];
 
+/** System defaults only — users add In-Transit stages per job as needed. */
 const DEFAULT_CLIENT_STAGES = [
   { name: 'Start', orderIndex: 0, stageType: 'initial' as const },
-  { name: 'Screening', orderIndex: 1, stageType: 'in_transit' as const },
-  { name: 'Technical Interview', orderIndex: 2, stageType: 'in_transit' as const },
-  { name: 'Final Interview', orderIndex: 3, stageType: 'in_transit' as const },
-  { name: 'Hired', orderIndex: 4, stageType: 'hired' as const },
-  { name: 'Rejected', orderIndex: 5, stageType: 'rejected' as const },
+  { name: 'Hired', orderIndex: 1, stageType: 'hired' as const },
+  { name: 'Rejected', orderIndex: 2, stageType: 'rejected' as const },
 ];
 
 const TAG_COLORS = ['#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#3b82f6', '#ef4444', '#14b8a6'];
