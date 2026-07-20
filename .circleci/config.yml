@@ -116,8 +116,13 @@ commands:
 
                         # Recreate API only. Recreating Redis every deploy races on fixed
                         # container_name hrms-be-redis-prod (Conflict: name already in use).
+                        # Force-remove by compose + name + id filter (orphans cause name conflicts).
+                        docker compose -p "$compose_project" -f "$compose_file" stop "$container_name" 2>/dev/null || true
+                        docker compose -p "$compose_project" -f "$compose_file" rm -f "$container_name" 2>/dev/null || true
                         docker stop "$container_name" 2>/dev/null || true
                         docker rm -f "$container_name" 2>/dev/null || true
+                        docker ps -aq --filter "name=^/${container_name}$" | xargs -r docker rm -f 2>/dev/null || true
+                        sleep 1
 
                         ensure_redis() {
                           if docker compose -p "$compose_project" -f "$compose_file" up -d redis; then
