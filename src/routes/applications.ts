@@ -46,7 +46,7 @@ export const STATUS_LABELS: Record<AppStatus, string> = {
   rejected:             'Rejected',
   interview_scheduled:  'Interview Scheduled',
   hold:                 'On Hold',
-  offer:                'Offer Extended',
+  offer:                'Hired',
   no_offer:             'No Offer',
 };
 
@@ -76,7 +76,16 @@ const notesSchema = z.object({ notes: z.string() });
 const assignmentSchema = z.object({
   assignedTo: z.number().int().positive(),
   jobStageId: z.number().int().positive().optional().nullable(),
+  /** Manual Hire / Reject only — never inferred from “next round”. */
+  closeAs: z.enum(['hired', 'rejected']).optional(),
+  /** Re-enable a closed (hired/rejected) application into a chosen stage. */
+  reopen: z.boolean().optional(),
+  note: z.string().optional(),
 });
+
+function isTerminalAppStatus(status: string): boolean {
+  return status === 'offer' || status === 'rejected' || status === 'no_offer';
+}
 
 /* ─── Helpers ─── */
 function safeJsonParse(str: string | null | undefined): string[] {
@@ -113,7 +122,13 @@ async function enrichApplication(app: Record<string, unknown>) {
     job = row ? { ...row, assignedTo: null } : null;
   }
 
-  let jobStage: { id: number; name: string; color: string; orderIndex: number } | null = null;
+  let jobStage: {
+    id: number;
+    name: string;
+    color: string;
+    orderIndex: number;
+    stageType?: string | null;
+  } | null = null;
   if (app.jobStageId != null) {
     try {
       const [stage] = await db
@@ -122,6 +137,7 @@ async function enrichApplication(app: Record<string, unknown>) {
           name: jobStages.name,
           color: jobStages.color,
           orderIndex: jobStages.orderIndex,
+          stageType: jobStages.stageType,
         })
         .from(jobStages)
         .where(eq(jobStages.id, app.jobStageId as number))
@@ -137,7 +153,7 @@ async function enrichApplication(app: Record<string, unknown>) {
         .from(jobStages)
         .where(eq(jobStages.id, app.jobStageId as number))
         .limit(1);
-      jobStage = stage ? { ...stage, color: '#6366f1' } : null;
+      jobStage = stage ? { ...stage, color: '#6366f1', stageType: null } : null;
     }
   }
 
@@ -565,18 +581,181 @@ applicationsRouter.patch(
 
       const body = c.req.valid('json');
       const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      const currentStatus = row.status as AppStatus;
+
+      let currentStageType: string | null = null;
+      if (row.jobStageId != null) {
+        try {
+          const [cur] = await db
+            .select({ stageType: jobStages.stageType })
+            .from(jobStages)
+            .where(eq(jobStages.id, row.jobStageId as number))
+            .limit(1);
+          currentStageType = cur?.stageType ?? null;
+        } catch {
+          currentStageType = null;
+        }
+      }
+
+      const isClosed =
+        isTerminalAppStatus(currentStatus) ||
+        currentStageType === 'hired' ||
+        currentStageType === 'rejected';
 
       if (body.assignedTo !== undefined) patch.assignedTo = body.assignedTo;
+
+      /* ── Re-open closed application into a chosen open stage ── */
+      if (body.reopen) {
+        if (!isClosed) {
+          return c.json({ error: 'Application is not closed' }, 400);
+        }
+        if (body.jobStageId == null) {
+          return c.json({ error: 'Select a stage to place the candidate in' }, 400);
+        }
+        const [stage] = await db
+          .select({ id: jobStages.id, name: jobStages.name, stageType: jobStages.stageType })
+          .from(jobStages)
+          .where(and(eq(jobStages.id, body.jobStageId), eq(jobStages.jobId, row.jobId)))
+          .limit(1);
+        if (!stage) return c.json({ error: 'Stage not found for this job' }, 400);
+        if (stage.stageType === 'hired' || stage.stageType === 'rejected') {
+          return c.json({ error: 'Re-open stage must be an open pipeline round (not Hired/Rejected)' }, 400);
+        }
+
+        const nextStatus: AppStatus = 'in_review';
+        patch.jobStageId = body.jobStageId;
+        patch.status = nextStatus;
+
+        await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
+        await db.insert(applicationStageHistory).values({
+          applicationId: id,
+          fromStatus: currentStatus,
+          toStatus: nextStatus,
+          note: body.note?.trim() || `Reopened → ${stage.name}`,
+          changedBy: userId,
+        });
+        await db
+          .update(candidates)
+          .set({ status: 'In Review' })
+          .where(eq(candidates.id, row.candidateId as number));
+
+        const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
+        return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
+      }
+
+      if (isClosed) {
+        return c.json(
+          {
+            error:
+              'Application is closed (hired or rejected). Re-open it and choose a stage to continue.',
+          },
+          409,
+        );
+      }
+
+      /* ── Manual Hire / Reject (closes application) ── */
+      if (body.closeAs) {
+        const targetType = body.closeAs === 'hired' ? 'hired' : 'rejected';
+        let stage:
+          | { id: number; name: string; stageType: string }
+          | undefined;
+
+        if (body.jobStageId != null) {
+          const [picked] = await db
+            .select({ id: jobStages.id, name: jobStages.name, stageType: jobStages.stageType })
+            .from(jobStages)
+            .where(and(eq(jobStages.id, body.jobStageId), eq(jobStages.jobId, row.jobId)))
+            .limit(1);
+          if (!picked || picked.stageType !== targetType) {
+            return c.json({ error: `Selected stage is not a ${targetType} stage` }, 400);
+          }
+          stage = picked;
+        } else {
+          const [found] = await db
+            .select({ id: jobStages.id, name: jobStages.name, stageType: jobStages.stageType })
+            .from(jobStages)
+            .where(and(eq(jobStages.jobId, row.jobId), eq(jobStages.stageType, targetType)))
+            .limit(1);
+          stage = found;
+        }
+
+        if (!stage) {
+          return c.json({ error: `No ${targetType} stage configured for this job` }, 400);
+        }
+
+        const nextStatus: AppStatus = body.closeAs === 'hired' ? 'offer' : 'rejected';
+        const historyNote =
+          body.note?.trim() ||
+          (body.closeAs === 'hired' ? `Hired (${stage.name})` : `Rejected (${stage.name})`);
+
+        patch.jobStageId = stage.id;
+        patch.status = nextStatus;
+
+        await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
+        await db.insert(applicationStageHistory).values({
+          applicationId: id,
+          fromStatus: currentStatus,
+          toStatus: nextStatus,
+          note: historyNote,
+          changedBy: userId,
+        });
+        await db
+          .update(candidates)
+          .set({
+            status: body.closeAs === 'hired' ? 'Hired' : 'Rejected',
+          })
+          .where(eq(candidates.id, row.candidateId as number));
+
+        const notifyUserId = (body.assignedTo ?? row.assignedTo) as number | null;
+        if (notifyUserId) {
+          await createNotification({
+            userId: notifyUserId,
+            title: body.closeAs === 'hired' ? 'Candidate hired' : 'Candidate rejected',
+            body: `Application #${id} marked as ${body.closeAs}.`,
+            type: 'stage_change',
+            relatedId: id,
+            relatedType: 'application',
+          });
+        }
+
+        const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
+        return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
+      }
+
+      /* ── Normal round move / assignee update (never auto Hire/Reject) ── */
       if (body.jobStageId !== undefined) {
         if (body.jobStageId != null) {
           const [stage] = await db
-            .select({ id: jobStages.id })
+            .select({ id: jobStages.id, name: jobStages.name, stageType: jobStages.stageType })
             .from(jobStages)
             .where(and(eq(jobStages.id, body.jobStageId), eq(jobStages.jobId, row.jobId)))
             .limit(1);
           if (!stage) return c.json({ error: 'Stage not found for this job' }, 400);
+
+          if (stage.stageType === 'hired' || stage.stageType === 'rejected') {
+            return c.json(
+              {
+                error:
+                  'Hired and Rejected require the Hire / Reject buttons — they cannot be reached via round moves.',
+              },
+              400,
+            );
+          }
+
+          patch.jobStageId = body.jobStageId;
+
+          if (body.jobStageId !== row.jobStageId) {
+            await db.insert(applicationStageHistory).values({
+              applicationId: id,
+              fromStatus: currentStatus,
+              toStatus: currentStatus,
+              note: `Moved to ${stage.name}`,
+              changedBy: userId,
+            });
+          }
+        } else {
+          patch.jobStageId = null;
         }
-        patch.jobStageId = body.jobStageId;
       }
 
       await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
@@ -632,6 +811,16 @@ applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSc
     if (!row) return c.json({ error: 'Application not found' }, 404);
 
     const currentStatus = row.status as AppStatus;
+    if (isTerminalAppStatus(currentStatus)) {
+      return c.json(
+        {
+          error:
+            'Application is closed (hired or rejected). Re-open it and choose a stage to continue.',
+        },
+        409,
+      );
+    }
+
     const allowed       = TRANSITIONS[currentStatus] ?? [];
 
     if (!allowed.includes(nextStatus)) {

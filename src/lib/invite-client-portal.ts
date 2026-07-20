@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { contacts, users } from '../db/schema.js';
+import { accounts, contacts, users } from '../db/schema.js';
 import { JWT_SECRET } from '../config.js';
 import { queueInviteEmail } from '../queue/email-service.js';
 import { sendInviteEmail } from '../utils/email.js';
@@ -28,6 +28,9 @@ async function dispatchInviteEmail(
 /**
  * Create an Org portal login for a CRM client account (same recruiter workspace)
  * and email a set-password / accept-invite link.
+ *
+ * Always links the user to the account via contacts.email (+ accounts.email)
+ * so job isolation can scope that client to only their jobs.
  */
 export async function inviteClientPortalUser(input: {
   email: string;
@@ -72,6 +75,17 @@ export async function inviteClientPortalUser(input: {
     .returning({ id: users.id, email: users.email });
 
   const now = new Date().toISOString();
+
+  // Keep account.email in sync — used by getAccessibleAccountIds for org portal scoping.
+  try {
+    await db
+      .update(accounts)
+      .set({ email, updatedAt: now })
+      .where(eq(accounts.id, input.accountId));
+  } catch (error) {
+    console.error('[client-portal-invite] account email update failed:', error);
+  }
+
   try {
     await db.insert(contacts).values({
       accountId: input.accountId,
@@ -87,7 +101,13 @@ export async function inviteClientPortalUser(input: {
       updatedAt: now,
     });
   } catch (error) {
-    console.error('[client-portal-invite] contact create failed (non-fatal):', error);
+    console.error('[client-portal-invite] contact create failed — rolling back user:', error);
+    await db.delete(users).where(eq(users.id, createdUser.id));
+    return {
+      invited: false,
+      reason: 'Could not link client login to the company account. Try again.',
+      email,
+    };
   }
 
   const verifyToken = jwt.sign({ email: createdUser.email, type: 'verify' }, JWT_SECRET, {

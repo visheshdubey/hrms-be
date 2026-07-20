@@ -12,18 +12,51 @@ CONF_AVAILABLE="/etc/nginx/sites-available/${APP_NAME}.conf"
 CONF_ENABLED="/etc/nginx/sites-enabled/${APP_NAME}.conf"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 
+# Escape hostname for use in grep -E / sed -E (] must be first in the class).
+escape_regex() {
+  printf '%s' "$1" | sed -e 's/[][\\.^$*+?(){}|]/g' '\\&'
+}
+
 # True if a site file's server_name line claims this hostname (quoted/unquoted, multi-name).
 file_claims_server_name() {
   local file="$1"
   local domain="$2"
-  # Escape regex metacharacters in the hostname (especially dots).
   local escaped
-  escaped="$(printf '%s' "${domain}" | sed -e 's/[.[\*^$()+?{|]/g' '\\&')"
-  grep -Eiq "server_name[[:space:]]+[^;]*${escaped}([\"[:space:];]|$)" "${file}" 2>/dev/null
+  escaped="$(escape_regex "${domain}")"
+  grep -Eiq "server_name[[:space:]]+[^;#]*${escaped}([\"[:space:];]|$)" "${file}" 2>/dev/null
 }
 
-# When two site files claim the same server_name, nginx keeps one and ignores the other
-# ("conflicting server name ... ignored"). That can leave the API domain pointing at FE HTML.
+# Frontend / other app vhosts — never delete these when applying the API site.
+is_protected_vhost() {
+  case "$1" in
+    hrms-fe.conf|MF-FE.conf|hrms.conf) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Remove only this hostname from server_name lines — do NOT delete whole FE vhosts.
+# Deleting MF-FE.conf / hrms-fe.conf wholesale breaks hrms.devcognito.tech TLS (wrong default cert).
+strip_server_name_from_file() {
+  local file="$1"
+  local domain="$2"
+  local escaped tmp
+  escaped="$(escape_regex "${domain}")"
+  tmp="$(mktemp)"
+  sed -E \
+    -e "s/([\"[:space:]])${escaped}([\"[:space:];])/\\1\\2/g" \
+    -e "s/server_name[[:space:]]+${escaped}([\"[:space:];])/server_name\\1/g" \
+    -e "s/server_name[[:space:]]+\"${escaped}\"([\"[:space:];])/server_name\\1/g" \
+    "${file}" >"${tmp}"
+  sed -E -i \
+    -e 's/server_name[[:space:]]*;/# server_name removed (conflict purge);/g' \
+    -e 's/server_name[[:space:]]+;/# server_name removed (conflict purge);/g' \
+    "${tmp}"
+  cat "${tmp}" >"${file}"
+  rm -f "${tmp}"
+}
+
+# When another site file also claims our API domain, strip that name only.
+# Never delete protected FE vhosts (that caused ERR_CERT_COMMON_NAME_INVALID for hrms.devcognito.tech).
 purge_conflicting_server_names() {
   local domain="$1"
   local keep_base="$2"
@@ -36,12 +69,16 @@ purge_conflicting_server_names() {
       base="$(basename "${file}")"
       [[ "${base}" == "${keep_base}" ]] && continue
       if file_claims_server_name "${file}" "${domain}"; then
-        echo "WARN: removing conflicting nginx site ${file} (also claims ${domain})"
-        rm -f "${file}"
-        # Park sites-available source so another deploy does not re-enable a bad vhost.
-        if [[ -f "/etc/nginx/sites-available/${base}" ]]; then
-          mv -f "/etc/nginx/sites-available/${base}" \
-            "/etc/nginx/sites-available/${base}.bak-conflict-$(date +%s)" 2>/dev/null || true
+        echo "WARN: stripping ${domain} from conflicting nginx site ${file}"
+        cp -a "${file}" "${file}.bak-strip-$(date +%s)" 2>/dev/null || true
+        strip_server_name_from_file "${file}" "${domain}"
+        if is_protected_vhost "${base}"; then
+          echo "WARN: keeping protected vhost ${base} (FE TLS)"
+          continue
+        fi
+        if ! grep -Eq 'server_name[[:space:]]+[^;#]+;' "${file}" 2>/dev/null; then
+          echo "WARN: ${file} has no remaining server_name — disabling"
+          rm -f "${file}"
         fi
       fi
     done
@@ -53,11 +90,12 @@ purge_conflicting_server_names() {
       base="$(basename "${file}")"
       [[ "${base}" == "${keep_base}" ]] && continue
       case "${base}" in
-        *.bak-conflict-*) continue ;;
+        *.bak-conflict-*|*.bak-strip-*) continue ;;
       esac
       if file_claims_server_name "${file}" "${domain}"; then
-        echo "WARN: archiving conflicting sites-available ${file}"
-        mv -f "${file}" "${file}.bak-conflict-$(date +%s)" 2>/dev/null || rm -f "${file}"
+        echo "WARN: stripping ${domain} from sites-available ${file}"
+        cp -a "${file}" "${file}.bak-strip-$(date +%s)" 2>/dev/null || true
+        strip_server_name_from_file "${file}" "${domain}"
       fi
     done
   fi

@@ -35,14 +35,16 @@ export async function createNamedClientAccount(input: {
 
 /**
  * Ensure this Org portal user has at least one linked CRM account (their company only).
- * Does NOT return another client's account in a shared agency workspace.
+ * Does NOT return / steal another client's account in a shared agency workspace.
+ * Does NOT invent a second company when the agency already has CRM accounts
+ * (missing link = invite/contact issue — safer empty than wrong company).
  */
 export async function ensureOrgUserLinkedAccount(input: {
   organizationId: number;
   userId: number;
   role: string | null;
   accountName?: string;
-}): Promise<{ id: number; name: string }> {
+}): Promise<{ id: number; name: string } | null> {
   const linked = await getAccessibleAccountIds(input.userId, input.organizationId, input.role);
   if (linked.length > 0) {
     const [row] = await db
@@ -51,6 +53,17 @@ export async function ensureOrgUserLinkedAccount(input: {
       .where(eq(accounts.id, linked[0]))
       .limit(1);
     if (row) return row;
+  }
+
+  const [existingInOrg] = await db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(eq(accounts.organizationId, input.organizationId))
+    .limit(1);
+
+  // Agency already has clients — do not create another orphan company for this login.
+  if (existingInOrg) {
+    return null;
   }
 
   const [user] = await db
@@ -95,7 +108,7 @@ export async function ensureOrgUserLinkedAccount(input: {
         updatedAt: now,
       });
     } catch {
-      // non-fatal — account alone is enough for Post Job
+      // account.email still links via getAccessibleAccountIds
     }
   }
 
