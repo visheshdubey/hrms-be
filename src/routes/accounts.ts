@@ -4,8 +4,8 @@ import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { accounts, contacts, users, jobs, accountStageTemplates, JOB_STAGE_TYPES, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
 import { eq, desc, sql, and, inArray, type SQL } from 'drizzle-orm';
-import { requireAuth, requireRole, type AppContext, type UserRole } from '../middleware.js';
-import { belongsToOrganization, orgOrCreatorScope, getOrgMemberIds, getAccessibleAccountIds, isOrgPortalRole } from '../lib/orgScope.js';
+import { belongsToOrganization, orgOrCreatorScope, getOrgMemberIds, getAccessibleAccountIds, isOrgPortalRole, canAccessAccountId } from '../lib/orgScope.js';
+import { requireAuth, requireRole, type AppContext, type UserRole, RECRUITER_ROLES, ORG_ROLES } from '../middleware.js';
 import {
   applyTemplatesToAccountJobsWithoutStages,
   canWriteStageTemplates,
@@ -599,16 +599,21 @@ accountsRouter.get('/:id/stats', requireAuth, requireRole('recruiter_admin', 're
 });
 
 /* GET /accounts/:id */
-accountsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
+accountsRouter.get('/:id', requireAuth, requireRole(...RECRUITER_ROLES, ...ORG_ROLES), async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
     const row = await getAccountByIdSafe(id);
     if (!row.length) return c.json({ error: 'Account not found' }, 404);
 
-    if (!belongsToOrganization(row[0].organizationId, orgId, row[0].createdBy, userId)) {
+    if (isOrgPortalRole(role)) {
+      if (!(await canAccessAccountId(id, userId, orgId, role))) {
+        return c.json({ error: 'Account not found' }, 404);
+      }
+    } else if (!belongsToOrganization(row[0].organizationId, orgId, row[0].createdBy, userId)) {
       return c.json({ error: 'Account not found' }, 404);
     }
 
@@ -625,6 +630,23 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
     const orgId = c.get('organizationId') as number | null;
     const b = c.req.valid('json');
     const now = new Date().toISOString();
+
+    // Block duplicate client names within the same agency workspace (case-insensitive).
+    if (orgId != null) {
+      const [dup] = await db
+        .select({ id: accounts.id })
+        .from(accounts)
+        .where(
+          and(
+            eq(accounts.organizationId, orgId),
+            sql`lower(trim(${accounts.name})) = lower(trim(${b.name}))`,
+          ),
+        )
+        .limit(1);
+      if (dup) {
+        return c.json({ error: 'A client with this name already exists in your workspace' }, 409);
+      }
+    }
 
     let created: typeof accounts.$inferSelect | undefined;
     try {
@@ -697,26 +719,43 @@ accountsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruited_
 });
 
 /* PUT /accounts/:id */
-accountsRouter.put('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', accountBody.partial()), async (c) => {
+accountsRouter.put('/:id', requireAuth, requireRole(...RECRUITER_ROLES, ...ORG_ROLES), zValidator('json', accountBody.partial()), async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
 
     const [existing] = await getAccountByIdSafe(id);
     if (!existing) return c.json({ error: 'Account not found' }, 404);
-    if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
+
+    if (isOrgPortalRole(role)) {
+      if (!(await canAccessAccountId(id, userId, orgId, role))) {
+        return c.json({ error: 'Account not found' }, 404);
+      }
+    } else if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
       return c.json({ error: 'Account not found' }, 404);
     }
 
     const b = c.req.valid('json');
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
-    for (const k of ['name','status','type','contractValue','website','description','phone','email','address','city','state','country','shortLogoUrl','longLogoUrl'] as const) {
+
+    // Org portal may update company profile fields only (not CRM type/status/contract).
+    const orgAllowed = ['name', 'website', 'description', 'phone', 'email', 'address', 'city', 'state', 'country'] as const;
+    const recruiterAllowed = [
+      'name', 'status', 'type', 'contractValue', 'website', 'description', 'phone', 'email',
+      'address', 'city', 'state', 'country', 'shortLogoUrl', 'longLogoUrl',
+    ] as const;
+    const allowedKeys = isOrgPortalRole(role) ? orgAllowed : recruiterAllowed;
+
+    for (const k of allowedKeys) {
       if (b[k] !== undefined) patch[k] = b[k];
     }
-    if (b.tags !== undefined) patch.tags = JSON.stringify(b.tags);
-    if (b.alertsEnabled !== undefined) patch.alertsEnabled = b.alertsEnabled ? 1 : 0;
+    if (!isOrgPortalRole(role)) {
+      if (b.tags !== undefined) patch.tags = JSON.stringify(b.tags);
+      if (b.alertsEnabled !== undefined) patch.alertsEnabled = b.alertsEnabled ? 1 : 0;
+    }
 
     let updated: typeof accounts.$inferSelect | undefined;
     try {

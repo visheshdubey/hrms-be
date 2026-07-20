@@ -360,6 +360,8 @@ jobsRouter.post('/', requireAuth, requireRole(...ORG_ROLES), zValidator('json', 
       payCurrency: body.payCurrency ?? 'INR',
       applicants: 0,
       createdBy: userId,
+      // Job creator is the default owner; change later via Edit job → Assigned staff.
+      assignedTo: body.assignedTo ?? userId,
     }).returning();
 
     const job = created[0];
@@ -537,7 +539,14 @@ jobsRouter.post('/:jobId/stages', requireAuth, zValidator('json', stageSchema), 
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const b = c.req.valid('json');
-    const orderIndex = b.orderIndex ?? 0;
+    let orderIndex = b.orderIndex;
+    if (orderIndex === undefined) {
+      const [maxRow] = await db
+        .select({ max: sql<number>`coalesce(max(${jobStages.orderIndex}), -1)` })
+        .from(jobStages)
+        .where(eq(jobStages.jobId, jobId));
+      orderIndex = (maxRow?.max ?? -1) + 1;
+    }
     const [created] = await db.insert(jobStages).values({
       jobId,
       name: b.name,
