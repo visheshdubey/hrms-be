@@ -106,11 +106,22 @@ commands:
                   command: |
                       printf -v circle_project_reponame %q "${CIRCLE_PROJECT_REPONAME}"
                       ssh -o StrictHostKeyChecking=no root@147.93.18.45 "bash -s $circle_project_reponame" \<< 'EOF'
-                        set -e
+                        set -euo pipefail
                         circle_project_reponame_var=$1
                         compose_project="${circle_project_reponame_var}-<< parameters.environment >>"
                         compose_file="./docker/docker-compose.<< parameters.environment >>.yml"
                         container_name="${circle_project_reponame_var}-<< parameters.environment >>"
+
+                        # Duplicate CircleCI integrations can start overlapping workflows.
+                        # Serialize VPS deploys so two jobs cannot recreate the same fixed
+                        # container name at the same time.
+                        lock_file="/var/lock/${compose_project}.deploy.lock"
+                        exec 9>"$lock_file"
+                        if ! flock -w 600 9; then
+                          echo "ERROR: timed out waiting for deployment lock: $lock_file"
+                          exit 1
+                        fi
+                        echo "Acquired deployment lock: $lock_file"
 
                         cd /home/source/<< parameters.environment >>/$circle_project_reponame_var/
 
