@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { accountPortalUsers, organizations, users } from '../db/schema.js';
+import { accountPortalUsers, accounts, organizations, users } from '../db/schema.js';
 import { and, eq, inArray } from 'drizzle-orm';
 import { sendInviteEmail, sendPasswordResetEmail, sendPasswordOtpEmail } from '../utils/email.js';
 import {
@@ -223,6 +223,23 @@ auth.get('/organization', async (c) => {
       return c.json({ error: 'Organization not found' }, 404);
     }
 
+    if ((user[0].portalType ?? 'recruiter') === 'org') {
+      const [accountId] = await getAccessibleAccountIds(
+        user[0].id,
+        user[0].organizationId,
+        user[0].role,
+      );
+      if (!accountId) return c.json({ error: 'Client account not found' }, 404);
+      const [account] = await db.select().from(accounts).where(eq(accounts.id, accountId)).limit(1);
+      if (!account) return c.json({ error: 'Client account not found' }, 404);
+      return c.json({
+        id: account.id,
+        name: account.name,
+        logo: account.shortLogoUrl ?? '',
+        defaults: { wordmarkUrl: account.longLogoUrl ?? '' },
+      });
+    }
+
     const org = await db.select().from(organizations)
       .where(eq(organizations.id, user[0].organizationId)).limit(1);
 
@@ -255,12 +272,40 @@ auth.put('/organization', zValidator('json', orgUpdateSchema), async (c) => {
     if (!user.length) return c.json({ error: 'User not found' }, 404);
 
     const role = user[0].role;
+    const body = c.req.valid('json');
+
+    // Backward compatibility for the currently deployed client settings screen:
+    // map its workspace branding request to the linked client account, never the agency.
+    if (role === 'org_admin' && (user[0].portalType ?? 'org') === 'org') {
+      if (!user[0].organizationId) return c.json({ error: 'Organization not found' }, 404);
+      const [accountId] = await getAccessibleAccountIds(
+        user[0].id,
+        user[0].organizationId,
+        role,
+      );
+      if (!accountId) return c.json({ error: 'Client account not found' }, 404);
+      const patch: Partial<typeof accounts.$inferInsert> = {};
+      if (body.logo !== undefined) patch.shortLogoUrl = body.logo;
+      const wordmarkUrl = body.defaults?.wordmarkUrl;
+      if (typeof wordmarkUrl === 'string') patch.longLogoUrl = wordmarkUrl;
+      const [updated] = Object.keys(patch).length > 0
+        ? await db.update(accounts).set(patch).where(eq(accounts.id, accountId)).returning()
+        : await db.select().from(accounts).where(eq(accounts.id, accountId)).limit(1);
+      if (!updated) return c.json({ error: 'Client account not found' }, 404);
+      return c.json({
+        id: updated.id,
+        name: updated.name,
+        logo: updated.shortLogoUrl ?? '',
+        defaults: { wordmarkUrl: updated.longLogoUrl ?? '' },
+        message: 'Client branding updated',
+      });
+    }
+
     if (role !== 'recruiter_admin') {
       return c.json({ error: 'Forbidden: recruiter admin access required' }, 403);
     }
     if (!user[0].organizationId) return c.json({ error: 'Organization not found' }, 404);
 
-    const body = c.req.valid('json');
     const patch: Record<string, unknown> = {};
     if (body.name != null) patch.name = body.name;
     if (body.logo != null) patch.logo = body.logo;
