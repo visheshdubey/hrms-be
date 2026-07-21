@@ -3,6 +3,9 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Hono } from 'hono';
 import { requireAuth, type AppContext } from '../middleware.js';
+import { db } from '../db/index.js';
+import { uploadAssets } from '../db/schema.js';
+import { and, eq } from 'drizzle-orm';
 import { enqueueUploadTask } from '../queue/upload-queue.js';
 import { cdn, type CdnFolder } from '../lib/bunny-cdn.js';
 
@@ -56,6 +59,7 @@ async function handleUpload(
   folder: CdnFolder,
   allowedMimes: Set<string>,
   maxBytes: number,
+  owner: { userId: number; organizationId: number | null },
 ): Promise<{ url: string; storagePath?: string }> {
   if (!allowedMimes.has(file.type)) {
     throw Object.assign(new Error('Unsupported file type'), { status: 400 });
@@ -70,6 +74,12 @@ async function handleUpload(
 
   if (cdn.isConfigured()) {
     const result = await cdn.upload(folder, buffer, filename);
+    await db.insert(uploadAssets).values({
+      storagePath: result.storagePath,
+      url: result.cdnUrl,
+      createdBy: owner.userId,
+      organizationId: owner.organizationId,
+    });
     return { url: result.cdnUrl, storagePath: result.storagePath };
   }
 
@@ -92,7 +102,9 @@ uploadsRouter.post('/images', requireAuth, async (c) => {
     const userId = c.get('userId') as number;
     const organizationId = c.get('organizationId') as number | null;
 
-    const { url, storagePath } = await handleUpload(file, 'images', IMAGE_MIME, IMAGE_MAX_BYTES);
+    const { url, storagePath } = await handleUpload(
+      file, 'images', IMAGE_MIME, IMAGE_MAX_BYTES, { userId, organizationId },
+    );
 
     let uploadTaskId: string | undefined;
     if (!cdn.isConfigured() && file.size >= HEAVY_UPLOAD_BYTES) {
@@ -132,7 +144,10 @@ uploadsRouter.post('/avatars', requireAuth, async (c) => {
     if (!file || !(file instanceof File)) {
       return c.json({ error: 'Avatar file is required' }, 400);
     }
-    const { url } = await handleUpload(file, 'avatars', AVATAR_MIME, AVATAR_MAX_BYTES);
+    const { url } = await handleUpload(file, 'avatars', AVATAR_MIME, AVATAR_MAX_BYTES, {
+      userId: c.get('userId') as number,
+      organizationId: c.get('organizationId') as number | null,
+    });
     return c.json({ url });
   } catch (error: any) {
     if (error?.status === 400) return c.json({ error: error.message }, 400);
@@ -149,7 +164,10 @@ uploadsRouter.post('/logos', requireAuth, async (c) => {
     if (!file || !(file instanceof File)) {
       return c.json({ error: 'Logo file is required' }, 400);
     }
-    const { url, storagePath } = await handleUpload(file, 'logos', LOGO_MIME, LOGO_MAX_BYTES);
+    const { url, storagePath } = await handleUpload(file, 'logos', LOGO_MIME, LOGO_MAX_BYTES, {
+      userId: c.get('userId') as number,
+      organizationId: c.get('organizationId') as number | null,
+    });
     return c.json({ url, ...(storagePath ? { storagePath } : {}) });
   } catch (error: any) {
     if (error?.status === 400) return c.json({ error: error.message }, 400);
@@ -166,7 +184,10 @@ uploadsRouter.post('/resumes', requireAuth, async (c) => {
     if (!file || !(file instanceof File)) {
       return c.json({ error: 'Resume file is required' }, 400);
     }
-    const { url } = await handleUpload(file, 'resumes', DOC_MIME, 10 * 1024 * 1024);
+    const { url } = await handleUpload(file, 'resumes', DOC_MIME, 10 * 1024 * 1024, {
+      userId: c.get('userId') as number,
+      organizationId: c.get('organizationId') as number | null,
+    });
     return c.json({ url });
   } catch (error: any) {
     if (error?.status === 400) return c.json({ error: error.message }, 400);
@@ -183,7 +204,10 @@ uploadsRouter.post('/documents', requireAuth, async (c) => {
     if (!file || !(file instanceof File)) {
       return c.json({ error: 'Document file is required' }, 400);
     }
-    const { url } = await handleUpload(file, 'documents', DOC_MIME, 10 * 1024 * 1024);
+    const { url } = await handleUpload(file, 'documents', DOC_MIME, 10 * 1024 * 1024, {
+      userId: c.get('userId') as number,
+      organizationId: c.get('organizationId') as number | null,
+    });
     return c.json({ url });
   } catch (error: any) {
     if (error?.status === 400) return c.json({ error: error.message }, 400);
@@ -198,7 +222,15 @@ uploadsRouter.delete('/file', requireAuth, async (c) => {
     const { storagePath } = await c.req.json<{ storagePath: string }>();
     if (!storagePath) return c.json({ error: 'storagePath is required' }, 400);
     if (!cdn.isConfigured()) return c.json({ error: 'CDN not configured' }, 501);
+    const userId = c.get('userId') as number;
+    const [asset] = await db.select({ storagePath: uploadAssets.storagePath })
+      .from(uploadAssets)
+      .where(and(eq(uploadAssets.storagePath, storagePath), eq(uploadAssets.createdBy, userId)))
+      .limit(1);
+    if (!asset) return c.json({ error: 'File not found' }, 404);
     await cdn.remove(storagePath);
+    await db.delete(uploadAssets)
+      .where(and(eq(uploadAssets.storagePath, storagePath), eq(uploadAssets.createdBy, userId)));
     return c.json({ ok: true });
   } catch (error) {
     console.error('File delete failed:', error);

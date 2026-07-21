@@ -6,8 +6,9 @@ import {
   orgSettings, rolesPermissions, organizations,
   ACCESS_CONTROL_TYPES,
 } from '../db/schema.js';
-import { eq, desc } from 'drizzle-orm';
+import { and, eq, desc } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
+import { getAccessibleAccountIds } from '../lib/orgScope.js';
 import tagsRoutes from './tags.js';
 import integrationsRoutes from './integrations.js';
 
@@ -158,12 +159,18 @@ settingsRouter.put('/org', requireAuth, requireRole('org_admin'), zValidator('js
 /* GET /settings/permissions */
 settingsRouter.get('/permissions', requireAuth, requireRole('org_admin'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
     if (!orgId) return c.json({ data: [] });
+    const [accountId] = await getAccessibleAccountIds(userId, orgId, 'org_admin');
+    if (!accountId) return c.json({ data: [] });
 
     const typeFilter = c.req.query('type') as AccessType | undefined;
     let rows = await db.select().from(rolesPermissions)
-      .where(eq(rolesPermissions.organizationId, orgId))
+      .where(and(
+        eq(rolesPermissions.organizationId, orgId),
+        eq(rolesPermissions.accountId, accountId),
+      ))
       .orderBy(desc(rolesPermissions.updatedAt));
 
     if (typeFilter) rows = rows.filter((r) => r.type === typeFilter);
@@ -180,12 +187,15 @@ settingsRouter.post('/permissions', requireAuth, requireRole('org_admin'), zVali
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
     if (!orgId) return c.json({ error: 'No organization' }, 404);
+    const [accountId] = await getAccessibleAccountIds(userId, orgId, 'org_admin');
+    if (!accountId) return c.json({ error: 'No linked client account' }, 404);
 
     const b = c.req.valid('json');
     const now = new Date().toISOString();
 
     const [created] = await db.insert(rolesPermissions).values({
       organizationId: orgId,
+      accountId,
       type: b.type,
       name: b.name,
       description: b.description ?? '',
@@ -207,6 +217,11 @@ settingsRouter.post('/permissions', requireAuth, requireRole('org_admin'), zVali
 /* PUT /settings/permissions/:id */
 settingsRouter.put('/permissions/:id', requireAuth, requireRole('org_admin'), zValidator('json', permissionBody.partial()), async (c) => {
   try {
+    const orgId = c.get('organizationId') as number | null;
+    if (!orgId) return c.json({ error: 'No organization' }, 404);
+    const userId = c.get('userId') as number;
+    const [accountId] = await getAccessibleAccountIds(userId, orgId, 'org_admin');
+    if (!accountId) return c.json({ error: 'No linked client account' }, 404);
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
     const b = c.req.valid('json');
@@ -222,7 +237,11 @@ settingsRouter.put('/permissions/:id', requireAuth, requireRole('org_admin'), zV
     if (b.isActive !== undefined) patch.isActive = b.isActive ? 1 : 0;
 
     const [updated] = await db.update(rolesPermissions).set(patch as any)
-      .where(eq(rolesPermissions.id, id)).returning();
+      .where(and(
+        eq(rolesPermissions.id, id),
+        eq(rolesPermissions.organizationId, orgId),
+        eq(rolesPermissions.accountId, accountId),
+      )).returning();
     if (!updated) return c.json({ error: 'Record not found' }, 404);
     return c.json(enrichPermission(updated));
   } catch {
@@ -233,9 +252,21 @@ settingsRouter.put('/permissions/:id', requireAuth, requireRole('org_admin'), zV
 /* DELETE /settings/permissions/:id */
 settingsRouter.delete('/permissions/:id', requireAuth, requireRole('org_admin'), async (c) => {
   try {
+    const orgId = c.get('organizationId') as number | null;
+    if (!orgId) return c.json({ error: 'No organization' }, 404);
+    const userId = c.get('userId') as number;
+    const [accountId] = await getAccessibleAccountIds(userId, orgId, 'org_admin');
+    if (!accountId) return c.json({ error: 'No linked client account' }, 404);
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
-    await db.delete(rolesPermissions).where(eq(rolesPermissions.id, id));
+    const [deleted] = await db.delete(rolesPermissions)
+      .where(and(
+        eq(rolesPermissions.id, id),
+        eq(rolesPermissions.organizationId, orgId),
+        eq(rolesPermissions.accountId, accountId),
+      ))
+      .returning({ id: rolesPermissions.id });
+    if (!deleted) return c.json({ error: 'Record not found' }, 404);
     return c.json({ ok: true });
   } catch {
     return c.json({ error: 'Failed to delete permission record' }, 500);

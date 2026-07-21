@@ -89,6 +89,65 @@ export async function ensureDefaultJobStages(jobId: number): Promise<number> {
   return inserted;
 }
 
+export async function normalizeAccountStageTemplateOrder(
+  accountId: number,
+  preferredInTransitIds?: number[],
+): Promise<void> {
+  const stages = await db
+    .select({
+      id: accountStageTemplates.id,
+      stageType: accountStageTemplates.stageType,
+      orderIndex: accountStageTemplates.orderIndex,
+    })
+    .from(accountStageTemplates)
+    .where(eq(accountStageTemplates.accountId, accountId))
+    .orderBy(accountStageTemplates.orderIndex);
+  const preferred = new Map((preferredInTransitIds ?? []).map((id, index) => [id, index]));
+  const inTransit = stages.filter((stage) => stage.stageType === 'in_transit');
+  inTransit.sort((a, b) => {
+    const aPreferred = preferred.get(a.id);
+    const bPreferred = preferred.get(b.id);
+    if (aPreferred != null && bPreferred != null) return aPreferred - bPreferred;
+    if (aPreferred != null) return -1;
+    if (bPreferred != null) return 1;
+    return a.orderIndex - b.orderIndex;
+  });
+  const ordered = [
+    ...stages.filter((stage) => stage.stageType === 'initial'),
+    ...inTransit,
+    ...stages.filter((stage) => stage.stageType === 'hired'),
+    ...stages.filter((stage) => stage.stageType === 'rejected'),
+  ];
+  await Promise.all(
+    ordered.map((stage, orderIndex) =>
+      db.update(accountStageTemplates)
+        .set({ orderIndex })
+        .where(eq(accountStageTemplates.id, stage.id)),
+    ),
+  );
+}
+
+export async function ensureDefaultAccountStageTemplates(accountId: number): Promise<void> {
+  const existing = await db
+    .select({ stageType: accountStageTemplates.stageType, orderIndex: accountStageTemplates.orderIndex })
+    .from(accountStageTemplates)
+    .where(eq(accountStageTemplates.accountId, accountId));
+  const have = new Set(existing.map((stage) => stage.stageType));
+  let maxOrder = existing.reduce((max, stage) => Math.max(max, stage.orderIndex), -1);
+  for (const stage of DEFAULT_JOB_STAGES) {
+    if (have.has(stage.stageType)) continue;
+    maxOrder += 1;
+    await db.insert(accountStageTemplates).values({
+      accountId,
+      name: stage.name,
+      orderIndex: stage.stageType === 'initial' ? 0 : maxOrder,
+      stageType: stage.stageType,
+      color: stage.color,
+    });
+  }
+  await normalizeAccountStageTemplateOrder(accountId);
+}
+
 export async function getAccountIfAccessible(
   accountId: number,
   userId: number,

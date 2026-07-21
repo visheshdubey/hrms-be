@@ -261,6 +261,27 @@ export const accounts = pgTable("accounts", {
   updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
+/** Explicit client-portal membership; avoids unsafe email-based account inference. */
+export const accountPortalUsers = pgTable(
+  "account_portal_users",
+  {
+    accountId: integer("account_id").notNull().references(() => accounts.id, { onDelete: "cascade" }),
+    userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+    createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+  },
+  (t) => ({
+    uniqueAccountUser: unique("account_portal_user_unique").on(t.accountId, t.userId),
+  }),
+);
+
+export const uploadAssets = pgTable("upload_assets", {
+  storagePath: text("storage_path").primaryKey(),
+  url: text("url").notNull(),
+  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+  organizationId: integer("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
 /* ── CRM: Contacts (people at accounts) ── */
 export const CONTACT_STATUSES = ["active", "inactive"] as const;
 
@@ -432,6 +453,7 @@ export const ACCESS_CONTROL_TYPES = [
 export const rolesPermissions = pgTable("roles_permissions", {
   id: serial("id").primaryKey(),
   organizationId: integer("organization_id").notNull().references(() => organizations.id),
+  accountId: integer("account_id").references(() => accounts.id, { onDelete: "cascade" }),
   type: text("type", { enum: ACCESS_CONTROL_TYPES }).notNull(),
   name: text("name").notNull(),
   description: text("description").default(""),

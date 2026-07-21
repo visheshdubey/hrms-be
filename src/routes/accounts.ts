@@ -2,14 +2,16 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { accounts, contacts, users, jobs, accountStageTemplates, JOB_STAGE_TYPES, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
+import { accounts, accountPortalUsers, contacts, users, jobs, accountStageTemplates, JOB_STAGE_TYPES, ACCOUNT_STATUSES, ACCOUNT_TYPES } from '../db/schema.js';
 import { eq, desc, sql, and, inArray, type SQL } from 'drizzle-orm';
 import { belongsToOrganization, orgOrCreatorScope, getOrgMemberIds, getAccessibleAccountIds, isOrgPortalRole, canAccessAccountId } from '../lib/orgScope.js';
 import { requireAuth, requireRole, type AppContext, type UserRole, RECRUITER_ROLES, ORG_ROLES } from '../middleware.js';
 import {
   applyTemplatesToAccountJobsWithoutStages,
   canWriteStageTemplates,
+  ensureDefaultAccountStageTemplates,
   getAccountIfAccessible,
+  normalizeAccountStageTemplateOrder,
 } from '../lib/stages.js';
 import { cascadeDeleteAccount, getAccountDeletePreview } from '../lib/accountDelete.js';
 import { ensureOrgUserLinkedAccount } from '../lib/ensure-org-account.js';
@@ -266,6 +268,7 @@ accountsRouter.get('/:id/stage-templates', requireAuth, async (c) => {
     const account = await getAccountIfAccessible(accountId, userId, orgId, role);
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
+    await ensureDefaultAccountStageTemplates(accountId);
     const stages = await db
       .select()
       .from(accountStageTemplates)
@@ -292,15 +295,21 @@ accountsRouter.post('/:id/stage-templates', requireAuth, zValidator('json', stag
     if (!account) return c.json({ error: 'Account not found or unauthorized' }, 403);
 
     const body = c.req.valid('json');
-    const orderIndex = body.orderIndex ?? 0;
+    await ensureDefaultAccountStageTemplates(accountId);
+    const existing = await db
+      .select({ orderIndex: accountStageTemplates.orderIndex })
+      .from(accountStageTemplates)
+      .where(eq(accountStageTemplates.accountId, accountId));
+    const orderIndex = existing.reduce((max, stage) => Math.max(max, stage.orderIndex), -1) + 1;
     const [created] = await db.insert(accountStageTemplates).values({
       accountId,
       name: body.name,
       orderIndex,
-      stageType: body.stageType ?? 'initial',
+      stageType: 'in_transit',
       color: body.color ?? defaultStageColor(orderIndex),
     }).returning();
 
+    await normalizeAccountStageTemplateOrder(accountId);
     return c.json(created, 201);
   } catch {
     return c.json({ error: 'Failed to create stage template' }, 500);
@@ -322,7 +331,7 @@ accountsRouter.put('/:id/stage-templates/reorder', requireAuth, zValidator('json
 
     const { stageIds } = c.req.valid('json');
     const existing = await db
-      .select({ id: accountStageTemplates.id })
+      .select({ id: accountStageTemplates.id, stageType: accountStageTemplates.stageType })
       .from(accountStageTemplates)
       .where(eq(accountStageTemplates.accountId, accountId));
 
@@ -330,21 +339,19 @@ accountsRouter.put('/:id/stage-templates/reorder', requireAuth, zValidator('json
       return c.json({ error: 'No stage templates to reorder' }, 400);
     }
 
-    if (stageIds.length !== existing.length) {
-      return c.json({ error: 'stageIds must include every template for this account' }, 400);
-    }
-
     const existingIdSet = new Set(existing.map((row) => row.id));
     if (!stageIds.every((id) => existingIdSet.has(id))) {
       return c.json({ error: 'Invalid stageIds for this account' }, 400);
     }
-
-    await Promise.all(
-      stageIds.map((stageId, orderIndex) =>
-        db.update(accountStageTemplates)
-          .set({ orderIndex })
-          .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId))),
-      ),
+    const inTransitIds = existing
+      .filter((stage) => stage.stageType === 'in_transit')
+      .map((stage) => stage.id);
+    if (!inTransitIds.every((id) => stageIds.includes(id))) {
+      return c.json({ error: 'stageIds must include every in-transit template' }, 400);
+    }
+    await normalizeAccountStageTemplateOrder(
+      accountId,
+      stageIds.filter((id) => inTransitIds.includes(id)),
     );
 
     const templates = await db
@@ -376,8 +383,6 @@ accountsRouter.put('/:id/stage-templates/:stageId', requireAuth, zValidator('jso
     const body = c.req.valid('json');
     const patch: Record<string, unknown> = {};
     if (body.name !== undefined) patch.name = body.name;
-    if (body.orderIndex !== undefined) patch.orderIndex = body.orderIndex;
-    if (body.stageType !== undefined) patch.stageType = body.stageType;
     if (body.color !== undefined) patch.color = body.color;
 
     const [updated] = await db
@@ -409,10 +414,15 @@ accountsRouter.delete('/:id/stage-templates/:stageId', requireAuth, async (c) =>
 
     const [deleted] = await db
       .delete(accountStageTemplates)
-      .where(and(eq(accountStageTemplates.id, stageId), eq(accountStageTemplates.accountId, accountId)))
+      .where(and(
+        eq(accountStageTemplates.id, stageId),
+        eq(accountStageTemplates.accountId, accountId),
+        eq(accountStageTemplates.stageType, 'in_transit'),
+      ))
       .returning();
 
-    if (!deleted) return c.json({ error: 'Stage template not found' }, 404);
+    if (!deleted) return c.json({ error: 'Only in-transit templates can be deleted' }, 400);
+    await normalizeAccountStageTemplateOrder(accountId);
     return c.json({ ok: true });
   } catch {
     return c.json({ error: 'Failed to delete stage template' }, 500);
@@ -518,12 +528,33 @@ accountsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited_s
 /* POST /accounts/merge — must be before /:id */
 accountsRouter.post('/merge', requireAuth, requireRole('recruiter_admin'), zValidator('json', mergeSchema), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const { targetId, sourceIds } = c.req.valid('json');
     const sources = sourceIds.filter((id) => id !== targetId);
     if (sources.length === 0) return c.json({ error: 'No source accounts to merge' }, 400);
 
+    const accessibleIds = await getAccessibleAccountIds(userId, orgId, role);
+    if (![targetId, ...sources].every((id) => accessibleIds.includes(id))) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
+
     for (const sid of sources) {
+      const memberships = await db
+        .select({ userId: accountPortalUsers.userId })
+        .from(accountPortalUsers)
+        .where(eq(accountPortalUsers.accountId, sid));
+      for (const membership of memberships) {
+        await db
+          .insert(accountPortalUsers)
+          .values({ accountId: targetId, userId: membership.userId })
+          .onConflictDoNothing();
+      }
       await db.update(contacts).set({ accountId: targetId }).where(eq(contacts.accountId, sid));
+      await db.update(jobs).set({ accountId: targetId }).where(eq(jobs.accountId, sid));
+      await db.delete(accountPortalUsers).where(eq(accountPortalUsers.accountId, sid));
+      await db.delete(accountStageTemplates).where(eq(accountStageTemplates.accountId, sid));
       await db.delete(accounts).where(eq(accounts.id, sid));
     }
 

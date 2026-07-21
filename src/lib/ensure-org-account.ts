@@ -1,6 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { accounts, contacts, organizations, users } from '../db/schema.js';
+import { accountPortalUsers, accounts, contacts, organizations, users } from '../db/schema.js';
 import { getAccessibleAccountIds } from './orgScope.js';
 
 /**
@@ -29,6 +29,11 @@ export async function createNamedClientAccount(input: {
       updatedAt: now,
     })
     .returning({ id: accounts.id, name: accounts.name });
+
+  await db
+    .insert(accountPortalUsers)
+    .values({ accountId: created.id, userId: input.createdBy, createdAt: now })
+    .onConflictDoNothing();
 
   return created;
 }

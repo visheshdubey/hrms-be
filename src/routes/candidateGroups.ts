@@ -163,11 +163,17 @@ candidateGroupsRouter.post('/:id/members', requireAuth, requireRecruiter, zValid
       return c.json({ error: 'One or more candidates are outside your organization' }, 403);
     }
 
+    let added = 0;
     for (const candidateId of ownedIds) {
-      await db.insert(candidateGroupMembers).values({ groupId, candidateId }).onConflictDoNothing();
+      const inserted = await db
+        .insert(candidateGroupMembers)
+        .values({ groupId, candidateId })
+        .onConflictDoNothing()
+        .returning({ candidateId: candidateGroupMembers.candidateId });
+      added += inserted.length;
     }
 
-    return c.json({ ok: true, added: ownedIds.size });
+    return c.json({ ok: true, added });
   } catch {
     return c.json({ error: 'Failed to add members' }, 500);
   }

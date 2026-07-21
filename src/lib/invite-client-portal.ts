@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { accounts, contacts, users } from '../db/schema.js';
+import { accountPortalUsers, accounts, contacts, users } from '../db/schema.js';
 import { JWT_SECRET } from '../config.js';
 import { queueInviteEmail } from '../queue/email-service.js';
 import { sendInviteEmail } from '../utils/email.js';
@@ -75,6 +75,18 @@ export async function inviteClientPortalUser(input: {
     .returning({ id: users.id, email: users.email });
 
   const now = new Date().toISOString();
+
+  try {
+    await db.insert(accountPortalUsers).values({
+      accountId: input.accountId,
+      userId: createdUser.id,
+      createdAt: now,
+    });
+  } catch (error) {
+    console.error('[client-portal-invite] membership create failed — rolling back user:', error);
+    await db.delete(users).where(eq(users.id, createdUser.id));
+    return { invited: false, reason: 'Could not link client login to the company account.', email };
+  }
 
   // Keep account.email in sync — used by getAccessibleAccountIds for org portal scoping.
   try {

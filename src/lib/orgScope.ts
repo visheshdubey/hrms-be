@@ -1,5 +1,5 @@
 import { db } from '../db/index.js';
-import { accounts, contacts, users } from '../db/schema.js';
+import { accountPortalUsers, accounts, contacts, users } from '../db/schema.js';
 import { eq, and, or, isNull, sql, inArray, type SQL } from 'drizzle-orm';
 import { isSchemaDriftError } from './schemaDrift.js';
 import type { UserRole } from '../middleware.js';
@@ -101,10 +101,8 @@ async function getAccountIdsInOrg(orgId: number | null, userId: number): Promise
 /**
  * Account IDs the caller may use.
  * Recruiters: all accounts in the agency workspace.
- * Org portal users: only their client company, linked by:
- *   1) contacts.email match
- *   2) accounts.email match (Add client email)
- *   3) accounts.created_by = this user (org self-signup company)
+ * Org portal users: only explicitly linked client accounts.
+ * A unique legacy email/creator match is migrated into that explicit link once.
  */
 export async function getAccessibleAccountIds(
   userId: number,
@@ -115,6 +113,19 @@ export async function getAccessibleAccountIds(
     return getAccountIdsInOrg(orgId, userId);
   }
 
+  const membershipRows = await db
+    .select({ id: accounts.id })
+    .from(accountPortalUsers)
+    .innerJoin(accounts, eq(accountPortalUsers.accountId, accounts.id))
+    .where(
+      orgId == null
+        ? eq(accountPortalUsers.userId, userId)
+        : and(eq(accountPortalUsers.userId, userId), eq(accounts.organizationId, orgId)),
+    );
+  if (membershipRows.length > 0) {
+    return membershipRows.map((row) => row.id);
+  }
+
   const [user] = await db
     .select({ email: users.email })
     .from(users)
@@ -122,23 +133,31 @@ export async function getAccessibleAccountIds(
     .limit(1);
 
   const email = user?.email?.trim().toLowerCase() ?? '';
-  const ids = new Set<number>();
+  const legacyIds = new Set<number>();
 
   if (email) {
     const contactRows = await db
       .select({ accountId: contacts.accountId })
       .from(contacts)
-      .where(sql`lower(trim(${contacts.email})) = ${email}`);
+      .innerJoin(accounts, eq(contacts.accountId, accounts.id))
+      .where(
+        orgId == null
+          ? sql`lower(trim(${contacts.email})) = ${email}`
+          : and(
+              sql`lower(trim(${contacts.email})) = ${email}`,
+              eq(accounts.organizationId, orgId),
+            ),
+      );
 
     for (const row of contactRows) {
-      if (row.accountId != null) ids.add(row.accountId);
+      if (row.accountId != null) legacyIds.add(row.accountId);
     }
 
     const accountEmailWhere =
       orgId != null
         ? and(
             sql`lower(trim(${accounts.email})) = ${email}`,
-            or(eq(accounts.organizationId, orgId), isNull(accounts.organizationId)),
+            eq(accounts.organizationId, orgId),
           )
         : sql`lower(trim(${accounts.email})) = ${email}`;
 
@@ -146,36 +165,31 @@ export async function getAccessibleAccountIds(
       .select({ id: accounts.id })
       .from(accounts)
       .where(accountEmailWhere!);
-    for (const row of byAccountEmail) ids.add(row.id);
+    for (const row of byAccountEmail) legacyIds.add(row.id);
   }
 
   const createdWhere =
     orgId != null
       ? and(
           eq(accounts.createdBy, userId),
-          or(eq(accounts.organizationId, orgId), isNull(accounts.organizationId)),
+          eq(accounts.organizationId, orgId),
         )
       : eq(accounts.createdBy, userId);
 
   const createdRows = await db.select({ id: accounts.id }).from(accounts).where(createdWhere!);
-  for (const row of createdRows) ids.add(row.id);
+  for (const row of createdRows) legacyIds.add(row.id);
 
-  // Drop accounts outside this agency when org is set.
-  if (orgId != null && ids.size > 0) {
-    const scoped = await db
-      .select({ id: accounts.id, organizationId: accounts.organizationId })
-      .from(accounts)
-      .where(inArray(accounts.id, [...ids]));
-    return scoped
-      .filter(
-        (row) =>
-          row.organizationId === orgId ||
-          row.organizationId == null,
-      )
-      .map((row) => row.id);
+  // Never guess when an email maps to multiple client companies.
+  if (legacyIds.size !== 1) {
+    return [];
   }
 
-  return [...ids];
+  const [accountId] = [...legacyIds];
+  await db
+    .insert(accountPortalUsers)
+    .values({ accountId, userId })
+    .onConflictDoNothing();
+  return [accountId];
 }
 
 export async function canAccessAccountId(

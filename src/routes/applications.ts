@@ -11,9 +11,9 @@ import {
   users,
   APP_STATUSES,
 } from '../db/schema.js';
-import { eq, desc, and } from 'drizzle-orm';
+import { eq, desc, and, inArray } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext, type UserRole } from '../middleware.js';
-import { canAccessJob } from '../lib/orgScope.js';
+import { canAccessJob, getOrgMemberIds } from '../lib/orgScope.js';
 import { selectJobById } from '../lib/jobQueries.js';
 import { isSchemaDriftError } from '../lib/schemaDrift.js';
 import {
@@ -25,6 +25,21 @@ import { createNotification, createNotificationsForUsers } from '../lib/notifica
 import { insertApplicationStageHistory } from '../lib/application-history.js';
 
 const applicationsRouter = new Hono<AppContext>({ strict: false });
+
+async function canAccessCandidates(
+  candidateIds: number[],
+  userId: number,
+  orgId: number | null,
+): Promise<boolean> {
+  const uniqueIds = [...new Set(candidateIds)];
+  if (uniqueIds.length === 0) return true;
+  const memberIds = await getOrgMemberIds(orgId, userId);
+  const rows = await db
+    .select({ id: candidates.id })
+    .from(candidates)
+    .where(and(inArray(candidates.id, uniqueIds), inArray(candidates.createdBy, memberIds)));
+  return rows.length === uniqueIds.length;
+}
 
 type AppStatus = typeof APP_STATUSES[number];
 
@@ -438,6 +453,9 @@ applicationsRouter.post(
 
       const job = await getJobIfAccessible(jobId, userId, orgId, role);
       if (!job) return c.json({ error: 'Job not found' }, 404);
+      if (!(await canAccessCandidates(candidateIds, userId, orgId))) {
+        return c.json({ error: 'One or more candidates were not found' }, 404);
+      }
 
       if (job.status !== 'submission_in_progress') {
         return c.json(
@@ -528,6 +546,9 @@ applicationsRouter.post(
 
       const job = await getJobIfAccessible(jobId, userId, orgId, role);
       if (!job) return c.json({ error: 'Job not found' }, 404);
+      if (!(await canAccessCandidates([candidateId], userId, orgId))) {
+        return c.json({ error: 'Candidate not found' }, 404);
+      }
 
       if (job.status !== 'submission_in_progress') {
         return c.json(

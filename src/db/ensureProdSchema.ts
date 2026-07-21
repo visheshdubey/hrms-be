@@ -13,6 +13,20 @@ const STATEMENTS = [
   `ALTER TABLE accounts ADD COLUMN IF NOT EXISTS short_logo_url text DEFAULT ''`,
   `ALTER TABLE accounts ADD COLUMN IF NOT EXISTS long_logo_url text DEFAULT ''`,
   `ALTER TABLE accounts ADD COLUMN IF NOT EXISTS organization_id integer`,
+  `ALTER TABLE roles_permissions ADD COLUMN IF NOT EXISTS account_id integer REFERENCES accounts(id) ON DELETE CASCADE`,
+  `CREATE TABLE IF NOT EXISTS account_portal_users (
+    account_id integer NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at text NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT account_portal_user_unique UNIQUE (account_id, user_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS upload_assets (
+    storage_path text PRIMARY KEY,
+    url text NOT NULL,
+    created_by integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    organization_id integer REFERENCES organizations(id) ON DELETE CASCADE,
+    created_at text NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
 
   // jobs assignment + pay (pay may already exist)
   `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_to integer`,

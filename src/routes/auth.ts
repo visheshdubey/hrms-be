@@ -4,8 +4,8 @@ import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { organizations, users } from '../db/schema.js';
-import { eq } from 'drizzle-orm';
+import { accountPortalUsers, organizations, users } from '../db/schema.js';
+import { and, eq, inArray } from 'drizzle-orm';
 import { sendInviteEmail, sendPasswordResetEmail, sendPasswordOtpEmail } from '../utils/email.js';
 import {
   queueInviteEmail,
@@ -13,6 +13,32 @@ import {
   queuePasswordResetEmail,
 } from '../queue/email-service.js';
 import { JWT_SECRET } from '../config.js';
+import { getAccessibleAccountIds } from '../lib/orgScope.js';
+
+async function canManageTeamUser(
+  me: typeof users.$inferSelect,
+  target: typeof users.$inferSelect,
+): Promise<boolean> {
+  if (me.organizationId !== target.organizationId) return false;
+  if ((me.portalType ?? 'recruiter') === 'recruiter') {
+    return (target.portalType ?? 'recruiter') === 'recruiter';
+  }
+  const accountIds = await getAccessibleAccountIds(
+    me.id,
+    me.organizationId,
+    me.role,
+  );
+  if (accountIds.length === 0) return false;
+  const [membership] = await db
+    .select({ userId: accountPortalUsers.userId })
+    .from(accountPortalUsers)
+    .where(and(
+      eq(accountPortalUsers.userId, target.id),
+      inArray(accountPortalUsers.accountId, accountIds),
+    ))
+    .limit(1);
+  return Boolean(membership);
+}
 
 async function dispatchEmail(
   queueFn: () => Promise<{ queued: boolean; inline?: boolean }>,
@@ -229,8 +255,8 @@ auth.put('/organization', zValidator('json', orgUpdateSchema), async (c) => {
     if (!user.length) return c.json({ error: 'User not found' }, 404);
 
     const role = user[0].role;
-    if (role !== 'recruiter_admin' && role !== 'org_admin') {
-      return c.json({ error: 'Forbidden: admin access required' }, 403);
+    if (role !== 'recruiter_admin') {
+      return c.json({ error: 'Forbidden: recruiter admin access required' }, 403);
     }
     if (!user[0].organizationId) return c.json({ error: 'Organization not found' }, 404);
 
@@ -329,6 +355,22 @@ auth.post('/invite', zValidator('json', inviteSchema), async (c) => {
       portalType: portal,
       organizationId: inviterUser.organizationId,
     }).returning(userProfileFields);
+
+    if (inviterPortal === 'org') {
+      const accountIds = await getAccessibleAccountIds(
+        inviterUser.id,
+        inviterUser.organizationId,
+        inviterUser.role,
+      );
+      if (accountIds.length !== 1) {
+        await db.delete(users).where(eq(users.id, newUser[0].id));
+        return c.json({ error: 'Could not resolve the client account for this invitation' }, 400);
+      }
+      await db.insert(accountPortalUsers).values({
+        accountId: accountIds[0],
+        userId: newUser[0].id,
+      });
+    }
 
     const verifyToken = jwt.sign({ email: newUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
     const emailSent = await dispatchEmail(
@@ -520,19 +562,15 @@ auth.get('/team', async (c) => {
     const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, JWT_SECRET) as { id: number };
 
-    const me = await db
-      .select({ organizationId: users.organizationId })
-      .from(users)
-      .where(eq(users.id, decoded.id))
-      .limit(1);
+    const me = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
 
     if (me.length === 0) return c.json({ error: 'User not found' }, 404);
 
-    const orgId = me[0].organizationId;
+    const meUser = me[0];
+    const orgId = meUser.organizationId;
     if (!orgId) return c.json({ team: [] });
 
-    const team = await db
-      .select({
+    const teamFields = {
         id: users.id,
         name: users.name,
         email: users.email,
@@ -541,9 +579,23 @@ auth.get('/team', async (c) => {
         isVerified: users.isVerified,
         isActive: users.isActive,
         createdAt: users.createdAt,
-      })
-      .from(users)
-      .where(eq(users.organizationId, orgId));
+      } as const;
+    const team = (meUser.portalType ?? 'recruiter') === 'org'
+      ? await db
+          .select(teamFields)
+          .from(accountPortalUsers)
+          .innerJoin(users, eq(accountPortalUsers.userId, users.id))
+          .where(inArray(
+            accountPortalUsers.accountId,
+            await getAccessibleAccountIds(meUser.id, orgId, meUser.role),
+          ))
+      : await db
+          .select(teamFields)
+          .from(users)
+          .where(and(
+            eq(users.organizationId, orgId),
+            eq(users.portalType, 'recruiter'),
+          ));
 
     return c.json({ team });
   } catch {
@@ -569,8 +621,8 @@ auth.patch('/users/:id/role', zValidator('json', z.object({ role: z.string() }))
 
     const targetUser = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
     if (!targetUser.length) return c.json({ error: 'Target user not found' }, 404);
-    if (targetUser[0].organizationId !== me[0].organizationId) {
-      return c.json({ error: 'Target user not in your organization' }, 403);
+    if (!(await canManageTeamUser(me[0], targetUser[0]))) {
+      return c.json({ error: 'Target user not in your team' }, 403);
     }
 
     const inviterPortal = (me[0].portalType ?? 'recruiter') as PortalType;
@@ -609,8 +661,8 @@ auth.patch('/users/:id/status', zValidator('json', z.object({ isActive: z.number
 
     const targetUser = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
     if (!targetUser.length) return c.json({ error: 'Target user not found' }, 404);
-    if (targetUser[0].organizationId !== me[0].organizationId) {
-      return c.json({ error: 'Target user not in your organization' }, 403);
+    if (!(await canManageTeamUser(me[0], targetUser[0]))) {
+      return c.json({ error: 'Target user not in your team' }, 403);
     }
 
     const updated = await db.update(users).set({ isActive }).where(eq(users.id, targetId)).returning(userProfileFields);
@@ -631,11 +683,14 @@ auth.post('/resend-invite/:id', async (c) => {
 
     const me = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
     if (!me.length) return c.json({ error: 'User not found' }, 404);
+    if (me[0].role !== 'recruiter_admin' && me[0].role !== 'org_admin') {
+      return c.json({ error: 'Forbidden: admin access required' }, 403);
+    }
 
     const targetUser = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
     if (!targetUser.length) return c.json({ error: 'Target user not found' }, 404);
-    if (targetUser[0].organizationId !== me[0].organizationId) {
-      return c.json({ error: 'Target user not in your organization' }, 403);
+    if (!(await canManageTeamUser(me[0], targetUser[0]))) {
+      return c.json({ error: 'Target user not in your team' }, 403);
     }
     if (targetUser[0].isVerified === 1) {
       return c.json({ error: 'User is already verified' }, 400);
