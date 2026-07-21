@@ -82,6 +82,43 @@ const JOB_LOCATIONS = ['Remote', 'On-site', 'Hybrid'] as const;
 const CANDIDATE_STATUSES = ['New', 'In Review', 'Shortlisted', 'Interview', 'Rejected', 'Offer'] as const;
 const CANDIDATE_SOURCES = ['Internal', 'LinkedIn', 'Referral', 'Job Board', 'Agency'] as const;
 
+async function resetDemoData(): Promise<void> {
+  await db.execute(sql`
+    TRUNCATE TABLE
+      application_stage_history,
+      application_tags,
+      applications,
+      job_stages,
+      job_shortlists,
+      jobs,
+      contacts,
+      account_stage_templates,
+      account_portal_users,
+      accounts,
+      candidate_group_members,
+      candidate_groups,
+      candidate_tags,
+      candidates,
+      notifications,
+      submissions,
+      interviews,
+      calendar_events,
+      employees,
+      onboarding_workflows,
+      tasks,
+      campaigns,
+      tags,
+      integrations,
+      roles_permissions,
+      org_settings,
+      saved_reports,
+      upload_assets,
+      users,
+      organizations
+    RESTART IDENTITY CASCADE
+  `);
+}
+
 function envInt(key: string, fallback: number): number {
   const n = Number(process.env[key]);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
@@ -111,6 +148,12 @@ function uniquePairs(count: number, jobIds: number[], candidateIds: number[]) {
 
 async function seedFakerFull() {
   const force = process.env.SEED_FORCE === '1';
+  const reset = process.env.SEED_RESET === '1';
+  const singleLogin = process.env.SEED_SINGLE_LOGIN === '1';
+  if (reset) {
+    console.log('🧹 Removing existing application data and logins…');
+    await resetDemoData();
+  }
   const existing = await db.select().from(users).where(eq(users.email, DEMO_USERS[0].email)).limit(1);
   if (existing.length > 0 && !force) {
     console.log('✅ Demo data already exists. Run npm run db:demo to reset and re-seed.');
@@ -124,7 +167,8 @@ async function seedFakerFull() {
   const applicationCount = envInt('SEED_APPLICATIONS', 100);
   const tagCount = envInt('SEED_TAGS', 20);
   const groupCount = envInt('SEED_GROUPS', 5);
-  const extraTeamCount = envInt('SEED_TEAM_EXTRAS', 8);
+  const extraTeamCount = singleLogin ? 0 : envInt('SEED_TEAM_EXTRAS', 8);
+  const demoUsers = singleLogin ? DEMO_USERS.slice(0, 1) : DEMO_USERS;
 
   faker.seed(2026);
   console.log('🌱 Seeding full faker dataset for local QA…');
@@ -146,7 +190,7 @@ async function seedFakerFull() {
 
   /* ── Core portal logins + extra team (incl. pending invites) ── */
   const teamRows = [];
-  for (const demoUser of DEMO_USERS) {
+  for (const demoUser of demoUsers) {
     const [row] = await db.insert(users).values({
       name: demoUser.name,
       email: demoUser.email,
@@ -550,13 +594,15 @@ async function seedFakerFull() {
   console.log('│ Portal              │ Email                  │ Role             │ Password   │');
   console.log('├─────────────────────┼────────────────────────┼──────────────────┼────────────┤');
   console.log('│ Recruiter           │ recruiter@demo.com     │ recruiter_admin  │ Demo@12345 │');
-  console.log('│ Recruiter           │ staff@demo.com         │ recruited_staff  │ Demo@12345 │');
-  console.log('│ Org / Client        │ orgadmin@demo.com      │ org_admin        │ Demo@12345 │');
-  console.log('│ Org / Client        │ orgstaff@demo.com      │ org_staff        │ Demo@12345 │');
+  if (!singleLogin) {
+    console.log('│ Recruiter           │ staff@demo.com         │ recruited_staff  │ Demo@12345 │');
+    console.log('│ Org / Client        │ orgadmin@demo.com      │ org_admin        │ Demo@12345 │');
+    console.log('│ Org / Client        │ orgstaff@demo.com      │ org_staff        │ Demo@12345 │');
+  }
   console.log('└─────────────────────┴────────────────────────┴──────────────────┴────────────┘');
   console.log('\nCounts:');
   console.log(`   Organization : ${org.name} (id ${orgId})`);
-  console.log(`   Team users   : ${teamRows.length} (incl. 3 pending invites)`);
+  console.log(`   Team users   : ${teamRows.length}${singleLogin ? ' (single login mode)' : ' (incl. pending invites)'}`);
   console.log(`   Accounts     : ${accountIds.length}`);
   console.log(`   Jobs         : ${jobIds.length}`);
   console.log(`   Candidates   : ${candidateIds.length}`);
