@@ -2,8 +2,8 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { candidateGroups, candidateGroupMembers, candidates } from '../db/schema.js';
-import { eq, and, sql } from 'drizzle-orm';
+import { candidateGroups, candidateGroupMembers, candidates, users } from '../db/schema.js';
+import { eq, and, inArray, sql } from 'drizzle-orm';
 import { requireAuth, requireRecruiter, type AppContext } from '../middleware.js';
 
 const candidateGroupsRouter = new Hono<AppContext>({ strict: false });
@@ -62,7 +62,11 @@ candidateGroupsRouter.get('/:id', requireAuth, requireRecruiter, async (c) => {
       })
       .from(candidateGroupMembers)
       .innerJoin(candidates, eq(candidateGroupMembers.candidateId, candidates.id))
-      .where(eq(candidateGroupMembers.groupId, id));
+      .innerJoin(users, eq(candidates.createdBy, users.id))
+      .where(and(
+        eq(candidateGroupMembers.groupId, id),
+        eq(users.organizationId, orgId!),
+      ));
 
     return c.json({ ...await enrichGroup(row), members });
   } catch {
@@ -146,11 +150,24 @@ candidateGroupsRouter.post('/:id/members', requireAuth, requireRecruiter, zValid
     if (!existing) return c.json({ error: 'Group not found' }, 404);
 
     const { candidateIds } = c.req.valid('json');
-    for (const candidateId of candidateIds) {
+    const ownedCandidates = await db
+      .select({ id: candidates.id })
+      .from(candidates)
+      .innerJoin(users, eq(candidates.createdBy, users.id))
+      .where(and(
+        inArray(candidates.id, candidateIds),
+        eq(users.organizationId, orgId!),
+      ));
+    const ownedIds = new Set(ownedCandidates.map((candidate) => candidate.id));
+    if (ownedIds.size !== new Set(candidateIds).size) {
+      return c.json({ error: 'One or more candidates are outside your organization' }, 403);
+    }
+
+    for (const candidateId of ownedIds) {
       await db.insert(candidateGroupMembers).values({ groupId, candidateId }).onConflictDoNothing();
     }
 
-    return c.json({ ok: true, added: candidateIds.length });
+    return c.json({ ok: true, added: ownedIds.size });
   } catch {
     return c.json({ error: 'Failed to add members' }, 500);
   }
@@ -159,9 +176,18 @@ candidateGroupsRouter.post('/:id/members', requireAuth, requireRecruiter, zValid
 /* DELETE /candidate-groups/:id/members/:candidateId */
 candidateGroupsRouter.delete('/:id/members/:candidateId', requireAuth, requireRecruiter, async (c) => {
   try {
+    const orgId = c.get('organizationId') as number | null;
     const groupId = parseInt(c.req.param('id'));
     const candidateId = parseInt(c.req.param('candidateId'));
     if (isNaN(groupId) || isNaN(candidateId)) return c.json({ error: 'Invalid id' }, 400);
+
+    const [group] = await db.select({ id: candidateGroups.id }).from(candidateGroups)
+      .where(and(
+        eq(candidateGroups.id, groupId),
+        eq(candidateGroups.organizationId, orgId!),
+      ))
+      .limit(1);
+    if (!group) return c.json({ error: 'Group not found' }, 404);
 
     await db.delete(candidateGroupMembers).where(
       and(eq(candidateGroupMembers.groupId, groupId), eq(candidateGroupMembers.candidateId, candidateId)),

@@ -21,6 +21,46 @@ export const DEFAULT_JOB_STAGES = [
   { name: 'Rejected', orderIndex: 2, stageType: 'rejected' as const, color: '#ef4444' },
 ] as const;
 
+/**
+ * Canonical pipeline order:
+ * Start → user-created In-Transit rounds → Hired → Rejected.
+ * System stages never derive their position from client input.
+ */
+export async function normalizeJobStageOrder(
+  jobId: number,
+  preferredInTransitIds?: number[],
+): Promise<void> {
+  const stages = await db
+    .select({ id: jobStages.id, stageType: jobStages.stageType, orderIndex: jobStages.orderIndex })
+    .from(jobStages)
+    .where(eq(jobStages.jobId, jobId))
+    .orderBy(jobStages.orderIndex);
+
+  const initial = stages.filter((stage) => stage.stageType === 'initial');
+  const hired = stages.filter((stage) => stage.stageType === 'hired');
+  const rejected = stages.filter((stage) => stage.stageType === 'rejected');
+  const inTransit = stages.filter((stage) => stage.stageType === 'in_transit');
+
+  const preferred = new Map((preferredInTransitIds ?? []).map((id, index) => [id, index]));
+  inTransit.sort((a, b) => {
+    const aPreferred = preferred.get(a.id);
+    const bPreferred = preferred.get(b.id);
+    if (aPreferred != null && bPreferred != null) return aPreferred - bPreferred;
+    if (aPreferred != null) return -1;
+    if (bPreferred != null) return 1;
+    return a.orderIndex - b.orderIndex;
+  });
+
+  const ordered = [...initial, ...inTransit, ...hired, ...rejected];
+  await Promise.all(
+    ordered.map((stage, orderIndex) =>
+      db.update(jobStages)
+        .set({ orderIndex })
+        .where(eq(jobStages.id, stage.id)),
+    ),
+  );
+}
+
 /** Ensure Start / Hired / Rejected exist on a job (by stageType). Safe to re-run. */
 export async function ensureDefaultJobStages(jobId: number): Promise<number> {
   const existing = await db
@@ -45,6 +85,7 @@ export async function ensureDefaultJobStages(jobId: number): Promise<number> {
     inserted += 1;
   }
 
+  await normalizeJobStageOrder(jobId);
   return inserted;
 }
 

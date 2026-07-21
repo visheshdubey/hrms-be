@@ -5,7 +5,12 @@ import { db } from '../db/index.js';
 import { eq, desc, inArray, and, or, isNull, sql, type SQL } from 'drizzle-orm';
 import { requireAuth, requireRole, ORG_ROLES, type AppContext, type UserRole } from '../middleware.js';
 import { jobs, jobStages, JOB_STAGE_TYPES, applications, users, applicationStageHistory } from '../db/schema.js';
-import { copyAccountStageTemplatesToJob, canWriteStageTemplates, getAccountIfAccessible } from '../lib/stages.js';
+import {
+  copyAccountStageTemplatesToJob,
+  canWriteStageTemplates,
+  getAccountIfAccessible,
+  normalizeJobStageOrder,
+} from '../lib/stages.js';
 import {
   canAccessJob,
   getAccessibleAccountIds,
@@ -540,14 +545,13 @@ jobsRouter.post('/:jobId/stages', requireAuth, zValidator('json', stageSchema), 
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const b = c.req.valid('json');
-    let orderIndex = b.orderIndex;
-    if (orderIndex === undefined) {
-      const [maxRow] = await db
-        .select({ max: sql<number>`coalesce(max(${jobStages.orderIndex}), -1)` })
-        .from(jobStages)
-        .where(eq(jobStages.jobId, jobId));
-      orderIndex = (maxRow?.max ?? -1) + 1;
-    }
+    const [hiredStage] = await db
+      .select({ orderIndex: jobStages.orderIndex })
+      .from(jobStages)
+      .where(and(eq(jobStages.jobId, jobId), eq(jobStages.stageType, 'hired')))
+      .limit(1);
+    // The normalizer is authoritative, but inserting before Hired also prevents a UI flash.
+    const orderIndex = hiredStage?.orderIndex ?? 1;
     // Custom stages are always In-Transit. Start/Hired/Rejected are system-only.
     const [created] = await db.insert(jobStages).values({
       jobId,
@@ -557,7 +561,11 @@ jobsRouter.post('/:jobId/stages', requireAuth, zValidator('json', stageSchema), 
       color: b.color ?? defaultStageColor(orderIndex),
     }).returning();
 
-    return c.json(created, 201);
+    await normalizeJobStageOrder(jobId);
+    const [normalized] = await db.select().from(jobStages)
+      .where(and(eq(jobStages.id, created.id), eq(jobStages.jobId, jobId)))
+      .limit(1);
+    return c.json(normalized ?? created, 201);
   } catch {
     return c.json({ error: 'Failed to create job stage' }, 500);
   }
@@ -580,7 +588,7 @@ jobsRouter.put('/:jobId/stages/reorder', requireAuth, zValidator('json', reorder
 
     const { stageIds } = c.req.valid('json');
     const existing = await db
-      .select({ id: jobStages.id })
+      .select({ id: jobStages.id, stageType: jobStages.stageType })
       .from(jobStages)
       .where(eq(jobStages.jobId, jobId));
 
@@ -597,13 +605,10 @@ jobsRouter.put('/:jobId/stages/reorder', requireAuth, zValidator('json', reorder
       return c.json({ error: 'Invalid stageIds for this job' }, 400);
     }
 
-    await Promise.all(
-      stageIds.map((stageId, orderIndex) =>
-        db.update(jobStages)
-          .set({ orderIndex })
-          .where(and(eq(jobStages.id, stageId), eq(jobStages.jobId, jobId))),
-      ),
+    const inTransitIds = stageIds.filter((id) =>
+      existing.some((stage) => stage.id === id && stage.stageType === 'in_transit'),
     );
+    await normalizeJobStageOrder(jobId, inTransitIds);
 
     const stages = await db
       .select()
@@ -637,16 +642,11 @@ jobsRouter.put('/:jobId/stages/:stageId', requireAuth, zValidator('json', stageS
       .where(and(eq(jobStages.id, stageId), eq(jobStages.jobId, jobId))).limit(1);
     if (!existing) return c.json({ error: 'Stage not found' }, 404);
 
-    const LOCKED_TYPES = new Set(['initial', 'hired', 'rejected']);
-    const isLocked = LOCKED_TYPES.has(existing.stageType);
-
     const b = c.req.valid('json');
     const patch: Record<string, unknown> = {};
     if (b.name !== undefined) patch.name = b.name;
-    if (b.orderIndex !== undefined) patch.orderIndex = b.orderIndex;
     if (b.color !== undefined) patch.color = b.color;
-    // Locked stages (Start, Hired, Rejected) cannot have their type changed
-    if (b.stageType !== undefined && !isLocked) patch.stageType = b.stageType;
+    // Stage type is immutable. System types are unique and custom stages stay In-Transit.
 
     const [updated] = await db.update(jobStages).set(patch as typeof jobStages.$inferInsert)
       .where(and(eq(jobStages.id, stageId), eq(jobStages.jobId, jobId)))
