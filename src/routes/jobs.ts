@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { eq, desc, inArray, and, or, isNull, sql, type SQL } from 'drizzle-orm';
+import { eq, desc, inArray, and, or, isNull, isNotNull, countDistinct, sql, type SQL } from 'drizzle-orm';
 import { requireAuth, requireRole, ORG_ROLES, type AppContext, type UserRole } from '../middleware.js';
 import { jobs, jobStages, JOB_STAGE_TYPES, applications, users, applicationStageHistory } from '../db/schema.js';
 import {
@@ -742,38 +742,34 @@ jobsRouter.get('/:jobId/stage-stats', requireAuth, async (c) => {
       count: countByStage.get(stage.id) ?? 0,
     }));
 
-    // Transition edges: how many candidates moved from stage A → stage B
+    // Transition edges: distinct applications that ever moved from stage A → stage B.
+    // Repeated A → B movements by the same application count once.
     const transitions: Array<{ fromStageId: number; toStageId: number; count: number }> = [];
     try {
-      const appIds = (
-        await db.select({ id: applications.id }).from(applications).where(eq(applications.jobId, jobId))
-      ).map((r) => r.id);
+      const historyCounts = await db
+        .select({
+          fromStageId: applicationStageHistory.fromStageId,
+          toStageId: applicationStageHistory.toStageId,
+          count: countDistinct(applicationStageHistory.applicationId),
+        })
+        .from(applicationStageHistory)
+        .innerJoin(applications, eq(applicationStageHistory.applicationId, applications.id))
+        .where(and(
+          eq(applications.jobId, jobId),
+          isNotNull(applicationStageHistory.fromStageId),
+          isNotNull(applicationStageHistory.toStageId),
+        ))
+        .groupBy(applicationStageHistory.fromStageId, applicationStageHistory.toStageId);
 
-      if (appIds.length > 0) {
-        const historyRows = await db
-          .select({
-            fromStageId: applicationStageHistory.fromStageId,
-            toStageId: applicationStageHistory.toStageId,
-          })
-          .from(applicationStageHistory)
-          .where(inArray(applicationStageHistory.applicationId, appIds));
-
-        const edgeCounts = new Map<string, number>();
-        for (const row of historyRows) {
-          if (row.fromStageId == null || row.toStageId == null) continue;
-          if (!stageIdSet.has(row.fromStageId) || !stageIdSet.has(row.toStageId)) continue;
-          if (row.fromStageId === row.toStageId) continue;
-          const key = `${row.fromStageId}->${row.toStageId}`;
-          edgeCounts.set(key, (edgeCounts.get(key) ?? 0) + 1);
-        }
-        for (const [key, count] of edgeCounts) {
-          const [fromRaw, toRaw] = key.split('->');
-          transitions.push({
-            fromStageId: Number(fromRaw),
-            toStageId: Number(toRaw),
-            count,
-          });
-        }
+      for (const row of historyCounts) {
+        if (row.fromStageId == null || row.toStageId == null) continue;
+        if (!stageIdSet.has(row.fromStageId) || !stageIdSet.has(row.toStageId)) continue;
+        if (row.fromStageId === row.toStageId) continue;
+        transitions.push({
+          fromStageId: row.fromStageId,
+          toStageId: row.toStageId,
+          count: Number(row.count),
+        });
       }
     } catch {
       // Columns may not exist yet on older DBs — mindmap falls back to headcounts.
