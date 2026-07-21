@@ -20,6 +20,7 @@ import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 import { isSchemaDriftError } from '../lib/schemaDrift.js';
 import { defaultStageColor } from '../lib/stageColors.js';
+import { isAuthorizedBrandingAssetUrl } from '../lib/branding-assets.js';
 
 const accountsRouter = new Hono<AppContext>({ strict: false });
 
@@ -191,8 +192,8 @@ const accountBody = z.object({
   city: z.string().optional(),
   state: z.string().optional(),
   country: z.string().optional(),
-  shortLogoUrl: z.string().optional(),
-  longLogoUrl: z.string().optional(),
+  shortLogoUrl: z.string().max(2048).optional(),
+  longLogoUrl: z.string().max(2048).optional(),
 });
 
 const mergeSchema = z.object({
@@ -233,6 +234,9 @@ accountsRouter.get('/options', requireAuth, async (c) => {
       const linkedIds = await getAccessibleAccountIds(userId, orgId, userRole);
       if (linkedIds.length === 0) {
         return c.json({ data: [] });
+      }
+      if (linkedIds.length !== 1) {
+        return c.json({ error: 'Client portal user must be linked to exactly one account' }, 409);
       }
 
       const rows = await db
@@ -765,15 +769,29 @@ accountsRouter.put('/:id', requireAuth, requireRole(...RECRUITER_ROLES, ...ORG_R
       if (!(await canAccessAccountId(id, userId, orgId, role))) {
         return c.json({ error: 'Account not found' }, 404);
       }
+      if (role !== 'org_admin') {
+        return c.json({ error: 'Only client administrators can update company settings' }, 403);
+      }
     } else if (!belongsToOrganization(existing.organizationId, orgId, existing.createdBy, userId)) {
       return c.json({ error: 'Account not found' }, 404);
     }
 
     const b = c.req.valid('json');
+    for (const key of ['shortLogoUrl', 'longLogoUrl'] as const) {
+      const nextUrl = b[key]?.trim();
+      if (nextUrl === undefined || nextUrl === (existing[key] ?? '').trim()) continue;
+      if (!await isAuthorizedBrandingAssetUrl(nextUrl, { organizationId: orgId, accountId: id })) {
+        return c.json({ error: 'Logo must be uploaded for this client account' }, 400);
+      }
+      b[key] = nextUrl;
+    }
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
 
     // Org portal may update company profile fields only (not CRM type/status/contract).
-    const orgAllowed = ['name', 'website', 'description', 'phone', 'email', 'address', 'city', 'state', 'country'] as const;
+    const orgAllowed = [
+      'name', 'website', 'description', 'phone', 'email', 'address', 'city', 'state', 'country',
+      'shortLogoUrl', 'longLogoUrl',
+    ] as const;
     const recruiterAllowed = [
       'name', 'status', 'type', 'contractValue', 'website', 'description', 'phone', 'email',
       'address', 'city', 'state', 'country', 'shortLogoUrl', 'longLogoUrl',

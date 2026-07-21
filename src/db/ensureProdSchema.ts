@@ -25,8 +25,10 @@ const STATEMENTS = [
     url text NOT NULL,
     created_by integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     organization_id integer REFERENCES organizations(id) ON DELETE CASCADE,
+    account_id integer REFERENCES accounts(id) ON DELETE CASCADE,
     created_at text NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
+  `ALTER TABLE upload_assets ADD COLUMN IF NOT EXISTS account_id integer REFERENCES accounts(id) ON DELETE CASCADE`,
 
   // jobs assignment + pay (pay may already exist)
   `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_to integer`,

@@ -29,13 +29,20 @@ export const requireAuth = async (c: any, next: any) => {
     const decoded = jwt.verify(token, JWT_SECRET) as { id: number; email: string };
 
     const row = await db
-      .select({ organizationId: users.organizationId, role: users.role })
+      .select({
+        organizationId: users.organizationId,
+        role: users.role,
+        isActive: users.isActive,
+      })
       .from(users)
       .where(eq(users.id, decoded.id))
       .limit(1);
 
     if (row.length === 0) {
       return c.json({ error: 'User not found' }, 401);
+    }
+    if (row[0].isActive !== 1) {
+      return c.json({ error: 'Account is inactive' }, 403);
     }
 
     c.set('userId', decoded.id);

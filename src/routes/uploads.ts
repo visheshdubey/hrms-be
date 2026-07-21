@@ -8,6 +8,7 @@ import { uploadAssets } from '../db/schema.js';
 import { and, eq } from 'drizzle-orm';
 import { enqueueUploadTask } from '../queue/upload-queue.js';
 import { cdn, type CdnFolder } from '../lib/bunny-cdn.js';
+import { canAccessAccountId, isOrgPortalRole } from '../lib/orgScope.js';
 
 const uploadsRouter = new Hono<AppContext>({ strict: false });
 
@@ -50,6 +51,22 @@ function extensionForMime(mime: string): string {
   }
 }
 
+function hasValidImageSignature(buffer: Buffer, mime: string): boolean {
+  if (mime === 'image/jpeg') {
+    return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  }
+  if (mime === 'image/png') {
+    return buffer.length >= 8
+      && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  }
+  if (mime === 'image/webp') {
+    return buffer.length >= 12
+      && buffer.toString('ascii', 0, 4) === 'RIFF'
+      && buffer.toString('ascii', 8, 12) === 'WEBP';
+  }
+  return true;
+}
+
 /**
  * Generic file upload handler.
  * When BunnyCDN is configured, files go to CDN. Otherwise falls back to local disk.
@@ -59,7 +76,7 @@ async function handleUpload(
   folder: CdnFolder,
   allowedMimes: Set<string>,
   maxBytes: number,
-  owner: { userId: number; organizationId: number | null },
+  owner: { userId: number; organizationId: number | null; accountId?: number | null },
 ): Promise<{ url: string; storagePath?: string }> {
   if (!allowedMimes.has(file.type)) {
     throw Object.assign(new Error('Unsupported file type'), { status: 400 });
@@ -71,6 +88,9 @@ async function handleUpload(
   const ext = extensionForMime(file.type);
   const filename = `${randomUUID()}.${ext}`;
   const buffer = Buffer.from(await file.arrayBuffer());
+  if (file.type.startsWith('image/') && !hasValidImageSignature(buffer, file.type)) {
+    throw Object.assign(new Error('File content does not match its image type'), { status: 400 });
+  }
 
   if (cdn.isConfigured()) {
     const result = await cdn.upload(folder, buffer, filename);
@@ -79,6 +99,7 @@ async function handleUpload(
       url: result.cdnUrl,
       createdBy: owner.userId,
       organizationId: owner.organizationId,
+      accountId: owner.accountId ?? null,
     });
     return { url: result.cdnUrl, storagePath: result.storagePath };
   }
@@ -86,7 +107,16 @@ async function handleUpload(
   const uploadDir = path.join(process.cwd(), 'uploads', folder);
   await mkdir(uploadDir, { recursive: true });
   await writeFile(path.join(uploadDir, filename), buffer);
-  return { url: `/uploads/${folder}/${filename}` };
+  const storagePath = `${folder}/${filename}`;
+  const url = `/uploads/${storagePath}`;
+  await db.insert(uploadAssets).values({
+    storagePath,
+    url,
+    createdBy: owner.userId,
+    organizationId: owner.organizationId,
+    accountId: owner.accountId ?? null,
+  });
+  return { url, storagePath };
 }
 
 // POST /uploads/images — editor & general images → CDN "images" folder
@@ -164,9 +194,30 @@ uploadsRouter.post('/logos', requireAuth, async (c) => {
     if (!file || !(file instanceof File)) {
       return c.json({ error: 'Logo file is required' }, 400);
     }
+    const accountIdRaw = body.accountId;
+    const accountId = typeof accountIdRaw === 'string' ? Number(accountIdRaw) : null;
+    if (accountIdRaw != null && (!Number.isInteger(accountId) || Number(accountId) <= 0)) {
+      return c.json({ error: 'Invalid account id' }, 400);
+    }
+    const userId = c.get('userId') as number;
+    const organizationId = c.get('organizationId') as number | null;
+    const userRole = c.get('userRole') as string | null;
+    if (isOrgPortalRole(userRole) && userRole !== 'org_admin') {
+      return c.json({ error: 'Only client administrators can upload company logos' }, 403);
+    }
+    if (isOrgPortalRole(userRole) && accountId == null) {
+      return c.json({ error: 'Client logo uploads require an account' }, 400);
+    }
+    if (
+      accountId != null
+      && !(await canAccessAccountId(accountId, userId, organizationId, userRole))
+    ) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
     const { url, storagePath } = await handleUpload(file, 'logos', LOGO_MIME, LOGO_MAX_BYTES, {
-      userId: c.get('userId') as number,
-      organizationId: c.get('organizationId') as number | null,
+      userId,
+      organizationId,
+      accountId,
     });
     return c.json({ url, ...(storagePath ? { storagePath } : {}) });
   } catch (error: any) {

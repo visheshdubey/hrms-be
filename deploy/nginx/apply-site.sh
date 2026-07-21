@@ -187,6 +187,7 @@ server {
 
     access_log /var/log/nginx/${APP_NAME}.access.log;
     error_log /var/log/nginx/${APP_NAME}.error.log;
+    client_max_body_size 12m;
 
     location / {
         proxy_pass http://127.0.0.1:${PROXY_PORT};
@@ -231,6 +232,7 @@ server {
 
     access_log /var/log/nginx/${APP_NAME}.access.log;
     error_log /var/log/nginx/${APP_NAME}.error.log;
+    client_max_body_size 12m;
 
     location / {
         proxy_pass http://127.0.0.1:${PROXY_PORT};

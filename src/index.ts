@@ -50,9 +50,11 @@ app.use('*', cors({
 app.use(
   '*',
   bodyLimit({
-    maxSize: 10 * 1024 * 1024, // 10MB limit for Base64 avatars
+    // Allow multipart overhead above the largest 10MB document/resume file.
+    // Individual upload routes still enforce their stricter per-file limits.
+    maxSize: 12 * 1024 * 1024,
     onError: (c) => {
-      return c.json({ error: 'Payload size exceeds 10MB limit' }, 413);
+      return c.json({ error: 'Payload size exceeds 12MB request limit' }, 413);
     },
   })
 );

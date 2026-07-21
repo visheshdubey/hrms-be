@@ -279,6 +279,7 @@ export const uploadAssets = pgTable("upload_assets", {
   url: text("url").notNull(),
   createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "cascade" }),
   organizationId: integer("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+  accountId: integer("account_id").references(() => accounts.id, { onDelete: "cascade" }),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 

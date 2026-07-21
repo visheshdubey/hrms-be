@@ -14,6 +14,7 @@ import {
 } from '../queue/email-service.js';
 import { JWT_SECRET } from '../config.js';
 import { getAccessibleAccountIds } from '../lib/orgScope.js';
+import { isAuthorizedBrandingAssetUrl } from '../lib/branding-assets.js';
 
 async function canManageTeamUser(
   me: typeof users.$inferSelect,
@@ -106,20 +107,19 @@ function assertCanInvite(
   targetRole: UserRole,
 ): string | null {
   if (inviterPortal === 'org') {
+    if (inviterRole !== 'org_admin') {
+      return 'Only client administrators can invite team members.';
+    }
     if (!ORG_ROLES.includes(targetRole)) {
       return 'Org admins can only invite Org Admin or Org Staff roles.';
     }
     return null;
   }
 
-  // Recruiter admin may invite both recruiter team and client (org) portal users.
-  if (inviterRole === 'recruiter_admin') {
-    return null;
+  if (inviterRole !== 'recruiter_admin') {
+    return 'Only recruiter administrators can invite team members.';
   }
-
-  if (!RECRUITER_ROLES.includes(targetRole)) {
-    return 'Recruiter staff can only invite Recruiter Admin or Recruiter Staff roles.';
-  }
+  // Recruiter admins may invite recruiter teammates and client-portal users.
   return null;
 }
 
@@ -151,7 +151,7 @@ const resetPasswordSchema = z.object({
 
 const orgUpdateSchema = z.object({
   name: z.string().min(1).optional(),
-  logo: z.string().optional(),
+  logo: z.string().max(2048).optional(),
   defaults: z.record(z.string(), z.unknown()).optional(),
 });
 
@@ -219,17 +219,22 @@ auth.get('/organization', async (c) => {
     const decoded = jwt.verify(token, JWT_SECRET) as { id: number };
 
     const user = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
-    if (!user.length || !user[0].organizationId) {
+    if (!user.length) return c.json({ error: 'User not found' }, 404);
+    if (user[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
+    if (!user[0].organizationId) {
       return c.json({ error: 'Organization not found' }, 404);
     }
 
     if ((user[0].portalType ?? 'recruiter') === 'org') {
-      const [accountId] = await getAccessibleAccountIds(
+      const accountIds = await getAccessibleAccountIds(
         user[0].id,
         user[0].organizationId,
         user[0].role,
       );
-      if (!accountId) return c.json({ error: 'Client account not found' }, 404);
+      if (accountIds.length !== 1) {
+        return c.json({ error: 'Client portal user must be linked to exactly one account' }, 409);
+      }
+      const accountId = accountIds[0];
       const [account] = await db.select().from(accounts).where(eq(accounts.id, accountId)).limit(1);
       if (!account) return c.json({ error: 'Client account not found' }, 404);
       return c.json({
@@ -270,6 +275,7 @@ auth.put('/organization', zValidator('json', orgUpdateSchema), async (c) => {
 
     const user = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
     if (!user.length) return c.json({ error: 'User not found' }, 404);
+    if (user[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
 
     const role = user[0].role;
     const body = c.req.valid('json');
@@ -278,16 +284,45 @@ auth.put('/organization', zValidator('json', orgUpdateSchema), async (c) => {
     // map its workspace branding request to the linked client account, never the agency.
     if (role === 'org_admin' && (user[0].portalType ?? 'org') === 'org') {
       if (!user[0].organizationId) return c.json({ error: 'Organization not found' }, 404);
-      const [accountId] = await getAccessibleAccountIds(
+      const accountIds = await getAccessibleAccountIds(
         user[0].id,
         user[0].organizationId,
         role,
       );
-      if (!accountId) return c.json({ error: 'Client account not found' }, 404);
+      if (accountIds.length !== 1) {
+        return c.json({ error: 'Client portal user must be linked to exactly one account' }, 409);
+      }
+      const accountId = accountIds[0];
+      const [current] = await db.select().from(accounts).where(eq(accounts.id, accountId)).limit(1);
+      if (!current) return c.json({ error: 'Client account not found' }, 404);
       const patch: Partial<typeof accounts.$inferInsert> = {};
-      if (body.logo !== undefined) patch.shortLogoUrl = body.logo;
+      if (body.logo !== undefined) {
+        const logo = body.logo.trim();
+        if (
+          logo !== (current.shortLogoUrl ?? '').trim()
+          && !await isAuthorizedBrandingAssetUrl(logo, {
+            organizationId: user[0].organizationId,
+            accountId,
+          })
+        ) {
+          return c.json({ error: 'Logo must be uploaded for this client account' }, 400);
+        }
+        patch.shortLogoUrl = logo;
+      }
       const wordmarkUrl = body.defaults?.wordmarkUrl;
-      if (typeof wordmarkUrl === 'string') patch.longLogoUrl = wordmarkUrl;
+      if (typeof wordmarkUrl === 'string') {
+        const normalizedWordmark = wordmarkUrl.trim();
+        if (
+          normalizedWordmark !== (current.longLogoUrl ?? '').trim()
+          && !await isAuthorizedBrandingAssetUrl(normalizedWordmark, {
+            organizationId: user[0].organizationId,
+            accountId,
+          })
+        ) {
+          return c.json({ error: 'Wordmark must be uploaded for this client account' }, 400);
+        }
+        patch.longLogoUrl = normalizedWordmark;
+      }
       const [updated] = Object.keys(patch).length > 0
         ? await db.update(accounts).set(patch).where(eq(accounts.id, accountId)).returning()
         : await db.select().from(accounts).where(eq(accounts.id, accountId)).limit(1);
@@ -306,23 +341,47 @@ auth.put('/organization', zValidator('json', orgUpdateSchema), async (c) => {
     }
     if (!user[0].organizationId) return c.json({ error: 'Organization not found' }, 404);
 
+    const [currentOrganization] = await db
+      .select()
+      .from(organizations)
+      .where(eq(organizations.id, user[0].organizationId))
+      .limit(1);
+    if (!currentOrganization) return c.json({ error: 'Organization not found' }, 404);
+    let currentDefaults: Record<string, unknown> = {};
+    try { currentDefaults = JSON.parse(currentOrganization.defaults || '{}'); } catch { /* ignore */ }
+
     const patch: Record<string, unknown> = {};
     if (body.name != null) patch.name = body.name;
-    if (body.logo != null) patch.logo = body.logo;
+    if (body.logo != null) {
+      const logo = body.logo.trim();
+      if (
+        logo !== (currentOrganization.logo ?? '').trim()
+        && !await isAuthorizedBrandingAssetUrl(logo, {
+          organizationId: user[0].organizationId,
+          accountId: null,
+        })
+      ) {
+        return c.json({ error: 'Logo must be uploaded for this workspace' }, 400);
+      }
+      patch.logo = logo;
+    }
     if (body.defaults != null) {
       // Merge so partial workspace saves (e.g. logos only) do not wipe other defaults.
-      let existingDefaults: Record<string, unknown> = {};
-      const [currentOrg] = await db
-        .select({ defaults: organizations.defaults })
-        .from(organizations)
-        .where(eq(organizations.id, user[0].organizationId))
-        .limit(1);
-      try {
-        existingDefaults = JSON.parse(currentOrg?.defaults || '{}');
-      } catch {
-        /* ignore */
+      const requestedWordmark = body.defaults.wordmarkUrl;
+      if (typeof requestedWordmark === 'string') {
+        const wordmark = requestedWordmark.trim();
+        if (
+          wordmark !== String(currentDefaults.wordmarkUrl ?? '').trim()
+          && !await isAuthorizedBrandingAssetUrl(wordmark, {
+            organizationId: user[0].organizationId,
+            accountId: null,
+          })
+        ) {
+          return c.json({ error: 'Wordmark must be uploaded for this workspace' }, 400);
+        }
+        body.defaults.wordmarkUrl = wordmark;
       }
-      const merged: Record<string, unknown> = { ...existingDefaults };
+      const merged: Record<string, unknown> = { ...currentDefaults };
       for (const [key, value] of Object.entries(body.defaults)) {
         if (value === undefined) continue;
         merged[key] = value;
@@ -382,6 +441,9 @@ auth.post('/invite', zValidator('json', inviteSchema), async (c) => {
     }
 
     const inviterUser = inviter[0];
+    if (inviterUser.isActive !== 1) {
+      return c.json({ error: 'Account is inactive' }, 403);
+    }
     const inviterPortal = (inviterUser.portalType ?? 'recruiter') as PortalType;
     const inviterRole = (inviterUser.role ?? 'recruited_staff') as UserRole;
     const resolvedRole = normalizeInviteRole(inviteRole, inviterPortal);
@@ -476,6 +538,9 @@ auth.post('/login', zValidator('json', loginSchema), async (c) => {
     if (user[0].isVerified === 0 || !user[0].password) {
       return c.json({ error: 'Please verify your email to set a password before logging in' }, 403);
     }
+    if (user[0].isActive !== 1) {
+      return c.json({ error: 'This account has been deactivated' }, 403);
+    }
 
     const validPassword = await bcrypt.compare(password, user[0].password);
     if (!validPassword) {
@@ -524,6 +589,7 @@ auth.get('/me', async (c) => {
     const user = await db.select(userProfileFields).from(users).where(eq(users.id, decoded.id));
 
     if (user.length === 0) return c.json({ error: 'User not found' }, 404);
+    if (user[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
 
     return c.json({ user: user[0] }, 200);
   } catch (error) {
@@ -536,7 +602,6 @@ const updateSchema = z.object({
   lastName: z.string().optional(),
   email: z.string().email("Invalid email").optional(),
   avatarUrl: z.string().optional(),
-  role: z.string().optional(),
   country: z.string().optional(),
   timezone: z.string().optional(),
   bio: z.string().optional(),
@@ -555,10 +620,13 @@ auth.put('/me', zValidator('json', updateSchema), async (c) => {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as { id: number; email: string };
-    const { firstName, lastName, email, avatarUrl, role, country, timezone, bio, currentPassword, newPassword } = c.req.valid('json');
+    const {
+      firstName, lastName, email, avatarUrl, country, timezone, bio, currentPassword, newPassword,
+    } = c.req.valid('json');
 
     const user = await db.select().from(users).where(eq(users.id, decoded.id));
     if (user.length === 0) return c.json({ error: 'User not found' }, 404);
+    if (user[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
 
     let passwordHash = user[0].password;
     if (currentPassword && newPassword) {
@@ -582,7 +650,6 @@ auth.put('/me', zValidator('json', updateSchema), async (c) => {
     };
     if (email !== undefined) patch.email = email;
     if (avatarUrl !== undefined) patch.avatar = avatarUrl;
-    if (role !== undefined) patch.role = role;
     if (country !== undefined) patch.country = country;
     if (timezone !== undefined) patch.timezone = timezone;
     if (bio !== undefined) patch.bio = bio;
@@ -610,6 +677,7 @@ auth.get('/team', async (c) => {
     const me = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
 
     if (me.length === 0) return c.json({ error: 'User not found' }, 404);
+    if (me[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
 
     const meUser = me[0];
     const orgId = meUser.organizationId;
@@ -660,6 +728,7 @@ auth.patch('/users/:id/role', zValidator('json', z.object({ role: z.string() }))
 
     const me = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
     if (!me.length) return c.json({ error: 'User not found' }, 404);
+    if (me[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
     if (me[0].role !== 'recruiter_admin' && me[0].role !== 'org_admin') {
       return c.json({ error: 'Forbidden: admin access required' }, 403);
     }
@@ -700,6 +769,7 @@ auth.patch('/users/:id/status', zValidator('json', z.object({ isActive: z.number
 
     const me = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
     if (!me.length) return c.json({ error: 'User not found' }, 404);
+    if (me[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
     if (me[0].role !== 'recruiter_admin' && me[0].role !== 'org_admin') {
       return c.json({ error: 'Forbidden: admin access required' }, 403);
     }
@@ -728,6 +798,7 @@ auth.post('/resend-invite/:id', async (c) => {
 
     const me = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
     if (!me.length) return c.json({ error: 'User not found' }, 404);
+    if (me[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
     if (me[0].role !== 'recruiter_admin' && me[0].role !== 'org_admin') {
       return c.json({ error: 'Forbidden: admin access required' }, 403);
     }
@@ -763,6 +834,7 @@ auth.post('/send-password-otp', async (c) => {
 
     const me = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
     if (!me.length) return c.json({ error: 'User not found' }, 404);
+    if (me[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiry = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 mins
@@ -793,6 +865,7 @@ auth.post('/verify-otp-change-password', zValidator('json', z.object({ otp: z.st
 
     const me = await db.select().from(users).where(eq(users.id, decoded.id)).limit(1);
     if (!me.length) return c.json({ error: 'User not found' }, 404);
+    if (me[0].isActive !== 1) return c.json({ error: 'Account is inactive' }, 403);
 
     if (!me[0].passwordOtp || me[0].passwordOtp !== otp) {
       return c.json({ error: 'Invalid OTP' }, 400);

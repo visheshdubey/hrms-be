@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { candidates, jobs, users } from '../db/schema.js';
+import { candidates, candidateTags, jobs, tags, users } from '../db/schema.js';
 import { eq, desc, inArray, and, or, ilike, notInArray } from 'drizzle-orm';
 import { requireAuth, requireRecruiter, type AppContext } from '../middleware.js';
 import { canAccessByCreator } from '../lib/orgScope.js';
@@ -13,6 +13,32 @@ import {
 import { queueCandidateBulkImport, shouldQueueBulkImport } from '../queue/bulk-import.js';
 
 const candidatesRouter = new Hono<AppContext>({ strict: false });
+
+type CandidateTagDto = { id: number; name: string; color: string };
+
+async function getCandidateTagMap(candidateIds: number[], orgId: number | null) {
+  const byCandidate = new Map<number, CandidateTagDto[]>();
+  if (candidateIds.length === 0 || orgId == null) return byCandidate;
+
+  const rows = await db
+    .select({
+      candidateId: candidateTags.candidateId,
+      id: tags.id,
+      name: tags.name,
+      color: tags.color,
+    })
+    .from(candidateTags)
+    .innerJoin(tags, eq(candidateTags.tagId, tags.id))
+    .where(and(inArray(candidateTags.candidateId, candidateIds), eq(tags.organizationId, orgId)))
+    .orderBy(tags.name);
+
+  for (const row of rows) {
+    const current = byCandidate.get(row.candidateId) ?? [];
+    current.push({ id: row.id, name: row.name, color: row.color ?? '#6366f1' });
+    byCandidate.set(row.candidateId, current);
+  }
+  return byCandidate;
+}
 
 const candidateSchema = z.object({
   jobId: z.number().optional().nullable(),
@@ -90,12 +116,14 @@ candidatesRouter.get('/', requireAuth, requireRecruiter, async (c) => {
         .orderBy(desc(candidates.createdAt), desc(candidates.id));
     }
 
+    const tagMap = await getCandidateTagMap(all.map((candidate) => candidate.id), orgId);
     const parsed = all.map((c: any, i: number) => ({
       ...c,
       skills: safeJsonParse(c.skills),
       certifications: safeJsonParse(c.certifications),
       languages: safeJsonParse(c.languages),
       workHistory: safeJsonParse(c.workHistory),
+      tags: tagMap.get(c.id) ?? [],
       rank: i + 1,
     }));
     return c.json(parsed);
@@ -172,6 +200,7 @@ candidatesRouter.post('/', requireAuth, requireRecruiter, zValidator('json', can
       certifications: safeJsonParse(created[0].certifications),
       languages: safeJsonParse(created[0].languages),
       workHistory: safeJsonParse(created[0].workHistory),
+      tags: [],
     }, 201);
   } catch (error) {
     console.error(error);
@@ -370,12 +399,14 @@ candidatesRouter.get('/:id', requireAuth, requireRecruiter, async (c) => {
     }
 
     const cand = row[0];
+    const tagMap = await getCandidateTagMap([cand.id], orgId);
     return c.json({
       ...cand,
       skills:         safeJsonParse(cand.skills),
       certifications: safeJsonParse(cand.certifications),
       languages:      safeJsonParse(cand.languages),
       workHistory:    safeJsonParse(cand.workHistory),
+      tags:            tagMap.get(cand.id) ?? [],
     });
   } catch {
     return c.json({ error: 'Failed to fetch candidate' }, 500);
@@ -442,12 +473,14 @@ candidatesRouter.put('/:id', requireAuth, requireRecruiter, zValidator('json', u
     const updated = await db.update(candidates).set(patch as any).where(eq(candidates.id, id)).returning();
 
     const u = updated[0];
+    const tagMap = await getCandidateTagMap([u.id], orgId);
     return c.json({
       ...u,
       skills:         safeJsonParse(u.skills),
       certifications: safeJsonParse(u.certifications),
       languages:      safeJsonParse(u.languages),
       workHistory:    safeJsonParse(u.workHistory),
+      tags:            tagMap.get(u.id) ?? [],
     });
   } catch {
     return c.json({ error: 'Failed to update candidate' }, 500);
