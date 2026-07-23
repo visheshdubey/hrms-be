@@ -99,6 +99,24 @@
       }
     }
 
+    /** Fetch a private object through the authenticated storage API. */
+    async function download(storagePath: string): Promise<Buffer> {
+      ensureConfigured();
+      if (!storagePath || storagePath.includes('..') || storagePath.startsWith('/')) {
+        throw new Error('[bunny-cdn] Invalid storage path');
+      }
+      const url = `${STORAGE_ENDPOINT}/${STORAGE_ZONE}/${storagePath}`;
+      const res = await fetch(url, {
+        method: 'GET',
+        signal: AbortSignal.timeout(20_000),
+        headers: { AccessKey: ACCESS_KEY },
+      });
+      if (!res.ok) {
+        throw new Error(`[bunny-cdn] Download failed (${res.status})`);
+      }
+      return Buffer.from(await res.arrayBuffer());
+    }
+
     /**
      * List files in a CDN folder.
      *
@@ -135,4 +153,4 @@
       return Boolean(STORAGE_ZONE && ACCESS_KEY && CDN_URL);
     }
 
-    export const cdn = { upload, remove, list, getUrl, isConfigured } as const;
+    export const cdn = { upload, download, remove, list, getUrl, isConfigured } as const;

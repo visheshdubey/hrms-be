@@ -3,14 +3,17 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { candidates, candidateTags, jobs, tags, users } from '../db/schema.js';
-import { eq, desc, inArray, and, or, ilike, notInArray } from 'drizzle-orm';
+import { eq, desc, inArray, and, or, ilike, notInArray, count } from 'drizzle-orm';
 import { requireAuth, requireRecruiter, type AppContext } from '../middleware.js';
+import { getRecruiterMemberIds } from '../lib/resourceAccess.js';
 import { canAccessByCreator } from '../lib/orgScope.js';
 import {
   runCandidateBulkImport,
   sanitizeBulkCandidateRows,
 } from '../lib/candidateBulkImport.js';
 import { queueCandidateBulkImport, shouldQueueBulkImport } from '../queue/bulk-import.js';
+import { parsePagination } from '../lib/pagination.js';
+import { getCachedCount, setCachedCount, invalidateCountCache } from '../lib/countCache.js';
 
 const candidatesRouter = new Hono<AppContext>({ strict: false });
 
@@ -87,47 +90,112 @@ const bulkCandidateSchema = z.object({
   })).min(1),
 });
 
-// GET /candidates — list all candidates visible to the authenticated user's organization
+const CANDIDATE_LIST_COLUMNS = {
+  id: candidates.id,
+  jobId: candidates.jobId,
+  filename: candidates.filename,
+  name: candidates.name,
+  email: candidates.email,
+  phone: candidates.phone,
+  location: candidates.location,
+  education: candidates.education,
+  experience: candidates.experience,
+  skills: candidates.skills,
+  matchScore: candidates.matchScore,
+  status: candidates.status,
+  source: candidates.source,
+  createdAt: candidates.createdAt,
+  createdBy: candidates.createdBy,
+} as const;
+
+// GET /candidates — paginated ATS pool (slim columns; detail endpoint has full profile)
 candidatesRouter.get('/', requireAuth, requireRecruiter, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const { page, pageSize, offset } = parsePagination(c.req.query());
+    const search = (c.req.query('search') ?? c.req.query('q') ?? '').trim();
+    const statusFilter = (c.req.query('status') ?? '').trim();
+    const sourceFilter = (c.req.query('source') ?? '').trim();
 
-    let all;
+    let memberIds: number[];
     if (orgId != null) {
-      const orgMembers = await db
-        .select({ id: users.id })
-        .from(users)
-        .where(eq(users.organizationId, orgId));
-
-      const memberIds = orgMembers.map((u: any) => u.id);
-      if (memberIds.length === 0) return c.json([]);
-
-      all = await db
-        .select()
-        .from(candidates)
-        .where(inArray(candidates.createdBy, memberIds))
-        .orderBy(desc(candidates.createdAt), desc(candidates.id));
+      memberIds = await getRecruiterMemberIds(orgId, userId);
+      if (memberIds.length === 0) {
+        return c.json({ data: [], total: 0, page, pageSize });
+      }
     } else {
-      all = await db
-        .select()
-        .from(candidates)
-        .where(eq(candidates.createdBy, userId))
-        .orderBy(desc(candidates.createdAt), desc(candidates.id));
+      memberIds = [userId];
     }
 
-    const tagMap = await getCandidateTagMap(all.map((candidate) => candidate.id), orgId);
-    const parsed = all.map((c: any, i: number) => ({
-      ...c,
-      skills: safeJsonParse(c.skills),
-      certifications: safeJsonParse(c.certifications),
-      languages: safeJsonParse(c.languages),
-      workHistory: safeJsonParse(c.workHistory),
-      tags: tagMap.get(c.id) ?? [],
-      rank: i + 1,
+    const scope = inArray(candidates.createdBy, memberIds);
+    const searchScope =
+      search.length > 0
+        ? or(
+            ilike(candidates.name, `${search}%`),
+            ilike(candidates.email, `${search}%`),
+            ilike(candidates.phone, `%${search}%`),
+          )
+        : undefined;
+    const statusScope = statusFilter && statusFilter !== 'all' ? eq(candidates.status, statusFilter) : undefined;
+    const sourceScope = sourceFilter && sourceFilter !== 'all' ? eq(candidates.source, sourceFilter) : undefined;
+    const whereClause = and(scope, searchScope, statusScope, sourceScope);
+
+    const countKey = `candidates:${orgId ?? `u${userId}`}:${search}:${statusFilter}:${sourceFilter}`;
+    let total = getCachedCount(countKey);
+    if (total == null) {
+      const [totalRow] = await db.select({ total: count() }).from(candidates).where(whereClause);
+      total = Number(totalRow?.total ?? 0);
+      setCachedCount(countKey, total);
+    }
+
+    // Deep OFFSET is expensive at 50k–1M. Prefer index-only id page, then hydrate rows.
+    // For very deep pages, still correct — just uses a narrow id scan first.
+    const idPage = await db
+      .select({ id: candidates.id })
+      .from(candidates)
+      .where(whereClause)
+      .orderBy(desc(candidates.createdAt), desc(candidates.id))
+      .limit(pageSize)
+      .offset(offset);
+
+    const pageIds = idPage.map((row) => row.id);
+    const rows =
+      pageIds.length === 0
+        ? []
+        : await db
+            .select(CANDIDATE_LIST_COLUMNS)
+            .from(candidates)
+            .where(inArray(candidates.id, pageIds))
+            .orderBy(desc(candidates.createdAt), desc(candidates.id));
+
+    // Preserve page order from idPage (inArray order is not guaranteed).
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const ordered = pageIds.map((id) => byId.get(id)).filter(Boolean) as typeof rows;
+
+    const tagMap = await getCandidateTagMap(
+      ordered.map((candidate) => candidate.id),
+      orgId,
+    );
+    const data = ordered.map((row, index) => ({
+      ...row,
+      skills: safeJsonParse(row.skills),
+      certifications: [],
+      languages: [],
+      workHistory: [],
+      summary: '',
+      tags: tagMap.get(row.id) ?? [],
+      rank: offset + index + 1,
     }));
-    return c.json(parsed);
-  } catch {
+
+    return c.json({
+      data,
+      total,
+      page,
+      pageSize,
+    });
+  } catch (error) {
+    console.error('[GET /candidates]', error);
     return c.json({ error: 'Failed to fetch candidates' }, 500);
   }
 });
@@ -193,6 +261,7 @@ candidatesRouter.post('/', requireAuth, requireRecruiter, zValidator('json', can
 
     // Note: linking a candidate to a jobId does NOT create an application.
     // jobs.applicants is updated only when an application row is created/deleted.
+    invalidateCountCache('candidates:');
 
     return c.json({
       ...created[0],
@@ -471,6 +540,7 @@ candidatesRouter.put('/:id', requireAuth, requireRecruiter, zValidator('json', u
     if (Object.keys(patch).length === 0) return c.json({ error: 'No fields to update' }, 400);
 
     const updated = await db.update(candidates).set(patch as any).where(eq(candidates.id, id)).returning();
+    invalidateCountCache('candidates:');
 
     const u = updated[0];
     const tagMap = await getCandidateTagMap([u.id], orgId);
@@ -503,6 +573,7 @@ candidatesRouter.delete('/:id', requireAuth, requireRecruiter, async (c) => {
     }
     
     await db.delete(candidates).where(eq(candidates.id, id));
+    invalidateCountCache('candidates:');
     return c.json({ message: 'Candidate deleted' });
   } catch {
     return c.json({ error: 'Failed to delete candidate' }, 500);

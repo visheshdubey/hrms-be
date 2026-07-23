@@ -28,6 +28,15 @@ export async function deliverRawEmail(input: {
 }): Promise<boolean> {
   const label = input.label ?? 'Email';
 
+  // E2E / local automation only — set SKIP_OUTBOUND_EMAIL=1 so tests can invite
+  // without hitting a real mailbox. Product invite/reset flows stay unchanged.
+  if (process.env.SKIP_OUTBOUND_EMAIL === '1' || process.env.SKIP_OUTBOUND_EMAIL === 'true') {
+    console.log(`[EMAIL SKIP] ${label} — SKIP_OUTBOUND_EMAIL is set`);
+    console.log(`  To: ${input.to}`);
+    console.log(`  Subject: ${input.subject}`);
+    return true;
+  }
+
   if (!isSmtpConfigured()) {
     console.log(`[EMAIL MOCK] ${label} — SMTP not configured`);
     console.log(`  To: ${input.to}`);

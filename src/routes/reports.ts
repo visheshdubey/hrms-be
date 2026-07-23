@@ -11,16 +11,24 @@ import {
   savedReports,
   APP_STATUSES,
 } from '../db/schema.js';
-import { eq, inArray, sql, desc } from 'drizzle-orm';
-import { requireAuth, type AppContext } from '../middleware.js';
-import { getOrgMemberIds } from '../lib/orgScope.js';
+import { and, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
+import { requireAuth, type AppContext, type UserRole } from '../middleware.js';
+import { getAccessibleAccountIds, getOrgMemberIds, isOrgPortalRole } from '../lib/orgScope.js';
 import { STATUS_LABELS } from './applications.js';
 
 const reportsRouter = new Hono<AppContext>({ strict: false });
 
-async function getOrgJobIds(memberIds: number[]): Promise<number[]> {
-  if (memberIds.length === 0) return [];
-  const rows = await db.select({ id: jobs.id }).from(jobs).where(inArray(jobs.createdBy, memberIds));
+async function getVisibleJobIds(
+  userId: number,
+  orgId: number | null,
+  role: UserRole | null,
+): Promise<number[]> {
+  const accountIds = await getAccessibleAccountIds(userId, orgId, role);
+  const memberIds = isOrgPortalRole(role) ? [userId] : await getOrgMemberIds(orgId, userId);
+  const accountScope = accountIds.length > 0 ? inArray(jobs.accountId, accountIds) : undefined;
+  const orphanScope = and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds));
+  const where = accountScope ? or(accountScope, orphanScope) : orphanScope;
+  const rows = await db.select({ id: jobs.id }).from(jobs).where(where);
   return rows.map((r: { id: number }) => r.id);
 }
 
@@ -33,8 +41,9 @@ reportsRouter.get('/summary', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const memberIds = await getOrgMemberIds(orgId, userId);
-    const jobIds = await getOrgJobIds(memberIds);
+    const jobIds = await getVisibleJobIds(userId, orgId, role);
 
     if (jobIds.length === 0) {
       return c.json({
@@ -82,10 +91,15 @@ reportsRouter.get('/summary', requireAuth, async (c) => {
     }
 
     // Source breakdown from candidates table
-    const candWhere = memberIds.length === 1
-      ? eq(candidates.createdBy, userId)
-      : inArray(candidates.createdBy, memberIds);
-    const allCands = await db.select({ jobId: candidates.jobId, filename: candidates.filename }).from(candidates).where(candWhere);
+    const visibleCandidateIds = [...new Set(apps.map((app) => app.candidateId))];
+    const candWhere = isOrgPortalRole(role)
+      ? (visibleCandidateIds.length > 0 ? inArray(candidates.id, visibleCandidateIds) : undefined)
+      : memberIds.length === 1
+        ? eq(candidates.createdBy, userId)
+        : inArray(candidates.createdBy, memberIds);
+    const allCands = candWhere
+      ? await db.select({ jobId: candidates.jobId, filename: candidates.filename }).from(candidates).where(candWhere)
+      : [];
 
     const sourceBreakdown = {
       pool:      allCands.filter((c: { jobId: number | null }) => !c.jobId).length,
@@ -111,8 +125,8 @@ reportsRouter.get('/pipeline', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    const jobIds = await getOrgJobIds(memberIds);
+    const role = c.get('userRole') as UserRole | null;
+    const jobIds = await getVisibleJobIds(userId, orgId, role);
 
     if (jobIds.length === 0) return c.json({ jobs: [], stages: [] });
 
@@ -160,8 +174,8 @@ reportsRouter.get('/export', requireAuth, async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    const jobIds = await getOrgJobIds(memberIds);
+    const role = c.get('userRole') as UserRole | null;
+    const jobIds = await getVisibleJobIds(userId, orgId, role);
 
     if (jobIds.length === 0) {
       return c.json({ error: 'No data to export' }, 404);
@@ -184,21 +198,27 @@ reportsRouter.get('/export', requireAuth, async (c) => {
       .where(inArray(applications.jobId, jobIds))
       .orderBy(desc(applications.createdAt));
 
-    const headers = ['Application ID', 'Job', 'Department', 'Candidate', 'Email', 'Match Score', 'Status', 'Applied Date'];
+    const clientPortal = isOrgPortalRole(role);
+    const headers = clientPortal
+      ? ['Application ID', 'Job', 'Department', 'Candidate', 'Status', 'Applied Date']
+      : ['Application ID', 'Job', 'Department', 'Candidate', 'Email', 'Match Score', 'Status', 'Applied Date'];
     const csvRows = rows.map((r: {
       appId: number; jobTitle: string; department: string;
       candidateName: string; candidateEmail: string; matchScore: number;
       status: string; createdAt: string;
-    }) => [
-      r.appId,
-      `"${(r.jobTitle || '').replace(/"/g, '""')}"`,
-      `"${(r.department || '').replace(/"/g, '""')}"`,
-      `"${(r.candidateName || '').replace(/"/g, '""')}"`,
-      `"${(r.candidateEmail || '').replace(/"/g, '""')}"`,
-      r.matchScore,
-      r.status,
-      r.createdAt,
-    ].join(','));
+    }) => {
+      const base = [
+        r.appId,
+        `"${(r.jobTitle || '').replace(/"/g, '""')}"`,
+        `"${(r.department || '').replace(/"/g, '""')}"`,
+        `"${(r.candidateName || '').replace(/"/g, '""')}"`,
+      ];
+      if (!clientPortal) {
+        base.push(`"${(r.candidateEmail || '').replace(/"/g, '""')}"`, r.matchScore);
+      }
+      base.push(r.status, r.createdAt);
+      return base.join(',');
+    });
 
     const csv = [headers.join(','), ...csvRows].join('\n');
     return c.text(csv, 200, {

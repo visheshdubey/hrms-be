@@ -27,6 +27,7 @@ export const users = pgTable("users", {
   isActive: integer("is_active").default(1),
   passwordOtp: text("password_otp"),
   passwordOtpExpiry: text("password_otp_expiry"),
+  authVersion: integer("auth_version").notNull().default(0),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
@@ -232,6 +233,49 @@ export const candidates = pgTable("candidates", {
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
   createdBy: integer("created_by").references(() => users.id),
 });
+
+export const candidateResumes = pgTable("candidate_resumes", {
+  id: serial("id").primaryKey(),
+  candidateId: integer("candidate_id").notNull().references(() => candidates.id, { onDelete: "cascade" }),
+  organizationId: integer("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+  originalFilename: text("original_filename").notNull(),
+  storagePath: text("storage_path").notNull().unique(),
+  mimeType: text("mime_type").notNull(),
+  byteSize: integer("byte_size").notNull(),
+  contentHash: text("content_hash").notNull(),
+  parseStatus: text("parse_status", { enum: ["pending", "parsed", "failed"] }).notNull().default("pending"),
+  parseError: text("parse_error"),
+  extractedText: text("extracted_text").default(""),
+  extractedData: text("extracted_data").default("{}"),
+  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+  updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+export const candidateJobScores = pgTable(
+  "candidate_job_scores",
+  {
+    id: serial("id").primaryKey(),
+    candidateId: integer("candidate_id").notNull().references(() => candidates.id, { onDelete: "cascade" }),
+    resumeId: integer("resume_id").references(() => candidateResumes.id, { onDelete: "set null" }),
+    jobId: integer("job_id").notNull().references(() => jobs.id, { onDelete: "cascade" }),
+    organizationId: integer("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
+    createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+    resumeHash: text("resume_hash").notNull(),
+    jobHash: text("job_hash").notNull(),
+    algorithmVersion: text("algorithm_version").notNull(),
+    totalScore: real("total_score").notNull(),
+    components: text("components").notNull().default("{}"),
+    matchedRequirements: text("matched_requirements").notNull().default("[]"),
+    missingRequirements: text("missing_requirements").notNull().default("[]"),
+    warnings: text("warnings").notNull().default("[]"),
+    createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+    updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+  },
+  (t) => ({
+    uniqueCandidateJob: unique("candidate_job_score_unique").on(t.candidateId, t.jobId),
+  }),
+);
 
 /* ── CRM: Accounts (client companies) ── */
 export const ACCOUNT_STATUSES = ["active", "inactive", "on_hold"] as const;

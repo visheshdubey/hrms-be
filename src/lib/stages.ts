@@ -11,7 +11,7 @@ import type { UserRole } from '../middleware.js';
 import { defaultStageColor } from './stageColors.js';
 
 export function canWriteStageTemplates(role: UserRole | null | undefined): boolean {
-  return role === 'org_admin' || role === 'recruiter_admin';
+  return role === 'recruiter_admin' || role === 'org_admin';
 }
 
 /** Locked system stages every job must have. Delete/type-change disabled in API + UI. */
@@ -155,7 +155,7 @@ export async function getAccountIfAccessible(
   role?: UserRole | string | null,
 ) {
   const [account] = await db.select().from(accounts).where(eq(accounts.id, accountId)).limit(1);
-  if (!account) return null;
+  if (!account || account.status !== 'active') return null;
   if (isOrgPortalRole(role)) {
     if (!(await canAccessAccountId(accountId, userId, orgId, role))) return null;
     return account;

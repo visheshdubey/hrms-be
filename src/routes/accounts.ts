@@ -251,7 +251,10 @@ accountsRouter.get('/options', requireAuth, async (c) => {
     const rows = await db
       .select({ id: accounts.id, name: accounts.name })
       .from(accounts)
-      .where(orgOrCreatorScope(orgId, userId, accounts, accounts))
+      .where(and(
+        orgOrCreatorScope(orgId, userId, accounts, accounts),
+        eq(accounts.status, 'active'),
+      ))
       .orderBy(desc(accounts.updatedAt));
 
     return c.json({ data: rows });

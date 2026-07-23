@@ -2,9 +2,17 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
-import { calendarEvents, interviews, candidates, users } from '../db/schema.js';
-import { eq, inArray } from 'drizzle-orm';
-import { requireAuth, type AppContext } from '../middleware.js';
+import {
+  accountPortalUsers,
+  calendarEvents,
+  interviews,
+  candidates,
+  users,
+  jobs,
+} from '../db/schema.js';
+import { and, eq, inArray, isNull, or, gte, lte, ne } from 'drizzle-orm';
+import { requireAuth, type AppContext, type UserRole } from '../middleware.js';
+import { getAccessibleAccountIds, isOrgPortalRole } from '../lib/orgScope.js';
 
 const calendarRouter = new Hono<AppContext>({ strict: false });
 
@@ -34,71 +42,139 @@ function parseInterviewerIds(json: string | null | undefined): number[] {
 }
 
 async function interviewsAsCalendarEvents(
-  orgId: number | null,
+  visibleJobIds: number[],
+  visibleCreatorIds: number[],
+  redactCandidateDetails: boolean,
   from?: string,
   to?: string,
   jobId?: number,
 ) {
-  let interviewRows = await db.select().from(interviews);
-  if (orgId != null) {
-    interviewRows = interviewRows.filter((row) => row.organizationId === orgId);
-  }
-  if (jobId != null) {
-    interviewRows = interviewRows.filter((row) => row.jobId === jobId);
-  }
+  if (visibleJobIds.length === 0 || visibleCreatorIds.length === 0) return [];
 
-  const filtered = interviewRows.filter((row) => {
-    if (row.status === 'cancelled') return false;
-    if (from && row.startTime < from) return false;
-    if (to && row.startTime > to) return false;
-    return true;
-  });
-
-  const events = await Promise.all(
-    filtered.map(async (row) => {
-      const [cand] = await db
-        .select({ id: candidates.id, name: candidates.name })
-        .from(candidates)
-        .where(eq(candidates.id, row.candidateId))
-        .limit(1);
-
-      const interviewerIds = parseInterviewerIds(row.interviewerIds);
-      let interviewerNames: string[] = [];
-      if (interviewerIds.length) {
-        const interviewers = await db
-          .select({ name: users.name })
-          .from(users)
-          .where(inArray(users.id, interviewerIds));
-        interviewerNames = interviewers.map((u) => u.name);
-      }
-
-      const interviewerLabel = interviewerNames.length
-        ? interviewerNames.join(', ')
-        : 'Unassigned';
-
-      return {
-        id: `interview-${row.id}`,
-        title: row.title,
-        startTime: row.startTime,
-        endTime: row.endTime,
-        color: row.status === 'completed' ? 'green' : 'purple',
-        eventType: 'interview',
-        candidateId: row.candidateId,
-        candidateName: cand?.name ?? '',
-        jobProfile: row.accountName || row.endClient || '',
-        location: '',
-        description: `Interviewers: ${interviewerLabel}`,
-        meetingLink: '',
-        isAllDay: 0,
-        organizationId: row.organizationId,
-        createdBy: row.createdBy,
-        source: 'interview',
-        interviewStatus: row.status,
-      };
-    }),
+  const dateScope = and(
+    from ? gte(interviews.startTime, from) : undefined,
+    to ? lte(interviews.startTime, to) : undefined,
   );
 
-  return events;
+  const interviewRows = await db
+    .select({
+      id: interviews.id,
+      title: interviews.title,
+      startTime: interviews.startTime,
+      endTime: interviews.endTime,
+      status: interviews.status,
+      candidateId: interviews.candidateId,
+      accountName: interviews.accountName,
+      endClient: interviews.endClient,
+      interviewerIds: interviews.interviewerIds,
+      organizationId: interviews.organizationId,
+      createdBy: interviews.createdBy,
+      jobId: interviews.jobId,
+    })
+    .from(interviews)
+    .where(
+      and(
+        inArray(interviews.jobId, visibleJobIds),
+        inArray(interviews.createdBy, visibleCreatorIds),
+        ne(interviews.status, 'cancelled'),
+        jobId != null ? eq(interviews.jobId, jobId) : undefined,
+        dateScope,
+      ),
+    );
+
+  if (interviewRows.length === 0) return [];
+
+  const candidateIds = [...new Set(interviewRows.map((row) => row.candidateId).filter(Boolean))];
+  const candidateNameById = new Map<number, string>();
+  if (candidateIds.length > 0 && !redactCandidateDetails) {
+    const candRows = await db
+      .select({ id: candidates.id, name: candidates.name })
+      .from(candidates)
+      .where(inArray(candidates.id, candidateIds));
+    for (const row of candRows) candidateNameById.set(row.id, row.name);
+  }
+
+  const allInterviewerIds = [
+    ...new Set(interviewRows.flatMap((row) => parseInterviewerIds(row.interviewerIds))),
+  ];
+  const interviewerNameById = new Map<number, string>();
+  if (allInterviewerIds.length > 0 && !redactCandidateDetails) {
+    const interviewerRows = await db
+      .select({ id: users.id, name: users.name })
+      .from(users)
+      .where(inArray(users.id, allInterviewerIds));
+    for (const row of interviewerRows) interviewerNameById.set(row.id, row.name);
+  }
+
+  return interviewRows.map((row) => {
+    const interviewerIds = parseInterviewerIds(row.interviewerIds);
+    const interviewerLabel = interviewerIds
+      .map((id) => interviewerNameById.get(id))
+      .filter(Boolean)
+      .join(', ') || 'Unassigned';
+
+    return {
+      id: `interview-${row.id}`,
+      title: row.title,
+      startTime: row.startTime,
+      endTime: row.endTime,
+      color: row.status === 'completed' ? 'green' : 'purple',
+      eventType: 'interview',
+      candidateId: redactCandidateDetails ? null : row.candidateId,
+      candidateName: redactCandidateDetails ? '' : (candidateNameById.get(row.candidateId) ?? ''),
+      jobProfile: row.accountName || row.endClient || '',
+      location: '',
+      description: redactCandidateDetails ? 'Scheduled interview' : `Interviewers: ${interviewerLabel}`,
+      meetingLink: '',
+      isAllDay: 0,
+      organizationId: row.organizationId,
+      createdBy: row.createdBy,
+      source: 'interview',
+      interviewStatus: row.status,
+    };
+  });
+}
+
+async function getCalendarMemberIds(
+  userId: number,
+  orgId: number | null,
+  role: UserRole | null,
+  accountIds: number[],
+): Promise<number[]> {
+  if (isOrgPortalRole(role)) {
+    if (accountIds.length === 0) return [userId];
+    const rows = await db
+      .select({ userId: accountPortalUsers.userId })
+      .from(accountPortalUsers)
+      .where(inArray(accountPortalUsers.accountId, accountIds));
+    return [...new Set([userId, ...rows.map((row) => row.userId)])];
+  }
+
+  const rows = orgId == null
+    ? await db
+        .select({ id: users.id })
+        .from(users)
+        .where(and(eq(users.id, userId), eq(users.portalType, 'recruiter')))
+    : await db
+        .select({ id: users.id })
+        .from(users)
+        .where(and(
+          eq(users.organizationId, orgId),
+          eq(users.portalType, 'recruiter'),
+        ));
+  return rows.map((row) => row.id);
+}
+
+async function getVisibleJobIds(userId: number, orgId: number | null, role: UserRole | null) {
+  const accountIds = await getAccessibleAccountIds(userId, orgId, role);
+  const memberIds = await getCalendarMemberIds(userId, orgId, role, accountIds);
+  const accountScope = accountIds.length > 0 ? inArray(jobs.accountId, accountIds) : undefined;
+  const orphanScope = and(isNull(jobs.accountId), inArray(jobs.createdBy, memberIds));
+  const rows = await db
+    .select({ id: jobs.id })
+    .from(jobs)
+    .where(accountScope ? or(accountScope, orphanScope) : orphanScope);
+  return rows.map((row) => row.id);
 }
 
 // GET /calendar — calendar events + scheduled interviews
@@ -106,30 +182,59 @@ calendarRouter.get('/', requireAuth, async (c) => {
   try {
     const userId  = c.get('userId') as number;
     const orgId   = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const from    = c.req.query('from');
     const to      = c.req.query('to');
     const jobIdParam = c.req.query('jobId');
     const jobId = jobIdParam ? parseInt(jobIdParam) : undefined;
 
-    let memberIds: number[] = [userId];
-    if (orgId != null) {
-      const members = await db.select({ id: users.id }).from(users).where(eq(users.organizationId, orgId));
-      memberIds = members.map((u: { id: number }) => u.id);
-    }
+    const accountIds = await getAccessibleAccountIds(userId, orgId, role);
+    const memberIds = await getCalendarMemberIds(userId, orgId, role, accountIds);
     if (memberIds.length === 0) return c.json([]);
+    const visibleJobIds = await getVisibleJobIds(userId, orgId, role);
 
-    const rows = await db.select().from(calendarEvents)
-      .where(inArray(calendarEvents.createdBy, memberIds));
+    const dateScope = and(
+      from ? gte(calendarEvents.startTime, from) : undefined,
+      to ? lte(calendarEvents.startTime, to) : undefined,
+    );
+
+    const rows = isOrgPortalRole(role)
+      ? await db.select().from(calendarEvents).where(
+          and(
+            inArray(calendarEvents.createdBy, memberIds),
+            visibleJobIds.length > 0
+              ? or(
+                  inArray(calendarEvents.jobId, visibleJobIds),
+                  isNull(calendarEvents.jobId),
+                )
+              : isNull(calendarEvents.jobId),
+            jobId != null && !isNaN(jobId) ? eq(calendarEvents.jobId, jobId) : undefined,
+            dateScope,
+          ),
+        )
+      : await db.select().from(calendarEvents)
+          .where(and(
+            inArray(calendarEvents.createdBy, memberIds),
+            jobId != null && !isNaN(jobId) ? eq(calendarEvents.jobId, jobId) : undefined,
+            dateScope,
+          ));
 
     const calendarOnly = rows.filter((e) => {
-      if (jobId != null && !isNaN(jobId) && e.jobId !== jobId) return false;
-      if (from && e.startTime < from) return false;
-      if (to && e.startTime > to) return false;
+      if (e.jobId != null && !visibleJobIds.includes(e.jobId)) return false;
       return true;
-    }).map((e) => ({ ...e, source: 'calendar' }));
+    }).map((e) => isOrgPortalRole(role)
+      ? {
+          ...e,
+          candidateId: null,
+          candidateName: '',
+          source: 'calendar',
+        }
+      : { ...e, source: 'calendar' });
 
     const interviewEvents = await interviewsAsCalendarEvents(
-      orgId,
+      visibleJobIds,
+      memberIds,
+      isOrgPortalRole(role),
       from,
       to,
       jobId != null && !isNaN(jobId) ? jobId : undefined,
@@ -147,7 +252,14 @@ calendarRouter.post('/', requireAuth, zValidator('json', eventSchema), async (c)
   try {
     const userId = c.get('userId') as number;
     const orgId  = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const b      = c.req.valid('json');
+    if (b.jobId != null) {
+      const visibleJobIds = await getVisibleJobIds(userId, orgId, role);
+      if (!visibleJobIds.includes(b.jobId)) {
+        return c.json({ error: 'Job not found or unauthorized' }, 403);
+      }
+    }
 
     const [created] = await db.insert(calendarEvents).values({
       title:         b.title,
@@ -177,6 +289,8 @@ calendarRouter.post('/', requireAuth, zValidator('json', eventSchema), async (c)
 calendarRouter.put('/:id', requireAuth, zValidator('json', eventSchema.partial()), async (c) => {
   try {
     const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
     const idParam = c.req.param('id');
     if (idParam.startsWith('interview-')) {
       return c.json({ error: 'Interview events are managed from the Interviews module' }, 403);
@@ -190,6 +304,12 @@ calendarRouter.put('/:id', requireAuth, zValidator('json', eventSchema.partial()
     if (existing[0].createdBy !== userId) return c.json({ error: 'Unauthorized' }, 403);
 
     const b = c.req.valid('json');
+    if (b.jobId != null) {
+      const visibleJobIds = await getVisibleJobIds(userId, orgId, role);
+      if (!visibleJobIds.includes(b.jobId)) {
+        return c.json({ error: 'Job not found or unauthorized' }, 403);
+      }
+    }
     const patch: Record<string, unknown> = {};
     if (b.title         != null) patch.title         = b.title;
     if (b.startTime     != null) patch.startTime     = b.startTime;
