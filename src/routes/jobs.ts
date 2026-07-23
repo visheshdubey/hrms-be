@@ -4,12 +4,11 @@ import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { eq, desc, inArray, and, or, isNull, isNotNull, countDistinct, sql, type SQL } from 'drizzle-orm';
 import { requireAuth, requireRole, ORG_ROLES, type AppContext, type UserRole } from '../middleware.js';
-import { jobs, jobStages, JOB_STAGE_TYPES, applications, users, applicationStageHistory } from '../db/schema.js';
+import { jobs, jobStages, JOB_STAGE_TYPES, applications, users, applicationStageHistory, submissions, interviews, candidates } from '../db/schema.js';
 import {
   copyAccountStageTemplatesToJob,
   canWriteStageTemplates,
   getAccountIfAccessible,
-  normalizeJobStageOrder,
 } from '../lib/stages.js';
 import {
   canAccessJob,
@@ -65,14 +64,32 @@ function withJobDefaults<T extends Record<string, unknown>>(row: T) {
   };
 }
 
+/** List columns — excludes heavy description HTML. */
+const LIST_JOB_SELECT = {
+  id: jobs.id,
+  title: jobs.title,
+  department: jobs.department,
+  status: jobs.status,
+  type: jobs.type,
+  location: jobs.location,
+  applicants: jobs.applicants,
+  postedDate: jobs.postedDate,
+  accountId: jobs.accountId,
+  payPackageMin: jobs.payPackageMin,
+  payPackageMax: jobs.payPackageMax,
+  payCurrency: jobs.payCurrency,
+  createdBy: jobs.createdBy,
+  assignedTo: jobs.assignedTo,
+} as const;
+
 async function selectJobs(where?: SQL) {
   const run = async (columns?: Record<string, unknown>) => {
-    const base = columns ? db.select(columns as any).from(jobs) : db.select().from(jobs);
+    const base = columns ? db.select(columns as any).from(jobs) : db.select(LIST_JOB_SELECT).from(jobs);
     return where ? await base.where(where).orderBy(desc(jobs.id)) : await base.orderBy(desc(jobs.id));
   };
 
   try {
-    return await run();
+    return await run(LIST_JOB_SELECT);
   } catch {
     try {
       const rows = await run(LEGACY_JOB_SELECT);
@@ -280,7 +297,8 @@ jobsRouter.get('/', requireAuth, async (c) => {
     const now = Date.now();
     const result = withCounts.map((j: any) => ({
       ...j,
-      skills: j.description,
+      description: '',
+      skills: '',
       postedDate: formatRelativeTime(j.postedDate, now),
     }));
     return c.json(result);
@@ -545,27 +563,42 @@ jobsRouter.post('/:jobId/stages', requireAuth, zValidator('json', stageSchema), 
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const b = c.req.valid('json');
-    const [hiredStage] = await db
-      .select({ orderIndex: jobStages.orderIndex })
-      .from(jobStages)
-      .where(and(eq(jobStages.jobId, jobId), eq(jobStages.stageType, 'hired')))
-      .limit(1);
-    // The normalizer is authoritative, but inserting before Hired also prevents a UI flash.
-    const orderIndex = hiredStage?.orderIndex ?? 1;
-    // Custom stages are always In-Transit. Start/Hired/Rejected are system-only.
-    const [created] = await db.insert(jobStages).values({
-      jobId,
-      name: b.name,
-      orderIndex,
-      stageType: 'in_transit',
-      color: b.color ?? defaultStageColor(orderIndex),
-    }).returning();
+    const created = await db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${jobId})`);
+      const current = await tx
+        .select()
+        .from(jobStages)
+        .where(eq(jobStages.jobId, jobId))
+        .orderBy(jobStages.orderIndex);
+      const hiredStage = current.find((stage) => stage.stageType === 'hired');
+      const orderIndex = hiredStage?.orderIndex ?? Math.max(1, current.length);
+      const [inserted] = await tx.insert(jobStages).values({
+        jobId,
+        name: b.name,
+        orderIndex,
+        stageType: 'in_transit',
+        color: b.color ?? defaultStageColor(orderIndex),
+      }).returning();
 
-    await normalizeJobStageOrder(jobId);
-    const [normalized] = await db.select().from(jobStages)
-      .where(and(eq(jobStages.id, created.id), eq(jobStages.jobId, jobId)))
-      .limit(1);
-    return c.json(normalized ?? created, 201);
+      const all = [...current, inserted];
+      const ordered = [
+        ...all.filter((stage) => stage.stageType === 'initial'),
+        ...all.filter((stage) => stage.stageType === 'in_transit')
+          .sort((a, b) => a.orderIndex - b.orderIndex || a.id - b.id),
+        ...all.filter((stage) => stage.stageType === 'hired'),
+        ...all.filter((stage) => stage.stageType === 'rejected'),
+      ];
+      for (const [index, stage] of ordered.entries()) {
+        await tx.update(jobStages)
+          .set({ orderIndex: index })
+          .where(and(eq(jobStages.id, stage.id), eq(jobStages.jobId, jobId)));
+      }
+      const [normalized] = await tx.select().from(jobStages)
+        .where(and(eq(jobStages.id, inserted.id), eq(jobStages.jobId, jobId)))
+        .limit(1);
+      return normalized ?? inserted;
+    });
+    return c.json(created, 201);
   } catch {
     return c.json({ error: 'Failed to create job stage' }, 500);
   }
@@ -587,36 +620,49 @@ jobsRouter.put('/:jobId/stages/reorder', requireAuth, zValidator('json', reorder
     if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
 
     const { stageIds } = c.req.valid('json');
-    const existing = await db
-      .select({ id: jobStages.id, stageType: jobStages.stageType })
-      .from(jobStages)
-      .where(eq(jobStages.jobId, jobId));
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${jobId})`);
+      const existing = await tx
+        .select()
+        .from(jobStages)
+        .where(eq(jobStages.jobId, jobId));
 
-    if (existing.length === 0) {
-      return c.json({ error: 'No stages to reorder' }, 400);
-    }
+      if (existing.length === 0) return { error: 'No stages to reorder' } as const;
+      if (stageIds.length !== existing.length) {
+        return { error: 'stageIds must include every stage for this job' } as const;
+      }
+      const existingIdSet = new Set(existing.map((row) => row.id));
+      if (new Set(stageIds).size !== stageIds.length
+        || !stageIds.every((id) => existingIdSet.has(id))) {
+        return { error: 'Invalid stageIds for this job' } as const;
+      }
 
-    if (stageIds.length !== existing.length) {
-      return c.json({ error: 'stageIds must include every stage for this job' }, 400);
-    }
+      const preferred = new Map(stageIds.map((id, index) => [id, index]));
+      const inTransit = existing
+        .filter((stage) => stage.stageType === 'in_transit')
+        .sort((a, b) => (preferred.get(a.id) ?? 0) - (preferred.get(b.id) ?? 0));
+      const ordered = [
+        ...existing.filter((stage) => stage.stageType === 'initial'),
+        ...inTransit,
+        ...existing.filter((stage) => stage.stageType === 'hired'),
+        ...existing.filter((stage) => stage.stageType === 'rejected'),
+      ];
+      for (const [index, stage] of ordered.entries()) {
+        await tx.update(jobStages)
+          .set({ orderIndex: index })
+          .where(and(eq(jobStages.id, stage.id), eq(jobStages.jobId, jobId)));
+      }
 
-    const existingIdSet = new Set(existing.map((row) => row.id));
-    if (!stageIds.every((id) => existingIdSet.has(id))) {
-      return c.json({ error: 'Invalid stageIds for this job' }, 400);
-    }
+      const stages = await tx
+        .select()
+        .from(jobStages)
+        .where(eq(jobStages.jobId, jobId))
+        .orderBy(jobStages.orderIndex);
+      return { data: stages } as const;
+    });
 
-    const inTransitIds = stageIds.filter((id) =>
-      existing.some((stage) => stage.id === id && stage.stageType === 'in_transit'),
-    );
-    await normalizeJobStageOrder(jobId, inTransitIds);
-
-    const stages = await db
-      .select()
-      .from(jobStages)
-      .where(eq(jobStages.jobId, jobId))
-      .orderBy(jobStages.orderIndex);
-
-    return c.json({ data: stages });
+    if ('error' in result) return c.json({ error: result.error }, 400);
+    return c.json(result);
   } catch {
     return c.json({ error: 'Failed to reorder job stages' }, 500);
   }
@@ -783,6 +829,169 @@ jobsRouter.get('/:jobId/stage-stats', requireAuth, async (c) => {
     });
   } catch {
     return c.json({ error: 'Failed to fetch stage stats' }, 500);
+  }
+});
+
+// GET /jobs/:jobId/overview — APTO-style job overview widgets
+jobsRouter.get('/:jobId/overview', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole') as UserRole | null;
+    const jobId = parseInt(c.req.param('jobId'));
+    if (isNaN(jobId)) return c.json({ error: 'Invalid job id' }, 400);
+
+    const job = await canAccessJobForStages({ jobId, userId, orgId, role });
+    if (!job) return c.json({ error: 'Job not found or unauthorized' }, 403);
+
+    const [[appCounts], [subCounts], [interviewCountRow], [matchBands], recentSubs, recentApps] =
+      await Promise.all([
+        db
+          .select({
+            pipelined: sql<number>`count(*) filter (
+              where coalesce(${jobStages.stageType}, '') not in ('hired', 'rejected')
+              and ${applications.status} not in ('rejected', 'no_offer', 'offer')
+            )`,
+            rejected: sql<number>`count(*) filter (
+              where ${jobStages.stageType} = 'rejected'
+              or ${applications.status} in ('rejected', 'no_offer')
+            )`,
+            onboarded: sql<number>`count(*) filter (
+              where ${jobStages.stageType} = 'hired'
+              or ${applications.status} = 'offer'
+            )`,
+          })
+          .from(applications)
+          .leftJoin(jobStages, eq(applications.jobStageId, jobStages.id))
+          .where(eq(applications.jobId, jobId)),
+        db
+          .select({
+            submitted: sql<number>`count(*)`,
+            endClient: sql<number>`count(*) filter (where ${submissions.status} in ('client_review', 'client_interview_scheduled', 'client_rejected', 'client_accepted'))`,
+            confirmations: sql<number>`count(*) filter (where ${submissions.status} = 'client_accepted')`,
+          })
+          .from(submissions)
+          .where(eq(submissions.jobId, jobId)),
+        db
+          .select({ cnt: sql<number>`count(*)` })
+          .from(interviews)
+          .where(eq(interviews.jobId, jobId)),
+        db
+          .select({
+            band80: sql<number>`count(*) filter (where coalesce(${candidates.matchScore}, 0) >= 80)`,
+            band50: sql<number>`count(*) filter (where coalesce(${candidates.matchScore}, 0) >= 50)`,
+            band10: sql<number>`count(*) filter (where coalesce(${candidates.matchScore}, 0) >= 10)`,
+          })
+          .from(applications)
+          .leftJoin(candidates, eq(applications.candidateId, candidates.id))
+          .where(eq(applications.jobId, jobId)),
+        db
+          .select({
+            submittedAt: submissions.submittedAt,
+            candidateName: candidates.name,
+            actorName: users.name,
+          })
+          .from(submissions)
+          .leftJoin(candidates, eq(submissions.candidateId, candidates.id))
+          .leftJoin(users, eq(submissions.submittedBy, users.id))
+          .where(eq(submissions.jobId, jobId))
+          .orderBy(desc(submissions.submittedAt))
+          .limit(10),
+        db
+          .select({
+            createdAt: applications.createdAt,
+            candidateName: candidates.name,
+            actorName: users.name,
+          })
+          .from(applications)
+          .leftJoin(candidates, eq(applications.candidateId, candidates.id))
+          .leftJoin(users, eq(applications.createdBy, users.id))
+          .where(eq(applications.jobId, jobId))
+          .orderBy(desc(applications.createdAt))
+          .limit(8),
+      ]);
+
+    const pipelined = Number(appCounts?.pipelined ?? 0);
+    const rejected = Number(appCounts?.rejected ?? 0);
+    const onboarded = Number(appCounts?.onboarded ?? 0);
+    const submitted = Number(subCounts?.submitted ?? 0);
+    const endClient = Number(subCounts?.endClient ?? 0);
+    const confirmations = Number(subCounts?.confirmations ?? 0);
+    const interviewsCount = Number(interviewCountRow?.cnt ?? 0);
+    const matchingProfiles = {
+      band80: Number(matchBands?.band80 ?? 0),
+      band50: Number(matchBands?.band50 ?? 0),
+      band10: Number(matchBands?.band10 ?? 0),
+    };
+
+    let createdByName = '';
+    let modifiedByName = '';
+    if (job.createdBy != null) {
+      const [creator] = await db.select({ name: users.name }).from(users).where(eq(users.id, job.createdBy)).limit(1);
+      createdByName = creator?.name ?? '';
+    }
+    if (job.assignedTo != null) {
+      const [assignee] = await db.select({ name: users.name }).from(users).where(eq(users.id, job.assignedTo)).limit(1);
+      modifiedByName = assignee?.name ?? createdByName;
+    } else {
+      modifiedByName = createdByName;
+    }
+
+    const activity: Array<{ at: string; text: string; actorName: string }> = [];
+    for (const s of recentSubs) {
+      activity.push({
+        at: s.submittedAt,
+        text: `Candidate ${s.candidateName ?? 'Unknown'} has been submitted to job`,
+        actorName: s.actorName ?? '',
+      });
+    }
+    for (const a of recentApps) {
+      activity.push({
+        at: a.createdAt,
+        text: `Application created for ${a.candidateName ?? 'candidate'}`,
+        actorName: a.actorName ?? '',
+      });
+    }
+    activity.push({
+      at: job.postedDate,
+      text: 'Job published',
+      actorName: createdByName,
+    });
+    activity.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+
+    const funnel = [
+      { key: 'pipelined', label: 'Pipelined', count: pipelined },
+      { key: 'submitted', label: 'Submitted', count: submitted },
+      { key: 'interviewed', label: 'Interviewed', count: interviewsCount },
+      { key: 'confirmations', label: 'Confirmations', count: confirmations },
+      { key: 'accepted', label: 'Accepted', count: confirmations },
+      { key: 'rejected', label: 'Rejected', count: rejected },
+      { key: 'onboarded', label: 'Onboarded', count: onboarded },
+    ];
+
+    return c.json({
+      pipelineSummary: {
+        pipelined,
+        submitted,
+        endClient,
+        interviews: interviewsCount,
+        confirmations,
+        rejected,
+        onboarded,
+      },
+      funnel,
+      meta: {
+        createdByName,
+        createdOn: job.postedDate,
+        modifiedByName,
+        modifiedOn: job.postedDate,
+      },
+      matchingProfiles,
+      activity: activity.slice(0, 15),
+    });
+  } catch (error) {
+    console.error('Job overview error:', error);
+    return c.json({ error: 'Failed to fetch job overview' }, 500);
   }
 });
 

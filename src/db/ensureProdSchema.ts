@@ -29,6 +29,49 @@ const STATEMENTS = [
     created_at text NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
   `ALTER TABLE upload_assets ADD COLUMN IF NOT EXISTS account_id integer REFERENCES accounts(id) ON DELETE CASCADE`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version integer NOT NULL DEFAULT 0`,
+
+  // Secure recruiter-owned resume ingestion and deterministic per-job ATS scores.
+  `CREATE TABLE IF NOT EXISTS candidate_resumes (
+    id serial PRIMARY KEY,
+    candidate_id integer NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+    organization_id integer REFERENCES organizations(id) ON DELETE CASCADE,
+    created_by integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    original_filename text NOT NULL,
+    storage_path text NOT NULL UNIQUE,
+    mime_type text NOT NULL,
+    byte_size integer NOT NULL,
+    content_hash text NOT NULL,
+    parse_status text NOT NULL DEFAULT 'pending',
+    parse_error text,
+    extracted_text text DEFAULT '',
+    extracted_data text DEFAULT '{}',
+    created_at text NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at text NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE INDEX IF NOT EXISTS candidate_resumes_candidate_idx ON candidate_resumes(candidate_id)`,
+  `CREATE INDEX IF NOT EXISTS candidate_resumes_owner_idx ON candidate_resumes(organization_id, created_by)`,
+  `CREATE TABLE IF NOT EXISTS candidate_job_scores (
+    id serial PRIMARY KEY,
+    candidate_id integer NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+    resume_id integer REFERENCES candidate_resumes(id) ON DELETE SET NULL,
+    job_id integer NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    organization_id integer REFERENCES organizations(id) ON DELETE CASCADE,
+    created_by integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    resume_hash text NOT NULL,
+    job_hash text NOT NULL,
+    algorithm_version text NOT NULL,
+    total_score real NOT NULL,
+    components text NOT NULL DEFAULT '{}',
+    matched_requirements text NOT NULL DEFAULT '[]',
+    missing_requirements text NOT NULL DEFAULT '[]',
+    warnings text NOT NULL DEFAULT '[]',
+    created_at text NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at text NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT candidate_job_score_unique UNIQUE (candidate_id, job_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS candidate_job_scores_job_score_idx ON candidate_job_scores(job_id, total_score DESC)`,
+  `CREATE INDEX IF NOT EXISTS candidate_job_scores_owner_idx ON candidate_job_scores(organization_id, created_by)`,
 
   // jobs assignment + pay (pay may already exist)
   `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_to integer`,
@@ -93,6 +136,26 @@ const STATEMENTS = [
     created_by integer,
     created_at text NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
+
+  // Hot-path indexes for large local/prod datasets (idempotent).
+  `CREATE INDEX IF NOT EXISTS candidates_created_by_created_at_idx ON candidates (created_by, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS candidates_job_id_idx ON candidates (job_id)`,
+  `CREATE INDEX IF NOT EXISTS candidates_fingerprint_idx ON candidates (fingerprint)`,
+  `CREATE INDEX IF NOT EXISTS candidates_match_score_idx ON candidates (created_by, match_score DESC)`,
+  `CREATE INDEX IF NOT EXISTS applications_created_by_created_at_idx ON applications (created_by, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS applications_job_stage_idx ON applications (job_id, job_stage_id)`,
+  `CREATE INDEX IF NOT EXISTS applications_status_updated_idx ON applications (created_by, status, updated_at)`,
+  `CREATE INDEX IF NOT EXISTS submissions_submitted_by_at_idx ON submissions (submitted_by, submitted_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS submissions_job_id_status_idx ON submissions (job_id, status)`,
+  `CREATE INDEX IF NOT EXISTS submissions_candidate_id_idx ON submissions (candidate_id)`,
+  `CREATE INDEX IF NOT EXISTS interviews_created_by_start_idx ON interviews (created_by, start_time)`,
+  `CREATE INDEX IF NOT EXISTS interviews_job_id_start_idx ON interviews (job_id, start_time)`,
+  `CREATE INDEX IF NOT EXISTS calendar_events_created_by_start_idx ON calendar_events (created_by, start_time)`,
+  `CREATE INDEX IF NOT EXISTS jobs_account_id_idx ON jobs (account_id)`,
+  `CREATE INDEX IF NOT EXISTS jobs_created_by_status_idx ON jobs (created_by, status)`,
+  `CREATE INDEX IF NOT EXISTS users_organization_id_idx ON users (organization_id)`,
+  `CREATE INDEX IF NOT EXISTS candidates_name_prefix_idx ON candidates (lower(name) text_pattern_ops)`,
+  `CREATE INDEX IF NOT EXISTS candidates_email_prefix_idx ON candidates (lower(email) text_pattern_ops)`,
 ] as const;
 
 export async function ensureProdSchema(): Promise<void> {

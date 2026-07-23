@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db } from '../db/index.js';
 import { accountPortalUsers, accounts, organizations, users } from '../db/schema.js';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { sendInviteEmail, sendPasswordResetEmail, sendPasswordOtpEmail } from '../utils/email.js';
 import {
   queueInviteEmail,
@@ -58,6 +58,8 @@ const auth = new Hono({ strict: false });
 
 type UserRole = 'recruiter_admin' | 'recruited_staff' | 'org_admin' | 'org_staff';
 type PortalType = 'org' | 'recruiter';
+
+const normalizeEmail = (email: string): string => email.trim().toLowerCase();
 
 const userProfileFields = {
   id: users.id,
@@ -125,12 +127,13 @@ function assertCanInvite(
 
 const inviteSchema = z.object({
   name: z.string().min(2, "Name must be at least 2 characters"),
-  email: z.string().email("Invalid email address"),
+  email: z.string().trim().email("Invalid email address").transform(normalizeEmail),
   role: z.string().optional(),
+  accountId: z.number().int().positive().optional(),
 });
 
 const loginSchema = z.object({
-  email: z.string().email("Invalid email address"),
+  email: z.string().trim().email("Invalid email address").transform(normalizeEmail),
   password: z.string().min(6, "Password must be at least 6 characters"),
 });
 
@@ -140,7 +143,7 @@ const verifySchema = z.object({
 });
 
 const forgotPasswordSchema = z.object({
-  email: z.string().email("Invalid email address"),
+  email: z.string().trim().email("Invalid email address").transform(normalizeEmail),
 });
 
 const resetPasswordSchema = z.object({
@@ -159,10 +162,14 @@ const orgUpdateSchema = z.object({
 auth.post('/forgot-password', zValidator('json', forgotPasswordSchema), async (c) => {
   try {
     const { email } = c.req.valid('json');
-    const user = await db.select().from(users).where(eq(users.email, email)).limit(1);
+    const user = await db.select().from(users).where(sql`lower(trim(${users.email})) = ${email}`).limit(1);
 
     if (user.length > 0 && user[0].isVerified === 1 && user[0].password) {
-      const resetToken = jwt.sign({ email, type: 'reset' }, JWT_SECRET, { expiresIn: '1h' });
+      const resetToken = jwt.sign({
+        userId: user[0].id,
+        type: 'reset',
+        authVersion: user[0].authVersion,
+      }, JWT_SECRET, { expiresIn: '1h' });
       await dispatchEmail(
         () => queuePasswordResetEmail(email, resetToken),
         () => sendPasswordResetEmail(email, resetToken),
@@ -189,19 +196,35 @@ auth.post('/reset-password', zValidator('json', resetPasswordSchema), async (c) 
       return c.json({ error: 'Passwords do not match' }, 400);
     }
 
-    const decoded = jwt.verify(token, JWT_SECRET) as { email: string; type: string };
+    const decoded = jwt.verify(token, JWT_SECRET) as {
+      userId: number;
+      type: string;
+      authVersion: number;
+    };
     if (decoded.type !== 'reset') {
       return c.json({ error: 'Invalid token type' }, 400);
     }
 
-    const user = await db.select().from(users).where(eq(users.email, decoded.email)).limit(1);
+    const user = await db.select().from(users).where(and(
+      eq(users.id, decoded.userId),
+      eq(users.authVersion, decoded.authVersion),
+    )).limit(1);
     if (user.length === 0) {
-      return c.json({ error: 'User not found' }, 404);
+      return c.json({ error: 'Reset link is invalid or has already been used' }, 409);
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    await db.update(users).set({ password: hashedPassword, isVerified: 1 })
-      .where(eq(users.email, decoded.email));
+    const updated = await db.update(users).set({
+      password: hashedPassword,
+      isVerified: 1,
+      authVersion: sql`${users.authVersion} + 1`,
+    }).where(and(
+      eq(users.id, user[0].id),
+      eq(users.authVersion, decoded.authVersion),
+    )).returning({ id: users.id });
+    if (updated.length === 0) {
+      return c.json({ error: 'Reset link has already been used' }, 409);
+    }
 
     return c.json({ message: 'Password reset successfully. You can now sign in.' }, 200);
   } catch {
@@ -426,11 +449,14 @@ auth.post('/invite', zValidator('json', inviteSchema), async (c) => {
   }
 
   try {
-    const { name, email, role: inviteRole } = c.req.valid('json');
+    const { name, email, role: inviteRole, accountId } = c.req.valid('json');
     const tokenStr = authHeader.split(' ')[1];
     const decoded = jwt.verify(tokenStr, JWT_SECRET) as { id: number; email: string };
 
-    const existingUser = await db.select().from(users).where(eq(users.email, email));
+    const existingUser = await db
+      .select()
+      .from(users)
+      .where(sql`lower(trim(${users.email})) = ${email}`);
     if (existingUser.length > 0) {
       return c.json({ error: 'User already exists' }, 400);
     }
@@ -452,32 +478,48 @@ auth.post('/invite', zValidator('json', inviteSchema), async (c) => {
       return c.json({ error: inviteError }, 403);
     }
     const portal = portalForRole(resolvedRole, inviterPortal);
-
-    const newUser = await db.insert(users).values({
-      name,
-      email,
-      password: null,
-      isVerified: 0,
-      role: resolvedRole,
-      portalType: portal,
-      organizationId: inviterUser.organizationId,
-    }).returning(userProfileFields);
-
-    if (inviterPortal === 'org') {
-      const accountIds = await getAccessibleAccountIds(
+    let membershipAccountId: number | null = null;
+    if (portal === 'org') {
+      const accessibleAccountIds = await getAccessibleAccountIds(
         inviterUser.id,
         inviterUser.organizationId,
         inviterUser.role,
       );
-      if (accountIds.length !== 1) {
-        await db.delete(users).where(eq(users.id, newUser[0].id));
-        return c.json({ error: 'Could not resolve the client account for this invitation' }, 400);
+      if (inviterPortal === 'org') {
+        if (accessibleAccountIds.length !== 1) {
+          return c.json({ error: 'Could not resolve the client account for this invitation' }, 409);
+        }
+        membershipAccountId = accessibleAccountIds[0];
+      } else {
+        if (accountId == null) {
+          return c.json({ error: 'accountId is required when inviting a client portal user' }, 400);
+        }
+        if (!accessibleAccountIds.includes(accountId)) {
+          return c.json({ error: 'Client account not found or unauthorized' }, 403);
+        }
+        membershipAccountId = accountId;
       }
-      await db.insert(accountPortalUsers).values({
-        accountId: accountIds[0],
-        userId: newUser[0].id,
-      });
     }
+
+    const newUser = await db.transaction(async (tx) => {
+      const [created] = await tx.insert(users).values({
+        name: name.trim(),
+        email,
+        password: null,
+        isVerified: 0,
+        role: resolvedRole,
+        portalType: portal,
+        organizationId: inviterUser.organizationId,
+      }).returning(userProfileFields);
+
+      if (membershipAccountId != null) {
+        await tx.insert(accountPortalUsers).values({
+          accountId: membershipAccountId,
+          userId: created.id,
+        });
+      }
+      return [created];
+    });
 
     const verifyToken = jwt.sign({ email: newUser[0].email, type: 'verify' }, JWT_SECRET, { expiresIn: '1d' });
     const emailSent = await dispatchEmail(
@@ -505,17 +547,25 @@ auth.post('/verify-link', zValidator('json', verifySchema), async (c) => {
       return c.json({ error: 'Invalid token type' }, 400);
     }
 
-    const user = await db.select().from(users).where(eq(users.email, decoded.email));
+    const email = normalizeEmail(decoded.email);
+    const user = await db.select().from(users).where(sql`lower(trim(${users.email})) = ${email}`);
     if (user.length === 0) {
       return c.json({ error: 'User not found' }, 404);
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+    if (user[0].isVerified === 1 || user[0].password) {
+      return c.json({ error: 'Invite link has already been used' }, 409);
+    }
+
     const updatedUser = await db.update(users).set({
       password: hashedPassword,
       isVerified: 1,
-    }).where(eq(users.email, decoded.email))
+    }).where(and(eq(users.id, user[0].id), eq(users.isVerified, 0)))
       .returning(userProfileFields);
+    if (updatedUser.length === 0) {
+      return c.json({ error: 'Invite link has already been used' }, 409);
+    }
 
     const loginToken = jwt.sign({ id: updatedUser[0].id, email: updatedUser[0].email }, JWT_SECRET, { expiresIn: '1d' });
 
@@ -530,7 +580,7 @@ auth.post('/login', zValidator('json', loginSchema), async (c) => {
   try {
     const { email, password } = c.req.valid('json');
 
-    const user = await db.select().from(users).where(eq(users.email, email));
+    const user = await db.select().from(users).where(sql`lower(trim(${users.email})) = ${email}`);
     if (user.length === 0) {
       return c.json({ error: 'Invalid credentials' }, 401);
     }
@@ -600,7 +650,7 @@ auth.get('/me', async (c) => {
 const updateSchema = z.object({
   firstName: z.string().optional(),
   lastName: z.string().optional(),
-  email: z.string().email("Invalid email").optional(),
+  email: z.string().trim().email("Invalid email").transform(normalizeEmail).optional(),
   avatarUrl: z.string().optional(),
   country: z.string().optional(),
   timezone: z.string().optional(),
@@ -738,6 +788,9 @@ auth.patch('/users/:id/role', zValidator('json', z.object({ role: z.string() }))
     if (!(await canManageTeamUser(me[0], targetUser[0]))) {
       return c.json({ error: 'Target user not in your team' }, 403);
     }
+    if (targetId === me[0].id) {
+      return c.json({ error: 'You cannot change your own role' }, 400);
+    }
 
     const inviterPortal = (me[0].portalType ?? 'recruiter') as PortalType;
     const inviterRole = (me[0].role ?? 'recruited_staff') as UserRole;
@@ -745,6 +798,37 @@ auth.patch('/users/:id/role', zValidator('json', z.object({ role: z.string() }))
     const inviteError = assertCanInvite(inviterPortal, inviterRole, resolvedRole);
     if (inviteError) return c.json({ error: inviteError }, 400);
     const nextPortal = portalForRole(resolvedRole, inviterPortal);
+    if (nextPortal !== (targetUser[0].portalType ?? 'recruiter')) {
+      return c.json({ error: 'A user role cannot be moved between portals' }, 400);
+    }
+    const currentAdminRole = nextPortal === 'org' ? 'org_admin' : 'recruiter_admin';
+    if (targetUser[0].role === currentAdminRole && resolvedRole !== currentAdminRole) {
+      const accountIds = nextPortal === 'org'
+        ? await getAccessibleAccountIds(me[0].id, me[0].organizationId, me[0].role)
+        : [];
+      const [adminCount] = nextPortal === 'org'
+        ? await db
+            .select({ count: sql<number>`cast(count(*) as int)` })
+            .from(accountPortalUsers)
+            .innerJoin(users, eq(accountPortalUsers.userId, users.id))
+            .where(and(
+              inArray(accountPortalUsers.accountId, accountIds),
+              eq(users.role, 'org_admin'),
+              eq(users.isActive, 1),
+            ))
+        : await db
+            .select({ count: sql<number>`cast(count(*) as int)` })
+            .from(users)
+            .where(and(
+              eq(users.organizationId, me[0].organizationId!),
+              eq(users.portalType, 'recruiter'),
+              eq(users.role, 'recruiter_admin'),
+              eq(users.isActive, 1),
+            ));
+      if (Number(adminCount?.count ?? 0) <= 1) {
+        return c.json({ error: 'The last active administrator cannot be demoted' }, 409);
+      }
+    }
 
     const updated = await db
       .update(users)
@@ -758,7 +842,10 @@ auth.patch('/users/:id/role', zValidator('json', z.object({ role: z.string() }))
 });
 
 // PATCH /auth/users/:id/status — toggle active/deactivate status
-auth.patch('/users/:id/status', zValidator('json', z.object({ isActive: z.number() })), async (c) => {
+auth.patch(
+  '/users/:id/status',
+  zValidator('json', z.object({ isActive: z.union([z.literal(0), z.literal(1)]) })),
+  async (c) => {
   const authHeader = c.req.header('Authorization');
   if (!authHeader?.startsWith('Bearer ')) return c.json({ error: 'Unauthorized' }, 401);
   try {
@@ -779,13 +866,45 @@ auth.patch('/users/:id/status', zValidator('json', z.object({ isActive: z.number
     if (!(await canManageTeamUser(me[0], targetUser[0]))) {
       return c.json({ error: 'Target user not in your team' }, 403);
     }
+    if (targetId === me[0].id && isActive !== 1) {
+      return c.json({ error: 'You cannot deactivate your own account' }, 400);
+    }
+    if (isActive !== 1 && (targetUser[0].role === 'recruiter_admin' || targetUser[0].role === 'org_admin')) {
+      const targetPortal = (targetUser[0].portalType ?? 'recruiter') as PortalType;
+      const accountIds = targetPortal === 'org'
+        ? await getAccessibleAccountIds(me[0].id, me[0].organizationId, me[0].role)
+        : [];
+      const [adminCount] = targetPortal === 'org'
+        ? await db
+            .select({ count: sql<number>`cast(count(*) as int)` })
+            .from(accountPortalUsers)
+            .innerJoin(users, eq(accountPortalUsers.userId, users.id))
+            .where(and(
+              inArray(accountPortalUsers.accountId, accountIds),
+              eq(users.role, 'org_admin'),
+              eq(users.isActive, 1),
+            ))
+        : await db
+            .select({ count: sql<number>`cast(count(*) as int)` })
+            .from(users)
+            .where(and(
+              eq(users.organizationId, me[0].organizationId!),
+              eq(users.portalType, 'recruiter'),
+              eq(users.role, 'recruiter_admin'),
+              eq(users.isActive, 1),
+            ));
+      if (Number(adminCount?.count ?? 0) <= 1) {
+        return c.json({ error: 'The last active administrator cannot be deactivated' }, 409);
+      }
+    }
 
     const updated = await db.update(users).set({ isActive }).where(eq(users.id, targetId)).returning(userProfileFields);
     return c.json({ message: 'Status updated successfully', user: updated[0] });
   } catch {
     return c.json({ error: 'Invalid or expired token' }, 401);
   }
-});
+  },
+);
 
 // POST /auth/resend-invite/:id — resend verification email
 auth.post('/resend-invite/:id', async (c) => {

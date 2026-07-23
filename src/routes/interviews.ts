@@ -8,7 +8,14 @@ import {
 } from '../db/schema.js';
 import { eq, desc, inArray } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
-import { getOrgMemberIds } from '../lib/orgScope.js';
+import {
+  getRecruiterMemberIds,
+  getJobIfAccessible,
+  canAccessCandidateIds,
+  getInterviewIfAccessible,
+  getSubmissionIfAccessible,
+  getApplicationIfAccessible,
+} from '../lib/resourceAccess.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
@@ -112,7 +119,7 @@ interviewsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited
     const jobIdParam = c.req.query('jobId');
     const jobId = jobIdParam ? parseInt(jobIdParam) : null;
 
-    const memberIds = await getOrgMemberIds(orgId, userId);
+    const memberIds = await getRecruiterMemberIds(orgId, userId);
     if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
 
     let rows = await db.select().from(interviews)
@@ -152,11 +159,13 @@ interviewsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruited
 /* GET /interviews/:id */
 interviewsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
-    const row = await db.select().from(interviews).where(eq(interviews.id, id)).limit(1);
-    if (!row.length) return c.json({ error: 'Interview not found' }, 404);
-    return c.json(await enrichInterview(row[0] as Record<string, unknown>));
+    const row = await getInterviewIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Interview not found' }, 404);
+    return c.json(await enrichInterview(row as Record<string, unknown>));
   } catch {
     return c.json({ error: 'Failed to fetch interview' }, 500);
   }
@@ -167,13 +176,31 @@ interviewsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruite
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole');
     const b = c.req.valid('json');
     const now = new Date().toISOString();
 
-    const [cand] = await db.select({ name: candidates.name }).from(candidates).where(eq(candidates.id, b.candidateId));
-    const [job] = await db.select({ title: jobs.title }).from(jobs).where(eq(jobs.id, b.jobId));
+    const job = await getJobIfAccessible(b.jobId, userId, orgId, role);
+    if (!job) return c.json({ error: 'Job not found or unauthorized' }, 404);
+    if (!(await canAccessCandidateIds([b.candidateId], userId, orgId))) {
+      return c.json({ error: 'Candidate not found or unauthorized' }, 404);
+    }
 
-    const title = b.title ?? `Scheduled Interview - ${cand?.name ?? 'Candidate'} for ${job?.title ?? 'Job'}`;
+    if (b.applicationId) {
+      const app = await getApplicationIfAccessible(b.applicationId, userId, orgId, role);
+      if (!app || app.jobId !== b.jobId || app.candidateId !== b.candidateId) {
+        return c.json({ error: 'Application not found or unauthorized' }, 404);
+      }
+    }
+    if (b.submissionId) {
+      const sub = await getSubmissionIfAccessible(b.submissionId, userId, orgId);
+      if (!sub || sub.jobId !== b.jobId || sub.candidateId !== b.candidateId) {
+        return c.json({ error: 'Submission not found or unauthorized' }, 404);
+      }
+    }
+
+    const [cand] = await db.select({ name: candidates.name }).from(candidates).where(eq(candidates.id, b.candidateId));
+    const title = b.title ?? `Scheduled Interview - ${cand?.name ?? 'Candidate'} for ${job.title ?? 'Job'}`;
 
     const [created] = await db.insert(interviews).values({
       applicationId: b.applicationId ?? null,
@@ -198,11 +225,11 @@ interviewsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruite
 
     // Advance linked application to interview_scheduled when applicable
     if (b.applicationId) {
-      const app = await db.select().from(applications).where(eq(applications.id, b.applicationId)).limit(1);
-      if (app.length && ['shortlisted', 'hold'].includes(app[0].status)) {
+      const app = await getApplicationIfAccessible(b.applicationId, userId, orgId, role);
+      if (app && ['shortlisted', 'hold'].includes(app.status)) {
         await db.update(applications).set({ status: 'interview_scheduled', updatedAt: now }).where(eq(applications.id, b.applicationId));
         await db.insert(applicationStageHistory).values({
-          applicationId: b.applicationId, fromStatus: app[0].status, toStatus: 'interview_scheduled',
+          applicationId: b.applicationId, fromStatus: app.status, toStatus: 'interview_scheduled',
           note: 'Interview scheduled', changedBy: userId,
         });
       }
@@ -210,9 +237,12 @@ interviewsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruite
 
     // Client-stage interview → bump submission status
     if (b.submissionId && b.submissionStage === 'client') {
-      await db.update(submissions).set({
-        status: 'client_interview_scheduled', updatedAt: now,
-      }).where(eq(submissions.id, b.submissionId));
+      const sub = await getSubmissionIfAccessible(b.submissionId, userId, orgId);
+      if (sub) {
+        await db.update(submissions).set({
+          status: 'client_interview_scheduled', updatedAt: now,
+        }).where(eq(submissions.id, b.submissionId));
+      }
     }
 
     return c.json(await enrichInterview(created as Record<string, unknown>), 201);
@@ -224,14 +254,16 @@ interviewsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruite
 /* PATCH /interviews/:id/status */
 interviewsRouter.patch('/:id/status', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', statusSchema), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
     const { status: next } = c.req.valid('json');
 
-    const row = await db.select().from(interviews).where(eq(interviews.id, id)).limit(1);
-    if (!row.length) return c.json({ error: 'Interview not found' }, 404);
+    const existing = await getInterviewIfAccessible(id, userId, orgId);
+    if (!existing) return c.json({ error: 'Interview not found' }, 404);
 
-    const current = row[0].status as IntStatus;
+    const current = existing.status as IntStatus;
     const allowed = TRANSITIONS[current] ?? [];
     if (!allowed.includes(next)) {
       return c.json({ error: `Invalid transition: ${current} → ${next}`, allowedTransitions: allowed }, 400);

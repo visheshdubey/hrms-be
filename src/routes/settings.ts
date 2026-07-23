@@ -99,8 +99,8 @@ function enrichPermission(row: typeof rolesPermissions.$inferSelect) {
   };
 }
 
-/* GET /settings/org */
-settingsRouter.get('/org', requireAuth, requireRole('org_admin'), async (c) => {
+/* GET /settings/org — agency workspace settings (recruiter admin only; not client portal) */
+settingsRouter.get('/org', requireAuth, requireRole('recruiter_admin'), async (c) => {
   try {
     const orgId = c.get('organizationId') as number | null;
     if (!orgId) return c.json({ error: 'No organization' }, 404);
@@ -115,8 +115,8 @@ settingsRouter.get('/org', requireAuth, requireRole('org_admin'), async (c) => {
   }
 });
 
-/* PUT /settings/org */
-settingsRouter.put('/org', requireAuth, requireRole('org_admin'), zValidator('json', orgSettingsBody), async (c) => {
+/* PUT /settings/org — agency workspace settings (recruiter admin only; not client portal) */
+settingsRouter.put('/org', requireAuth, requireRole('recruiter_admin'), zValidator('json', orgSettingsBody), async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;

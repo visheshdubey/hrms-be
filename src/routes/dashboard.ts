@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { db } from '../db/index.js';
 import { accounts, jobs, candidates, users, applications } from '../db/schema.js';
 import { eq, desc, and, or, sql, inArray, isNull } from 'drizzle-orm';
@@ -10,8 +10,77 @@ import {
   orgOrCreatorScope,
 } from '../lib/orgScope.js';
 import { isSchemaDriftError } from '../lib/schemaDrift.js';
+import {
+  buildBenchSalesStats,
+  buildByMember,
+  buildConversion,
+  buildDrilldown,
+  buildRecruitmentStats,
+  parseDateRange,
+  parseIdList,
+  parseOptionalAccountIds,
+  type AnalyticsFilters,
+  type MetricKey,
+} from '../lib/dashboardAnalytics.js';
 
 const dashboardRouter = new Hono<AppContext>({ strict: false });
+
+const METRIC_KEYS = new Set<MetricKey>([
+  'jobs',
+  'candidates',
+  'submissions',
+  'endClientSubmissions',
+  'interviews',
+  'confirmations',
+  'offers',
+  'placements',
+  'dropouts',
+  'deferred',
+  'poolAdded',
+  'activePool',
+  'poolNoSubmissions',
+  'poolWithSubmissions',
+  'poolPlaced',
+  'hotlist',
+  'poolInterviews',
+]);
+
+async function resolveAnalyticsContext(c: Context<AppContext>) {
+  const userId = c.get('userId') as number;
+  const orgId = c.get('organizationId') as number | null;
+  const role = c.get('userRole') as UserRole | null;
+
+  if (isOrgPortalRole(role)) {
+    return { error: true as const, response: c.json({ error: 'Analytics dashboard is available for recruiter portal only' }, 403) };
+  }
+
+  const memberIds = await getOrgMemberIds(orgId, userId);
+  const accessibleAccounts = await getAccessibleAccountIds(userId, orgId, role);
+  const { fromStart, toExclusive, prevFromStart, prevToExclusive } = parseDateRange(
+    c.req.query('from') ?? undefined,
+    c.req.query('to') ?? undefined,
+  );
+  const userIds = parseIdList(c.req.query('userIds') ?? undefined, memberIds);
+  const accountIds = parseOptionalAccountIds(c.req.query('accountIds') ?? undefined, accessibleAccounts);
+  const groupBy = (c.req.query('groupBy') === 'team' ? 'team' : 'user') as 'user' | 'team';
+
+  const current: AnalyticsFilters = {
+    fromStart,
+    toExclusive,
+    userIds,
+    accountIds,
+    memberIds,
+  };
+  const previous: AnalyticsFilters = {
+    fromStart: prevFromStart,
+    toExclusive: prevToExclusive,
+    userIds,
+    accountIds,
+    memberIds,
+  };
+
+  return { error: false as const, orgId, memberIds, accessibleAccounts, current, previous, groupBy, userId };
+}
 
 dashboardRouter.get('/', requireAuth, async (c) => {
   try {
@@ -209,8 +278,8 @@ dashboardRouter.get('/', requireAuth, async (c) => {
           status: row.status,
           createdAt: row.createdAt,
           name: row.name,
-          filename: row.filename,
-          matchScore: row.matchScore,
+          filename: '',
+          matchScore: null,
           jobTitle: row.jobTitle ?? null,
         }));
       }
@@ -269,5 +338,92 @@ dashboardRouter.get('/', requireAuth, async (c) => {
     return c.json({ error: 'Failed to fetch dashboard metrics' }, 500);
   }
 });
+
+dashboardRouter.get('/analytics', requireAuth, async (c) => {
+  try {
+    const ctx = await resolveAnalyticsContext(c);
+    if (ctx.error) return ctx.response;
+
+    const { orgId, current, previous, groupBy, memberIds, accessibleAccounts } = ctx;
+
+    const [recruitment, benchSales, conversion, byMember] = await Promise.all([
+      buildRecruitmentStats(current, previous),
+      buildBenchSalesStats(current, previous),
+      buildConversion(current),
+      buildByMember(current, groupBy, orgId),
+    ]);
+
+    const orgUsers = await db
+      .select({ id: users.id, name: users.name })
+      .from(users)
+      .where(inArray(users.id, memberIds));
+
+    const clientRows =
+      accessibleAccounts.length > 0
+        ? await db
+            .select({ id: accounts.id, name: accounts.name })
+            .from(accounts)
+            .where(inArray(accounts.id, accessibleAccounts))
+        : [];
+
+    return c.json({
+      range: {
+        from: current.fromStart,
+        to: addDaysIso(current.toExclusive, -1),
+        previousFrom: previous.fromStart,
+        previousTo: addDaysIso(previous.toExclusive, -1),
+      },
+      filters: {
+        userIds: current.userIds,
+        accountIds: current.accountIds,
+        groupBy,
+      },
+      recruitment,
+      benchSales,
+      conversion,
+      byMember,
+      meta: {
+        users: orgUsers,
+        clients: clientRows,
+      },
+    });
+  } catch (error) {
+    console.error('Dashboard analytics error:', error);
+    return c.json({ error: 'Failed to fetch dashboard analytics' }, 500);
+  }
+});
+
+dashboardRouter.get('/analytics/drilldown', requireAuth, async (c) => {
+  try {
+    const ctx = await resolveAnalyticsContext(c);
+    if (ctx.error) return ctx.response;
+
+    const metricRaw = (c.req.query('metric') ?? '') as MetricKey;
+    if (!METRIC_KEYS.has(metricRaw)) {
+      return c.json({ error: 'Invalid metric' }, 400);
+    }
+
+    const limit = Math.min(100, Math.max(1, Number(c.req.query('limit') ?? 50) || 50));
+    const offset = Math.max(0, Number(c.req.query('offset') ?? 0) || 0);
+
+    const scopeUserId = Number(c.req.query('scopeUserId') ?? 0);
+    const filters: AnalyticsFilters = { ...ctx.current };
+    if (Number.isFinite(scopeUserId) && scopeUserId > 0 && ctx.memberIds.includes(scopeUserId)) {
+      filters.userIds = [scopeUserId];
+    }
+
+    const { rows, total } = await buildDrilldown(metricRaw, filters, limit, offset);
+    return c.json({ metric: metricRaw, total, limit, offset, rows });
+  } catch (error) {
+    console.error('Dashboard drilldown error:', error);
+    return c.json({ error: 'Failed to fetch drilldown' }, 500);
+  }
+});
+
+function addDaysIso(isoDate: string, days: number): string {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
 
 export default dashboardRouter;

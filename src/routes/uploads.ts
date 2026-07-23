@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Hono } from 'hono';
-import { requireAuth, type AppContext } from '../middleware.js';
+import { requireAuth, requireRecruiter, type AppContext } from '../middleware.js';
 import { db } from '../db/index.js';
 import { uploadAssets } from '../db/schema.js';
 import { and, eq } from 'drizzle-orm';
@@ -227,24 +227,12 @@ uploadsRouter.post('/logos', requireAuth, async (c) => {
   }
 });
 
-// POST /uploads/resumes — candidate resumes → CDN "resumes" folder
-uploadsRouter.post('/resumes', requireAuth, async (c) => {
-  try {
-    const body = await c.req.parseBody();
-    const file = body.file;
-    if (!file || !(file instanceof File)) {
-      return c.json({ error: 'Resume file is required' }, 400);
-    }
-    const { url } = await handleUpload(file, 'resumes', DOC_MIME, 10 * 1024 * 1024, {
-      userId: c.get('userId') as number,
-      organizationId: c.get('organizationId') as number | null,
-    });
-    return c.json({ url });
-  } catch (error: any) {
-    if (error?.status === 400) return c.json({ error: error.message }, 400);
-    console.error('Resume upload failed:', error);
-    return c.json({ error: 'Failed to upload resume' }, 500);
-  }
+// Legacy endpoint cannot safely associate ownership with a candidate.
+uploadsRouter.post('/resumes', requireAuth, requireRecruiter, (c) => {
+  return c.json({
+    error: 'Use POST /resumes/ingest with candidateId and file',
+    code: 'resume_ingestion_required',
+  }, 410);
 });
 
 // POST /uploads/documents — onboarding / general docs → CDN "documents" folder
@@ -289,7 +277,9 @@ uploadsRouter.delete('/file', requireAuth, async (c) => {
   }
 });
 
-const LOCAL_FOLDERS = new Set(['images', 'logos', 'avatars', 'resumes', 'documents']);
+// Resumes are intentionally excluded: they are served only by the authenticated,
+// ownership-aware /resumes/:id/download endpoint.
+const LOCAL_FOLDERS = new Set(['images', 'logos', 'avatars', 'documents']);
 
 function contentTypeForExt(ext: string): string {
   switch (ext) {

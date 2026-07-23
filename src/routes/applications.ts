@@ -11,18 +11,20 @@ import {
   users,
   APP_STATUSES,
 } from '../db/schema.js';
-import { eq, desc, and, inArray } from 'drizzle-orm';
+import { eq, desc, and, inArray, sql } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext, type UserRole } from '../middleware.js';
 import { canAccessJob, getOrgMemberIds } from '../lib/orgScope.js';
 import { selectJobById } from '../lib/jobQueries.js';
 import { isSchemaDriftError } from '../lib/schemaDrift.js';
 import {
-  incrementJobApplicantCount,
-  resolveNewApplicationDefaults,
   backfillNullApplicationStages,
 } from '../lib/applicationDefaults.js';
 import { createNotification, createNotificationsForUsers } from '../lib/notifications.js';
-import { insertApplicationStageHistory } from '../lib/application-history.js';
+import {
+  ApplicationWriteConflictError,
+  createApplicationsAtomically,
+  transitionApplicationAtomically,
+} from '../lib/application-writes.js';
 
 const applicationsRouter = new Hono<AppContext>({ strict: false });
 
@@ -280,7 +282,31 @@ async function resolveRequiredAssignee(
   assignedTo?: number | null,
   fallbackUserId?: number,
 ): Promise<number> {
-  if (assignedTo != null && assignedTo > 0) return assignedTo;
+  const isValidRecruiterAssignee = async (candidateUserId: number) => {
+    if (fallbackUserId == null) return false;
+    const [actor] = await db
+      .select({ organizationId: users.organizationId })
+      .from(users)
+      .where(eq(users.id, fallbackUserId))
+      .limit(1);
+    const [assignee] = await db
+      .select({ organizationId: users.organizationId, role: users.role, isActive: users.isActive })
+      .from(users)
+      .where(eq(users.id, candidateUserId))
+      .limit(1);
+    return Boolean(
+      actor
+      && assignee
+      && actor.organizationId === assignee.organizationId
+      && assignee.isActive === 1
+      && (assignee.role === 'recruiter_admin' || assignee.role === 'recruited_staff'),
+    );
+  };
+
+  if (assignedTo != null && assignedTo > 0) {
+    if (!await isValidRecruiterAssignee(assignedTo)) throw new Error('ASSIGNEE_INVALID');
+    return assignedTo;
+  }
 
   try {
     const [job] = await db
@@ -288,54 +314,68 @@ async function resolveRequiredAssignee(
       .from(jobs)
       .where(eq(jobs.id, jobId))
       .limit(1);
-    if (job?.assignedTo != null && job.assignedTo > 0) return job.assignedTo;
+    if (
+      job?.assignedTo != null
+      && job.assignedTo > 0
+      && await isValidRecruiterAssignee(job.assignedTo)
+    ) return job.assignedTo;
   } catch {
     // assigned_to may be missing until ensureProdSchema runs
   }
 
   // Prefer job owner; otherwise the recruiter performing the assign so Search → job works E2E.
-  if (fallbackUserId != null && fallbackUserId > 0) return fallbackUserId;
+  if (
+    fallbackUserId != null
+    && fallbackUserId > 0
+    && await isValidRecruiterAssignee(fallbackUserId)
+  ) return fallbackUserId;
 
   throw new Error('ASSIGNMENT_REQUIRED');
 }
 
-async function createApplicationRecord(params: {
+async function validateApplicationRelationships(params: {
+  jobId: number;
+  orgId: number | null;
+  userId: number;
+  assignedTo: number;
+  jobStageId?: number | null;
+  allowTerminalStage?: boolean;
+}): Promise<'INVALID_ASSIGNEE' | 'INVALID_STAGE' | null> {
+  const [assignee] = await db
+    .select({ organizationId: users.organizationId, role: users.role, isActive: users.isActive })
+    .from(users)
+    .where(eq(users.id, params.assignedTo))
+    .limit(1);
+  if (
+    !assignee
+    || assignee.organizationId !== params.orgId
+    || assignee.isActive !== 1
+    || (assignee.role !== 'recruiter_admin' && assignee.role !== 'recruited_staff')
+  ) return 'INVALID_ASSIGNEE';
+  if (params.jobStageId != null) {
+    const [stage] = await db
+      .select({ id: jobStages.id, stageType: jobStages.stageType })
+      .from(jobStages)
+      .where(and(
+        eq(jobStages.id, params.jobStageId),
+        eq(jobStages.jobId, params.jobId),
+      ))
+      .limit(1);
+    if (!stage || (!params.allowTerminalStage
+      && (stage.stageType === 'hired' || stage.stageType === 'rejected'))) {
+      return 'INVALID_STAGE';
+    }
+  }
+  return null;
+}
+
+async function notifyApplicationCreated(params: {
+  applicationId: number;
   jobId: number;
   candidateId: number;
   userId: number;
-  notes?: string;
-  assignedTo?: number | null;
-  jobStageId?: number | null;
+  assignedTo: number;
 }) {
-  const resolvedAssignee = await resolveRequiredAssignee(
-    params.jobId,
-    params.assignedTo,
-    params.userId,
-  );
-  const defaults = await resolveNewApplicationDefaults(params.jobId);
-
-  const created = await db.insert(applications).values({
-    jobId: params.jobId,
-    candidateId: params.candidateId,
-    status: 'applied',
-    notes: params.notes ?? '',
-    assignedTo: resolvedAssignee,
-    jobStageId: params.jobStageId ?? defaults.jobStageId,
-    createdBy: params.userId,
-  }).returning();
-
-  await insertApplicationStageHistory({
-    applicationId: created[0].id,
-    fromStatus:    null,
-    toStatus:      'applied',
-    fromStageId:   null,
-    toStageId:     params.jobStageId ?? defaults.jobStageId ?? null,
-    note:          'Application created',
-    changedBy:     params.userId,
-  });
-
-  await incrementJobApplicantCount(params.jobId, 1);
-
   const [job] = await db
     .select({ title: jobs.title, createdBy: jobs.createdBy })
     .from(jobs)
@@ -351,17 +391,15 @@ async function createApplicationRecord(params: {
   const jobTitle = job?.title?.trim() || `Job #${params.jobId}`;
 
   await createNotificationsForUsers(
-    [resolvedAssignee, job?.createdBy, params.userId],
+    [params.assignedTo, job?.createdBy, params.userId],
     {
       title: 'New application received',
       body: `${candidateName} was added to ${jobTitle}.`,
       type: 'application',
-      relatedId: created[0].id,
+      relatedId: params.applicationId,
       relatedType: 'application',
     },
   );
-
-  return created[0];
 }
 
 function filterEnrichedApplications(
@@ -402,6 +440,25 @@ function filterEnrichedApplications(
   return result;
 }
 
+function redactApplicationForClient(
+  app: Awaited<ReturnType<typeof enrichApplication>>,
+  role: UserRole | null,
+) {
+  if (role !== 'org_admin' && role !== 'org_staff') return app;
+  const candidate = app.candidate;
+  const visible: Record<string, unknown> = { ...app };
+  delete visible.notes;
+  delete visible.assignedTo;
+  delete visible.assignedToName;
+  delete visible.candidate;
+  delete visible.allowedTransitions;
+  return {
+    ...visible,
+    candidate: candidate ? { id: candidate.id, name: candidate.name } : null,
+    allowedTransitions: [],
+  };
+}
+
 /* ═══════════════════════════════════════════════
    GET /applications?jobId=X
    All authenticated users can list applications.
@@ -430,7 +487,7 @@ applicationsRouter.get('/', requireAuth, async (c) => {
       q: c.req.query('q'),
     });
 
-    return c.json(filtered);
+    return c.json(filtered.map((app) => redactApplicationForClient(app, role)));
   } catch {
     return c.json({ error: 'Failed to fetch applications' }, 500);
   }
@@ -470,31 +527,36 @@ applicationsRouter.post(
       } catch {
         return c.json({ error: 'Assign a job owner or staff member before bulk assigning' }, 400);
       }
-
-      const created: Awaited<ReturnType<typeof enrichApplication>>[] = [];
-      const skipped: { candidateId: number; reason: string }[] = [];
-
-      for (const candidateId of candidateIds) {
-        const dup = await db
-          .select({ id: applications.id })
-          .from(applications)
-          .where(and(eq(applications.jobId, jobId), eq(applications.candidateId, candidateId)))
-          .limit(1);
-
-        if (dup.length > 0) {
-          skipped.push({ candidateId, reason: 'already_assigned' });
-          continue;
-        }
-
-        const row = await createApplicationRecord({
-          jobId,
-          candidateId,
-          userId,
-          notes,
-          assignedTo: resolvedAssignee,
-        });
-        created.push(await enrichApplication(row as Record<string, unknown>));
+      const relationshipError = await validateApplicationRelationships({
+        jobId,
+        orgId,
+        userId,
+        assignedTo: resolvedAssignee,
+      });
+      if (relationshipError === 'INVALID_ASSIGNEE') {
+        return c.json({ error: 'Assignee must be an active member of your organization' }, 400);
       }
+
+      const result = await createApplicationsAtomically({
+        jobId,
+        userId,
+        assignedTo: resolvedAssignee,
+        applications: candidateIds.map((candidateId) => ({ candidateId, notes })),
+      });
+      const created = await Promise.all(
+        result.created.map((row) => enrichApplication(row as Record<string, unknown>)),
+      );
+      const skipped = result.skipped.map((candidateId) => ({
+        candidateId,
+        reason: 'already_assigned',
+      }));
+      await Promise.all(result.created.map((row) => notifyApplicationCreated({
+        applicationId: row.id,
+        jobId,
+        candidateId: row.candidateId,
+        userId,
+        assignedTo: resolvedAssignee,
+      })));
 
       return c.json({
         created,
@@ -522,7 +584,10 @@ applicationsRouter.get('/:id', requireAuth, async (c) => {
     const row = await getApplicationIfAccessible(id, userId, orgId, role);
     if (!row) return c.json({ error: 'Application not found' }, 404);
 
-    return c.json(await enrichApplication(row as Record<string, unknown>));
+    return c.json(redactApplicationForClient(
+      await enrichApplication(row as Record<string, unknown>),
+      role,
+    ));
   } catch {
     return c.json({ error: 'Failed to fetch application' }, 404);
   }
@@ -557,28 +622,47 @@ applicationsRouter.post(
         );
       }
 
-      const dup = await db
-        .select({ id: applications.id })
-        .from(applications)
-        .where(and(eq(applications.jobId, jobId), eq(applications.candidateId, candidateId)))
-        .limit(1);
-      if (dup.length > 0) {
+      const resolvedAssignee = await resolveRequiredAssignee(jobId, assignedTo, userId);
+      const relationshipError = await validateApplicationRelationships({
+        jobId,
+        orgId,
+        userId,
+        assignedTo: resolvedAssignee,
+        jobStageId,
+      });
+      if (relationshipError === 'INVALID_ASSIGNEE') {
+        return c.json({ error: 'Assignee must be an active member of your organization' }, 400);
+      }
+      if (relationshipError === 'INVALID_STAGE') {
+        return c.json({ error: 'Stage not found for this job' }, 400);
+      }
+
+      const result = await createApplicationsAtomically({
+        jobId,
+        userId,
+        assignedTo: resolvedAssignee,
+        jobStageId,
+        applications: [{ candidateId, notes }],
+      });
+      if (result.created.length === 0) {
         return c.json({ error: 'Candidate is already assigned to this job' }, 409);
       }
 
-      const created = await createApplicationRecord({
+      const created = result.created[0];
+      await notifyApplicationCreated({
+        applicationId: created.id,
         jobId,
         candidateId,
         userId,
-        notes,
-        assignedTo,
-        jobStageId,
+        assignedTo: resolvedAssignee,
       });
-
       return c.json(await enrichApplication(created as Record<string, unknown>), 201);
     } catch (error) {
       if (error instanceof Error && error.message === 'ASSIGNMENT_REQUIRED') {
         return c.json({ error: 'Assign a job owner before creating applications' }, 400);
+      }
+      if (error instanceof Error && error.message === 'ASSIGNEE_INVALID') {
+        return c.json({ error: 'Assignee must be an active recruiter in this workspace' }, 400);
       }
       return c.json({ error: 'Failed to create application' }, 500);
     }
@@ -591,6 +675,7 @@ applicationsRouter.post(
 applicationsRouter.patch(
   '/:id/assignment',
   requireAuth,
+  requireRole('recruiter_admin', 'recruited_staff'),
   zValidator('json', assignmentSchema),
   async (c) => {
     try {
@@ -604,7 +689,20 @@ applicationsRouter.patch(
       if (!row) return c.json({ error: 'Application not found' }, 404);
 
       const body = c.req.valid('json');
-      const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      const relationshipError = await validateApplicationRelationships({
+        jobId: row.jobId,
+        orgId,
+        userId,
+        assignedTo: body.assignedTo,
+        jobStageId: body.jobStageId,
+        allowTerminalStage: Boolean(body.closeAs),
+      });
+      if (relationshipError === 'INVALID_ASSIGNEE') {
+        return c.json({ error: 'Assignee must be an active member of your organization' }, 400);
+      }
+      if (relationshipError === 'INVALID_STAGE') {
+        return c.json({ error: 'Stage not found for this job' }, 400);
+      }
       const currentStatus = row.status as AppStatus;
 
       let currentStageType: string | null = null;
@@ -626,8 +724,6 @@ applicationsRouter.patch(
         currentStageType === 'hired' ||
         currentStageType === 'rejected';
 
-      if (body.assignedTo !== undefined) patch.assignedTo = body.assignedTo;
-
       /* ── Re-open closed application into a chosen open stage ── */
       if (body.reopen) {
         if (!isClosed) {
@@ -647,26 +743,20 @@ applicationsRouter.patch(
         }
 
         const nextStatus: AppStatus = 'in_review';
-        patch.jobStageId = body.jobStageId;
-        patch.status = nextStatus;
 
-        await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
-        await insertApplicationStageHistory({
+        const updated = await transitionApplicationAtomically({
           applicationId: id,
-          fromStatus: currentStatus,
-          toStatus: nextStatus,
-          fromStageId: (row.jobStageId as number | null) ?? null,
-          toStageId: stage.id,
+          candidateId: row.candidateId,
+          expectedStatus: currentStatus,
+          expectedStageId: (row.jobStageId as number | null) ?? null,
+          nextStatus,
+          nextStageId: stage.id,
+          assignedTo: body.assignedTo,
           note: body.note?.trim() || `Reopened → ${stage.name}`,
           changedBy: userId,
+          candidateStatus: 'In Review',
         });
-        await db
-          .update(candidates)
-          .set({ status: 'In Review' })
-          .where(eq(candidates.id, row.candidateId as number));
-
-        const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
-        return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
+        return c.json(await enrichApplication(updated as Record<string, unknown>));
       }
 
       if (isClosed) {
@@ -717,25 +807,18 @@ applicationsRouter.patch(
             ? `Hired from stage #${prevStageId ?? 'n/a'} → ${stage.name}`
             : `Rejected from stage #${prevStageId ?? 'n/a'} → ${stage.name}`);
 
-        patch.jobStageId = stage.id;
-        patch.status = nextStatus;
-
-        await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
-        await insertApplicationStageHistory({
+        const updated = await transitionApplicationAtomically({
           applicationId: id,
-          fromStatus: currentStatus,
-          toStatus: nextStatus,
-          fromStageId: prevStageId,
-          toStageId: stage.id,
+          candidateId: row.candidateId,
+          expectedStatus: currentStatus,
+          expectedStageId: prevStageId,
+          nextStatus,
+          nextStageId: stage.id,
+          assignedTo: body.assignedTo,
           note: historyNote,
           changedBy: userId,
+          candidateStatus: body.closeAs === 'hired' ? 'Hired' : 'Rejected',
         });
-        await db
-          .update(candidates)
-          .set({
-            status: body.closeAs === 'hired' ? 'Hired' : 'Rejected',
-          })
-          .where(eq(candidates.id, row.candidateId as number));
 
         const notifyUserId = (body.assignedTo ?? row.assignedTo) as number | null;
         if (notifyUserId) {
@@ -749,11 +832,11 @@ applicationsRouter.patch(
           });
         }
 
-        const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
-        return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
+        return c.json(await enrichApplication(updated as Record<string, unknown>));
       }
 
       /* ── Normal round move / assignee update (never auto Hire/Reject) ── */
+      let transitionNote = body.note?.trim() || '';
       if (body.jobStageId !== undefined) {
         if (body.jobStageId != null) {
           const [stage] = await db
@@ -773,25 +856,24 @@ applicationsRouter.patch(
             );
           }
 
-          patch.jobStageId = body.jobStageId;
-
           if (body.jobStageId !== row.jobStageId) {
-            await insertApplicationStageHistory({
-              applicationId: id,
-              fromStatus: currentStatus,
-              toStatus: currentStatus,
-              fromStageId: (row.jobStageId as number | null) ?? null,
-              toStageId: body.jobStageId,
-              note: `Moved to ${stage.name}`,
-              changedBy: userId,
-            });
+            transitionNote ||= `Moved to ${stage.name}`;
           }
         } else {
-          patch.jobStageId = null;
+          transitionNote ||= 'Removed from pipeline stage';
         }
       }
 
-      await db.update(applications).set(patch as typeof applications.$inferInsert).where(eq(applications.id, id));
+      const updated = await transitionApplicationAtomically({
+        applicationId: id,
+        candidateId: row.candidateId,
+        expectedStatus: currentStatus,
+        expectedStageId: (row.jobStageId as number | null) ?? null,
+        nextStageId: body.jobStageId,
+        assignedTo: body.assignedTo,
+        note: transitionNote,
+        changedBy: userId,
+      });
 
       if (body.assignedTo != null && body.assignedTo !== row.assignedTo) {
         await createNotification({
@@ -818,9 +900,13 @@ applicationsRouter.patch(
         }
       }
 
-      const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
-      return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
-    } catch {
+      return c.json(await enrichApplication(updated as Record<string, unknown>));
+    } catch (error) {
+      if (error instanceof ApplicationWriteConflictError) {
+        return c.json({
+          error: 'Application changed concurrently. Refresh and retry your action.',
+        }, 409);
+      }
       return c.json({ error: 'Failed to update assignment' }, 500);
     }
   },
@@ -830,7 +916,12 @@ applicationsRouter.patch(
    PATCH /applications/:id/status
    Any authenticated user in the org can advance the stage.
 ═══════════════════════════════════════════════ */
-applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSchema), async (c) => {
+applicationsRouter.patch(
+  '/:id/status',
+  requireAuth,
+  requireRole('recruiter_admin', 'recruited_staff'),
+  zValidator('json', statusSchema),
+  async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
@@ -863,19 +954,14 @@ applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSc
       }, 400);
     }
 
-    const now = new Date().toISOString();
-    await db.update(applications)
-      .set({ status: nextStatus, updatedAt: now })
-      .where(eq(applications.id, id));
-
-    await insertApplicationStageHistory({
+    const updated = await transitionApplicationAtomically({
       applicationId: id,
-      fromStatus:    currentStatus,
-      toStatus:      nextStatus,
-      fromStageId:   (row.jobStageId as number | null) ?? null,
-      toStageId:     (row.jobStageId as number | null) ?? null,
-      note:          note ?? '',
-      changedBy:     userId,
+      candidateId: row.candidateId,
+      expectedStatus: currentStatus,
+      expectedStageId: (row.jobStageId as number | null) ?? null,
+      nextStatus,
+      note: note ?? '',
+      changedBy: userId,
     });
 
     if (row.assignedTo) {
@@ -889,17 +975,27 @@ applicationsRouter.patch('/:id/status', requireAuth, zValidator('json', statusSc
       });
     }
 
-    const updated = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
-    return c.json(await enrichApplication(updated[0] as Record<string, unknown>));
-  } catch {
+    return c.json(await enrichApplication(updated as Record<string, unknown>));
+  } catch (error) {
+    if (error instanceof ApplicationWriteConflictError) {
+      return c.json({
+        error: 'Application changed concurrently. Refresh and retry your action.',
+      }, 409);
+    }
     return c.json({ error: 'Failed to update status' }, 500);
   }
-});
+  },
+);
 
 /* ═══════════════════════════════════════════════
    PATCH /applications/:id/notes
 ═══════════════════════════════════════════════ */
-applicationsRouter.patch('/:id/notes', requireAuth, zValidator('json', notesSchema), async (c) => {
+applicationsRouter.patch(
+  '/:id/notes',
+  requireAuth,
+  requireRole('recruiter_admin', 'recruited_staff'),
+  zValidator('json', notesSchema),
+  async (c) => {
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
@@ -916,7 +1012,8 @@ applicationsRouter.patch('/:id/notes', requireAuth, zValidator('json', notesSche
   } catch {
     return c.json({ error: 'Failed to update notes' }, 500);
   }
-});
+  },
+);
 
 /* ═══════════════════════════════════════════════
    GET /applications/:id/history
@@ -949,6 +1046,7 @@ applicationsRouter.get('/:id/history', requireAuth, async (c) => {
 
     return c.json(rows.map(h => ({
       ...h,
+      ...(role === 'org_admin' || role === 'org_staff' ? { note: '' } : {}),
       fromStatusLabel: h.fromStatus ? (STATUS_LABELS[h.fromStatus as AppStatus] ?? h.fromStatus) : null,
       toStatusLabel:   STATUS_LABELS[h.toStatus as AppStatus] ?? h.toStatus,
     })));
@@ -971,9 +1069,15 @@ applicationsRouter.delete('/:id', requireAuth, requireRole('recruiter_admin'), a
     const row = await getApplicationIfAccessible(id, userId, orgId, role);
     if (!row) return c.json({ error: 'Application not found' }, 404);
 
-    await db.delete(applicationStageHistory).where(eq(applicationStageHistory.applicationId, id));
-    await db.delete(applications).where(eq(applications.id, id));
-    await incrementJobApplicantCount(row.jobId, -1);
+    await db.transaction(async (tx) => {
+      await tx.delete(applicationStageHistory).where(eq(applicationStageHistory.applicationId, id));
+      await tx.delete(applications).where(eq(applications.id, id));
+      await tx.update(jobs)
+        .set({
+          applicants: sql`greatest(0, coalesce(${jobs.applicants}, 0) - 1)`,
+        })
+        .where(eq(jobs.id, row.jobId));
+    });
     return c.json({ message: 'Application deleted' });
   } catch {
     return c.json({ error: 'Failed to delete application' }, 500);

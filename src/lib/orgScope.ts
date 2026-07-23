@@ -74,8 +74,15 @@ export async function canAccessByCreator(
   createdBy: number | null | undefined,
 ): Promise<boolean> {
   if (orgId != null) {
-    const memberIds = await getOrgMemberIds(orgId, userId);
-    return isOrgMember(createdBy, memberIds);
+    // Prefer recruiter members so client portal users sharing organizationId
+    // cannot inherit creator-scoped recruiter ATS records.
+    const recruiters = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(and(eq(users.organizationId, orgId), eq(users.portalType, 'recruiter')));
+    const memberIds = recruiters.map((m) => m.id);
+    if (memberIds.length > 0) return isOrgMember(createdBy, memberIds);
+    return isOrgMember(createdBy, await getOrgMemberIds(orgId, userId));
   }
   return createdBy === userId;
 }
@@ -85,7 +92,10 @@ async function getAccountIdsInOrg(orgId: number | null, userId: number): Promise
     const orgAccounts = await db
       .select({ id: accounts.id })
       .from(accounts)
-      .where(orgOrCreatorScope(orgId, userId, accounts, accounts));
+      .where(and(
+        orgOrCreatorScope(orgId, userId, accounts, accounts),
+        eq(accounts.status, 'active'),
+      ));
     return orgAccounts.map((account) => account.id);
   } catch (error) {
     if (!isSchemaDriftError(error)) throw error;
@@ -93,7 +103,7 @@ async function getAccountIdsInOrg(orgId: number | null, userId: number): Promise
     const orgAccounts = await db
       .select({ id: accounts.id })
       .from(accounts)
-      .where(inArray(accounts.createdBy, memberIds));
+      .where(and(inArray(accounts.createdBy, memberIds), eq(accounts.status, 'active')));
     return orgAccounts.map((account) => account.id);
   }
 }
@@ -119,8 +129,12 @@ export async function getAccessibleAccountIds(
     .innerJoin(accounts, eq(accountPortalUsers.accountId, accounts.id))
     .where(
       orgId == null
-        ? eq(accountPortalUsers.userId, userId)
-        : and(eq(accountPortalUsers.userId, userId), eq(accounts.organizationId, orgId)),
+        ? and(eq(accountPortalUsers.userId, userId), eq(accounts.status, 'active'))
+        : and(
+            eq(accountPortalUsers.userId, userId),
+            eq(accounts.organizationId, orgId),
+            eq(accounts.status, 'active'),
+          ),
     );
   if (membershipRows.length > 0) {
     return membershipRows.map((row) => row.id);
@@ -142,10 +156,14 @@ export async function getAccessibleAccountIds(
       .innerJoin(accounts, eq(contacts.accountId, accounts.id))
       .where(
         orgId == null
-          ? sql`lower(trim(${contacts.email})) = ${email}`
+          ? and(
+              sql`lower(trim(${contacts.email})) = ${email}`,
+              eq(accounts.status, 'active'),
+            )
           : and(
               sql`lower(trim(${contacts.email})) = ${email}`,
               eq(accounts.organizationId, orgId),
+              eq(accounts.status, 'active'),
             ),
       );
 
@@ -158,8 +176,9 @@ export async function getAccessibleAccountIds(
         ? and(
             sql`lower(trim(${accounts.email})) = ${email}`,
             eq(accounts.organizationId, orgId),
+            eq(accounts.status, 'active'),
           )
-        : sql`lower(trim(${accounts.email})) = ${email}`;
+        : and(sql`lower(trim(${accounts.email})) = ${email}`, eq(accounts.status, 'active'));
 
     const byAccountEmail = await db
       .select({ id: accounts.id })
@@ -173,8 +192,9 @@ export async function getAccessibleAccountIds(
       ? and(
           eq(accounts.createdBy, userId),
           eq(accounts.organizationId, orgId),
+          eq(accounts.status, 'active'),
         )
-      : eq(accounts.createdBy, userId);
+      : and(eq(accounts.createdBy, userId), eq(accounts.status, 'active'));
 
   const createdRows = await db.select({ id: accounts.id }).from(accounts).where(createdWhere!);
   for (const row of createdRows) legacyIds.add(row.id);
@@ -208,19 +228,21 @@ async function getAccountAccessRow(accountId: number) {
       .select({
         organizationId: accounts.organizationId,
         createdBy: accounts.createdBy,
+        status: accounts.status,
       })
       .from(accounts)
       .where(eq(accounts.id, accountId))
       .limit(1);
-    return account ?? null;
+    if (!account || account.status !== 'active') return null;
+    return account;
   } catch (error) {
     if (!isSchemaDriftError(error)) throw error;
     const [account] = await db
-      .select({ createdBy: accounts.createdBy })
+      .select({ createdBy: accounts.createdBy, status: accounts.status })
       .from(accounts)
       .where(eq(accounts.id, accountId))
       .limit(1);
-    if (!account) return null;
+    if (!account || account.status !== 'active') return null;
     return { organizationId: null as number | null, createdBy: account.createdBy };
   }
 }

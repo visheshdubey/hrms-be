@@ -24,6 +24,8 @@ import settingsRoutes from './routes/settings.js';
 import candidateGroupsRoutes from './routes/candidateGroups.js';
 import uploadsRoutes from './routes/uploads.js';
 import queueRoutes from './routes/queue.js';
+import resumesRoutes from './routes/resumes.js';
+import atsRoutes from './routes/ats.js';
 import { startQueueWorker } from './queue/worker.js';
 import { QUEUE_CONFIG } from './queue/config.js';
 import { ensureProdSchema } from './db/ensureProdSchema.js';
@@ -108,6 +110,12 @@ app.route('/uploads', uploadsRoutes);
 app.route('/api/hono/uploads', uploadsRoutes);
 app.route('/queue', queueRoutes);
 app.route('/api/hono/queue', queueRoutes);
+app.route('/resumes', resumesRoutes);
+app.route('/api/hono/resumes', resumesRoutes);
+app.route('/candidate-resumes', resumesRoutes);
+app.route('/api/hono/candidate-resumes', resumesRoutes);
+app.route('/ats', atsRoutes);
+app.route('/api/hono/ats', atsRoutes);
 
 const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 

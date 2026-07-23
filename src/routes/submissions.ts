@@ -8,7 +8,7 @@ import {
 } from '../db/schema.js';
 import { eq, desc, inArray } from 'drizzle-orm';
 import { requireAuth, requireRole, type AppContext } from '../middleware.js';
-import { getOrgMemberIds } from '../lib/orgScope.js';
+import { getRecruiterMemberIds, getJobIfAccessible, canAccessCandidateIds, getSubmissionIfAccessible } from '../lib/resourceAccess.js';
 import { parsePagination, paginateInMemory } from '../lib/pagination.js';
 import { MS_PER_DAY, RECENT_DAYS } from '../config.js';
 
@@ -95,7 +95,7 @@ submissionsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruite
     const search = c.req.query('search')?.trim().toLowerCase() ?? '';
     const { page, pageSize } = parsePagination(c.req.query());
 
-    const memberIds = await getOrgMemberIds(orgId, userId);
+    const memberIds = await getRecruiterMemberIds(orgId, userId);
     if (memberIds.length === 0) return c.json({ data: [], total: 0, page, pageSize });
 
     let rows = await db.select().from(submissions)
@@ -131,11 +131,13 @@ submissionsRouter.get('/', requireAuth, requireRole('recruiter_admin', 'recruite
 /* GET /submissions/:id */
 submissionsRouter.get('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
-    const row = await db.select().from(submissions).where(eq(submissions.id, id)).limit(1);
-    if (!row.length) return c.json({ error: 'Submission not found' }, 404);
-    return c.json(await enrichSubmission(row[0] as Record<string, unknown>));
+    const row = await getSubmissionIfAccessible(id, userId, orgId);
+    if (!row) return c.json({ error: 'Submission not found' }, 404);
+    return c.json(await enrichSubmission(row as Record<string, unknown>));
   } catch {
     return c.json({ error: 'Failed to fetch submission' }, 500);
   }
@@ -146,8 +148,15 @@ submissionsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruit
   try {
     const userId = c.get('userId') as number;
     const orgId = c.get('organizationId') as number | null;
+    const role = c.get('userRole');
     const b = c.req.valid('json');
     const now = new Date().toISOString();
+
+    const job = await getJobIfAccessible(b.jobId, userId, orgId, role);
+    if (!job) return c.json({ error: 'Job not found or unauthorized' }, 404);
+    if (!(await canAccessCandidateIds([b.candidateId], userId, orgId))) {
+      return c.json({ error: 'Candidate not found or unauthorized' }, 404);
+    }
 
     const [created] = await db.insert(submissions).values({
       applicationId: b.applicationId ?? null,
@@ -172,14 +181,16 @@ submissionsRouter.post('/', requireAuth, requireRole('recruiter_admin', 'recruit
 /* PATCH /submissions/:id/status */
 submissionsRouter.patch('/:id/status', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', statusSchema), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
     const { status: next, reasonForRejection, rejectionComments } = c.req.valid('json');
 
-    const row = await db.select().from(submissions).where(eq(submissions.id, id)).limit(1);
-    if (!row.length) return c.json({ error: 'Submission not found' }, 404);
+    const existing = await getSubmissionIfAccessible(id, userId, orgId);
+    if (!existing) return c.json({ error: 'Submission not found' }, 404);
 
-    const current = row[0].status as SubStatus;
+    const current = existing.status as SubStatus;
     const allowed = TRANSITIONS[current] ?? [];
     if (!allowed.includes(next)) {
       return c.json({ error: `Invalid transition: ${current} → ${next}`, allowedTransitions: allowed }, 400);
@@ -201,8 +212,13 @@ submissionsRouter.patch('/:id/status', requireAuth, requireRole('recruiter_admin
 /* PATCH /submissions/:id */
 submissionsRouter.patch('/:id', requireAuth, requireRole('recruiter_admin', 'recruited_staff'), zValidator('json', updateSchema), async (c) => {
   try {
+    const userId = c.get('userId') as number;
+    const orgId = c.get('organizationId') as number | null;
     const id = parseInt(c.req.param('id'));
     if (isNaN(id)) return c.json({ error: 'Invalid id' }, 400);
+    const existing = await getSubmissionIfAccessible(id, userId, orgId);
+    if (!existing) return c.json({ error: 'Submission not found' }, 404);
+
     const b = c.req.valid('json');
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     if (b.clientName != null) patch.clientName = b.clientName;

@@ -16,25 +16,35 @@
     "db:seed:stages": "tsx src/db/seed-stage-templates.ts",
     "db:backfill:phase2": "tsx src/db/backfill-jobs-phase2.ts",
     "db:seed:stress": "tsx src/db/seed-stress.ts",
+    "db:seed:local-50k": "tsx src/db/seed-local-50k.ts",
     "db:seed:full": "tsx src/db/seed-faker-full.ts",
     "db:demo:single": "tsx src/db/seed-demo-single-login.ts",
     "db:demo": "npm run db:reset && npm run db:push && npm run db:seed:full",
     "db:setup": "npm run db:push && npm run db:seed:full",
     "db:migrate:sqlite": "tsx src/db/migrate-sqlite-to-postgres.ts",
-    "worker:queue": "tsx src/queue/run-worker.ts"
+    "worker:queue": "tsx src/queue/run-worker.ts",
+    "test": "npm run test:unit",
+    "test:unit": "cross-env NODE_ENV=test node --import tsx --test tests/unit/*.test.ts src/lib/*.test.ts",
+    "test:integration:prepare": "cross-env NODE_ENV=test tsx tests/prepare-test-db.ts",
+    "test:integration": "cross-env NODE_ENV=test node --import tsx --test tests/integration/*.test.ts",
+    "test:deep-demo": "cross-env NODE_ENV=test tsx scripts/deep-demo-e2e.ts",
+    "test:e2e:pipeline": "tsx scripts/full-pipeline-e2e.ts"
   },
   "dependencies": {
     "@faker-js/faker": "^10.5.0",
-    "@hono/node-server": "^1.19.14",
+    "@hono/node-server": "^2.0.11",
     "@hono/zod-validator": "^0.7.6",
     "bcryptjs": "^3.0.3",
     "dotenv": "^17.4.2",
     "drizzle-kit": "^0.31.10",
     "drizzle-orm": "^0.45.2",
-    "hono": "^4.12.12",
+    "fflate": "^0.8.3",
+    "hono": "^4.12.31",
     "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.3",
-    "nodemailer": "^9.0.0",
+    "mammoth": "^1.12.0",
+    "nodemailer": "^9.0.3",
+    "pdfjs-dist": "^6.1.200",
     "pg": "^8.20.0",
     "tsx": "^4.23.1",
     "zod": "^4.3.6"
@@ -45,6 +55,7 @@
     "@types/node": "^20.11.17",
     "@types/nodemailer": "^8.0.1",
     "@types/pg": "^8.20.0",
+    "cross-env": "^10.1.0",
     "typescript": "^5.8.3"
   }
 }
