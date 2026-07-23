@@ -58,7 +58,7 @@
 
   const res = await fetch(url, {
     method: 'PUT',
-    signal: AbortSignal.timeout(20_000),
+    signal: AbortSignal.timeout(60_000),
     headers: {
       AccessKey: ACCESS_KEY,
       'Content-Type': 'application/octet-stream',
@@ -89,7 +89,7 @@
 
       const res = await fetch(url, {
         method: 'DELETE',
-        signal: AbortSignal.timeout(20_000),
+        signal: AbortSignal.timeout(60_000),
         headers: { AccessKey: ACCESS_KEY },
       });
 
@@ -108,7 +108,7 @@
       const url = `${STORAGE_ENDPOINT}/${STORAGE_ZONE}/${storagePath}`;
       const res = await fetch(url, {
         method: 'GET',
-        signal: AbortSignal.timeout(20_000),
+        signal: AbortSignal.timeout(60_000),
         headers: { AccessKey: ACCESS_KEY },
       });
       if (!res.ok) {
