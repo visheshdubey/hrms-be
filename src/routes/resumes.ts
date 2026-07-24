@@ -15,19 +15,18 @@ import {
   sha256,
   validateResumeFile,
   RESUME_MIMES,
-  extractResume,
 } from '../lib/resume-extraction.js';
 import { AtsPythonError, parseResumeWithPython } from '../lib/ats-python-client.js';
 import { requireAuth, requireRecruiter, type AppContext } from '../middleware.js';
 
 const resumesRouter = new Hono<AppContext>({ strict: false });
 
-async function extractViaAtsOrFallback(buffer: Buffer, mime: typeof RESUME_MIMES[keyof typeof RESUME_MIMES], filename: string, job?: {
+/** ATS parse is Python-only — Hono never extracts/scores resumes. */
+async function extractViaPython(buffer: Buffer, mime: typeof RESUME_MIMES[keyof typeof RESUME_MIMES], filename: string, job?: {
   id: number;
   title?: string | null;
   description: string | null;
 } | null) {
-  const useLocalFallback = process.env.ATS_LOCAL_FALLBACK === '1' || process.env.ATS_LOCAL_FALLBACK === 'true';
   const expectedSkills = (() => {
     if (!job) return [] as string[];
     const text = `${job.title ?? ''} ${job.description ?? ''}`.toLowerCase();
@@ -36,26 +35,24 @@ async function extractViaAtsOrFallback(buffer: Buffer, mime: typeof RESUME_MIMES
     )].slice(0, 30);
   })();
 
-  try {
-    return await parseResumeWithPython({
-      buffer,
-      filename,
-      mime,
-      jobId: job?.id,
-      jobDescription: job?.description,
-      expectedSkills,
-    });
-  } catch (error) {
-    if (!useLocalFallback || !(error instanceof AtsPythonError)) throw error;
-    console.warn('[resumes] Python parse unavailable; ATS_LOCAL_FALLBACK in use:', error.message);
-    const local = await extractResume(buffer, mime);
-    return {
-      text: local.text,
-      data: local.data,
-      matchScore: local.data.profileScore,
-      algorithmVersion: 'ats-local-fallback',
-    };
-  }
+  const python = await parseResumeWithPython({
+    buffer,
+    filename,
+    mime,
+    jobId: job?.id,
+    jobDescription: job?.description,
+    expectedSkills,
+  });
+  return {
+    text: sanitizeExtractedText(python.text),
+    data: python.data,
+    matchScore: python.matchScore,
+    algorithmVersion: python.algorithmVersion,
+  };
+}
+
+function sanitizeExtractedText(value: string): string {
+  return (value || '').replace(/\u0000/g, '').slice(0, 200_000);
 }
 
 function parseId(value: string): number | null {
@@ -216,7 +213,7 @@ resumesRouter.post('/', requireAuth, requireRecruiter, async (c) => {
       }
     }
 
-    const extracted = await extractViaAtsOrFallback(buffer, mime, file.name, job);
+    const extracted = await extractViaPython(buffer, mime, file.name, job);
     let candidate = candidateId ? await getOwnedCandidate(candidateId, userId, orgId) : null;
     if (candidateId && !candidate) {
       return c.json({ error: 'Candidate not found', code: 'candidate_not_found' }, 404);
@@ -257,7 +254,7 @@ resumesRouter.post('/', requireAuth, requireRecruiter, async (c) => {
       byteSize: buffer.length,
       contentHash: sha256(buffer),
       parseStatus: 'parsed',
-      extractedText: extracted.text,
+      extractedText: sanitizeExtractedText(extracted.text),
       extractedData: JSON.stringify(extracted.data),
       createdAt: now,
       updatedAt: now,
