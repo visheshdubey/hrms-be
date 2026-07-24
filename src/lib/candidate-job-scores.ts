@@ -6,11 +6,9 @@ import {
   jobs,
 } from '../db/schema.js';
 import {
-  AtsPythonError,
   candidateRecordForPythonScore,
   scoreCandidateWithPython,
 } from './ats-python-client.js';
-import { scoreCandidateForJob } from './ats-scoring.js';
 
 function skillsFromJob(job: typeof jobs.$inferSelect): string[] {
   // Jobs table stores free-text description only — extract likely skill tokens.
@@ -33,37 +31,14 @@ export async function persistCandidateJobScore(params: {
     throw new Error('RESUME_NOT_PARSED');
   }
 
-  const useLocalFallback = process.env.ATS_LOCAL_FALLBACK === '1' || process.env.ATS_LOCAL_FALLBACK === 'true';
-  let result: {
-    totalScore: number;
-    algorithmVersion: string;
-    components: Record<string, unknown>;
-    matchedRequirements: string[];
-    missingRequirements: string[];
-    warnings: string[];
-    resumeHash: string;
-    jobHash: string;
-  };
-
-  try {
-    result = await scoreCandidateWithPython({
-      candidate: candidateRecordForPythonScore(params.candidate),
-      jobDescription: params.job.description ?? '',
-      expectedSkills: skillsFromJob(params.job),
-      jobId: params.job.id,
-      resumeHash: params.resume.contentHash,
-    });
-  } catch (error) {
-    if (!useLocalFallback || !(error instanceof AtsPythonError)) throw error;
-    console.warn('[ats] Python score unavailable; ATS_LOCAL_FALLBACK in use:', error.message);
-    result = scoreCandidateForJob({
-      jobTitle: params.job.title,
-      jobDescription: params.job.description ?? '',
-      resumeText: params.resume.extractedText,
-      resumeHash: params.resume.contentHash,
-      candidate: params.candidate,
-    });
-  }
+  // ATS score is Python-only — no Hono/local fallback.
+  const result = await scoreCandidateWithPython({
+    candidate: candidateRecordForPythonScore(params.candidate),
+    jobDescription: params.job.description ?? '',
+    expectedSkills: skillsFromJob(params.job),
+    jobId: params.job.id,
+    resumeHash: params.resume.contentHash,
+  });
 
   const now = new Date().toISOString();
   const values = {
