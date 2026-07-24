@@ -510,7 +510,12 @@ candidatesRouter.delete('/:id', requireAuth, requireRecruiter, async (c) => {
 });
 
 function safeJsonParse(str: string | null): any[] {
-  try { return JSON.parse(str || '[]'); } catch { return []; }
+  try {
+    const parsed = JSON.parse(str || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 export default candidatesRouter;
